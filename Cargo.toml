@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "models",
+    "db",
+    "peering",
+    "utilities",
+    "core",
+    "protocol"
+]
+
+resolver = "2"

@@ -32,7 +32,7 @@ cargo build
 
 ### Run a node
 
-The default CLI values are developer-oriented (including a hard-coded default share path), so you'll usually want to pass at least one `--share`.
+You must configure at least one share, either via `--share` flags or a `config.toml`.
 
 ```bash
 cargo run -p localbox -- \
@@ -82,6 +82,21 @@ Run `cargo run -p localbox -- --help` for the full list. Common flags:
 - `--log-path`: log output file (also logs to console)
 - `--remote-share-root`: base directory for remote peer shares
 - `--share NAME=PATH[,recursive=true|false]`: add a watched share (repeatable)
+- `--config PATH`: load settings from a TOML config file (defaults to `./config.toml` if it exists)
+
+## Configuration (config.toml)
+
+Generate a template:
+
+```bash
+cargo run -p localbox -- init
+```
+
+Validate your config (and any CLI overrides):
+
+```bash
+cargo run -p localbox -- validate
+```
 
 Logging level is controlled via `RUST_LOG` (defaults to `info`), for example:
 
@@ -131,4 +146,3 @@ cargo test
 ## License
 
 MIT - see `LICENSE`.
-

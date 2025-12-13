@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 use utilities::{FileSystem, Net, VirtualFileSystem, VirtualNet};
 use tokio_util::sync::CancellationToken;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "current_thread")]
 async fn virtual_peers_exchange_changes() {
     let net: Arc<dyn Net> = Arc::new(VirtualNet::default());
     let fs1: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
@@ -59,12 +59,10 @@ async fn virtual_peers_exchange_changes() {
     let tok2 = CancellationToken::new();
     let tok2_runner = tok2.clone();
 
-    println!("starting peer managers");
     let t1 = tokio::spawn(async move { pm1.run(net_rx1, tok1_runner).await.unwrap() });
     let t2 = tokio::spawn(async move { pm2.run(net_rx2, tok2_runner).await.unwrap() });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    println!("after initial sleep");
 
     // Node1 sends a modify.
     enqueue_sample_batch(
@@ -75,10 +73,8 @@ async fn virtual_peers_exchange_changes() {
         net_tx1.clone(),
     )
     .await;
-    println!("queued modify from node1");
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    println!("after second sleep");
 
     // Node2 sends a delete.
     enqueue_sample_batch(
@@ -89,10 +85,8 @@ async fn virtual_peers_exchange_changes() {
         net_tx2.clone(),
     )
     .await;
-    println!("queued delete from node2");
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    println!("before waiting for share");
 
     // Wait for remote share rows to materialize.
     let share_row2 = wait_for_share(&db2, &shares1[0].share_id).await;
@@ -161,8 +155,6 @@ async fn enqueue_sample_batch(
     kind: ChangeKind,
     net_tx: mpsc::Sender<String>,
 ) {
-    println!("enqueue_sample_batch start for {path}");
-    println!("locking db for {path}");
     let change = FileChange {
         seq: 0,
         share_id: *share_id,
@@ -187,15 +179,11 @@ async fn enqueue_sample_batch(
         created_at: OffsetDateTime::now_utc().unix_timestamp(),
         changes: vec![change],
     };
-    println!("locked? attempting enqueue for {path}");
     let db_guard = db.lock().await;
-    println!("db lock acquired for {path}");
     db_guard
         .enqueue_outbound_batch(&manifest, None)
         .unwrap();
-    println!("enqueued {path}");
     let _ = net_tx.try_send(manifest.batch_id);
-    println!("enqueue_sample_batch end for {path}");
 }
 
 async fn wait_for_share(db: &Arc<Mutex<Db>>, share_id: &models::ShareId) -> i64 {

@@ -169,3 +169,58 @@ fn parse_share_arg(raw: &str) -> Result<ShareCli, String> {
         recursive,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_share_arg, CliConfig};
+    use std::path::PathBuf;
+
+    #[test]
+    fn parse_share_arg_basic_and_recursive() {
+        let s = parse_share_arg("docs=/tmp/docs,recursive=false").unwrap();
+        assert_eq!(s.name, "docs");
+        assert_eq!(s.root, PathBuf::from("/tmp/docs"));
+        assert!(!s.recursive);
+
+        let s = parse_share_arg("pics=C:/pics").unwrap();
+        assert_eq!(s.name, "pics");
+        assert!(s.recursive);
+    }
+
+    #[test]
+    fn parse_share_arg_rejects_invalid() {
+        assert!(parse_share_arg("noequals").is_err());
+        assert!(parse_share_arg("=C:/x").is_err());
+        assert!(parse_share_arg("x=").is_err());
+        assert!(parse_share_arg("x=C:/x,wat=true").is_err());
+        assert!(parse_share_arg("x=C:/x,recursive=maybe").is_err());
+    }
+
+    #[test]
+    fn cli_config_builds_default_share_when_none_specified() {
+        let cfg = CliConfig {
+            instance_id: "inst".to_string(),
+            listen_port: 5000,
+            discovery_port: 5001,
+            aggregation_window_ms: 100,
+            db_path: PathBuf::from("db.sqlite"),
+            log_path: PathBuf::from("app.log"),
+            tls_cert_path: PathBuf::from("cert.pem"),
+            tls_key_path: PathBuf::from("key.pem"),
+            tls_ca_cert_path: PathBuf::from("ca.pem"),
+            remote_share_root: PathBuf::from("remote"),
+            shares: vec![],
+            share_name: "default".to_string(),
+            share_root: PathBuf::from("C:/data"),
+            share_recursive: false,
+        };
+        let app = cfg.into_app_config();
+        assert_eq!(app.instance_id, "inst");
+        assert_eq!(app.listen_addr.port(), 5000);
+        assert_eq!(app.discovery_port, 5001);
+        assert_eq!(app.shares.len(), 1);
+        assert_eq!(app.shares[0].name, "default");
+        assert_eq!(app.shares[0].root_path, PathBuf::from("C:/data"));
+        assert!(!app.shares[0].recursive);
+    }
+}

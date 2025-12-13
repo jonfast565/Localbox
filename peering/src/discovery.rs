@@ -333,7 +333,8 @@ async fn handle_here(
         return;
     };
 
-    if let Err(e) = db.lock().await.set_peer_shares(peer_id, &shares) {
+    let set_res = { db.lock().await.set_peer_shares(peer_id, &shares) };
+    if let Err(e) = set_res {
         error!("DB set_peer_shares error: {e}");
     } else {
         info!(
@@ -446,11 +447,8 @@ async fn upsert_peer_with_state(
     state: &str,
 ) -> Option<i64> {
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    match db
-        .lock()
-        .await
-        .upsert_peer(pc_name, instance_id, addr, now, state)
-    {
+    let res = { db.lock().await.upsert_peer(pc_name, instance_id, addr, now, state) };
+    match res {
         Ok(id) => Some(id),
         Err(e) => {
             error!("DB upsert_peer error: {e}");

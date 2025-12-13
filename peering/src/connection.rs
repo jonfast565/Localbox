@@ -160,12 +160,9 @@ async fn incoming_reader_loop<R>(
                 handle_batch_message(&db, &connections, peer_id, b).await;
             }
             Ok(Some(WireMessage::BatchAck(ack))) => {
-                if let Ok(share_row_id) = db.lock().await.get_share_row_id_by_share_id(&ack.share_id)
-                {
-                    let _ = db
-                        .lock()
-                        .await
-                        .bump_last_seq_acked(peer_id, share_row_id, ack.upto_seq);
+                let db_guard = db.lock().await;
+                if let Ok(share_row_id) = db_guard.get_share_row_id_by_share_id(&ack.share_id) {
+                    let _ = db_guard.bump_last_seq_acked(peer_id, share_row_id, ack.upto_seq);
                 }
                 info!(
                     "Received ack for share {:?} upto seq {} from {}",

@@ -51,3 +51,41 @@ pub async fn recv_framed_message<R: AsyncRead + Unpin>(
     reader.read_exact(&mut buf).await?;
     parse_wire_message(&buf).map(Some)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{recv_framed_message, send_framed_message};
+    use models::{HelloMessage, WireMessage};
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn framed_round_trip() {
+        let (mut a, mut b) = tokio::io::duplex(8 * 1024);
+        let msg = WireMessage::Hello(HelloMessage {
+            pc_name: "pc".to_string(),
+            instance_id: "inst".to_string(),
+            listen_port: 5000,
+            shares: vec!["shareA".to_string()],
+        });
+        let msg_for_sender = msg.clone();
+
+        let sender = tokio::spawn(async move {
+            send_framed_message(&mut a, &msg_for_sender).await.unwrap();
+        });
+
+        let got = recv_framed_message(&mut b).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&got).unwrap(),
+            serde_json::to_value(&msg).unwrap()
+        );
+        sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn eof_returns_none() {
+        let (mut a, mut b) = tokio::io::duplex(8 * 1024);
+        a.shutdown().await.unwrap();
+        let got = recv_framed_message(&mut b).await.unwrap();
+        assert!(got.is_none());
+    }
+}

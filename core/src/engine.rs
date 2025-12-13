@@ -384,6 +384,82 @@ fn format_share_label(share_id: &models::ShareId, share_labels: &HashMap<[u8; 16
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{format_share_label, group_pending_by_share, map_event_kind};
+    use models::{ChangeKind, FileChange, ShareId};
+    use notify::event::{CreateKind, ModifyKind, RemoveKind};
+    use notify::EventKind;
+    use std::collections::HashMap;
+
+    #[test]
+    fn groups_pending_by_share_id_bytes() {
+        let s1 = ShareId::new("a", "pc").0;
+        let s2 = ShareId::new("b", "pc").0;
+        let mut pending = vec![
+            FileChange {
+                seq: 0,
+                share_id: ShareId(s1),
+                path: "p1".to_string(),
+                kind: ChangeKind::Modify,
+                meta: None,
+            },
+            FileChange {
+                seq: 0,
+                share_id: ShareId(s2),
+                path: "p2".to_string(),
+                kind: ChangeKind::Modify,
+                meta: None,
+            },
+            FileChange {
+                seq: 0,
+                share_id: ShareId(s1),
+                path: "p3".to_string(),
+                kind: ChangeKind::Delete,
+                meta: None,
+            },
+        ];
+
+        let grouped = group_pending_by_share(&mut pending);
+        assert!(pending.is_empty());
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped.get(&s1).unwrap().len(), 2);
+        assert_eq!(grouped.get(&s2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn formats_share_labels_with_optional_names() {
+        let id = ShareId::new("shareA", "pc-one");
+        let mut labels = HashMap::new();
+        labels.insert(id.0, "shareA".to_string());
+        let s = format_share_label(&id, &labels);
+        assert!(s.starts_with("shareA ("));
+        assert!(s.contains(')'));
+
+        let other = ShareId::new("shareB", "pc-one");
+        let s2 = format_share_label(&other, &labels);
+        assert!(!s2.starts_with("shareA ("));
+        assert!(s2.contains('-'));
+    }
+
+    #[test]
+    fn maps_notify_event_kind_to_change_kind() {
+        assert_eq!(
+            map_event_kind(&EventKind::Create(CreateKind::File)),
+            Some(ChangeKind::Create)
+        );
+        assert_eq!(
+            map_event_kind(&EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any))),
+            Some(ChangeKind::Modify)
+        );
+        assert_eq!(
+            map_event_kind(&EventKind::Remove(RemoveKind::File)),
+            Some(ChangeKind::Delete)
+        );
+        assert_eq!(map_event_kind(&EventKind::Access(notify::event::AccessKind::Any)), None);
+    }
+}
+
 fn log_banner() {
     info!(
         "\n{}\n{}\n  name: {}\n  version: {}\n  author(s): {}\n{}\n",

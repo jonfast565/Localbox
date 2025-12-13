@@ -149,7 +149,7 @@ impl PeerManager {
     ) -> JoinHandle<()> {
         let db = Arc::clone(&self.db);
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
                     _ = token.cancelled() => break,
@@ -210,13 +210,11 @@ impl PeerManager {
                         } else {
                             any_sent = true;
                             if max_seq > 0 {
+                                let db_guard = db.lock().await;
                                 if let Ok(share_row_id) =
-                                    db.lock().await.get_share_row_id_by_share_id(&item.manifest.share_id)
+                                    db_guard.get_share_row_id_by_share_id(&item.manifest.share_id)
                                 {
-                                    let _ = db
-                                        .lock()
-                                        .await
-                                        .bump_last_seq_sent(pid, share_row_id, max_seq);
+                                    let _ = db_guard.bump_last_seq_sent(pid, share_row_id, max_seq);
                                 }
                             }
                         }
@@ -241,4 +239,19 @@ impl PeerManager {
 fn compute_backoff_secs(attempts: i64) -> i64 {
     let base = 2_i64.pow(attempts.clamp(1, 6) as u32);
     (base * 5).min(300)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_backoff_secs;
+
+    #[test]
+    fn backoff_is_capped_and_monotonic() {
+        assert_eq!(compute_backoff_secs(0), 10);
+        assert_eq!(compute_backoff_secs(1), 10);
+        assert_eq!(compute_backoff_secs(2), 20);
+        assert_eq!(compute_backoff_secs(3), 40);
+        assert_eq!(compute_backoff_secs(6), 300);
+        assert_eq!(compute_backoff_secs(100), 300);
+    }
 }

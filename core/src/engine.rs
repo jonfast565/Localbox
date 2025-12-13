@@ -386,11 +386,16 @@ fn format_share_label(share_id: &models::ShareId, share_labels: &HashMap<[u8; 16
 
 #[cfg(test)]
 mod tests {
-    use super::{format_share_label, group_pending_by_share, map_event_kind};
+    use super::{format_share_label, group_pending_by_share, handle_rename_event, map_event_kind};
     use models::{ChangeKind, FileChange, ShareId};
+    use models::ShareContext;
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::EventKind;
     use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use utilities::{FileSystem, VirtualFileSystem};
 
     #[test]
     fn groups_pending_by_share_id_bytes() {
@@ -457,6 +462,43 @@ mod tests {
             Some(ChangeKind::Delete)
         );
         assert_eq!(map_event_kind(&EventKind::Access(notify::event::AccessKind::Any)), None);
+    }
+
+    #[test]
+    fn rename_is_emitted_as_delete_then_modify() {
+        let fs: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+        let root = PathBuf::from("/share");
+        fs.create_dir_all(&root).unwrap();
+        fs.write(&root.join("new.txt"), b"hello").unwrap();
+
+        let share = ShareContext {
+            id: 1,
+            share_name: "s".to_string(),
+            pc_name: "pc".to_string(),
+            share_id: ShareId::new("s", "pc"),
+            root_path: root.clone(),
+            recursive: true,
+            index: HashMap::new(),
+        };
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_rename_event(
+            &fs,
+            &share,
+            &[root.join("old.txt"), root.join("new.txt")],
+            &notify::event::RenameMode::Both,
+            &tx,
+            1,
+            0,
+        );
+
+        let first = rx.try_recv().unwrap();
+        let second = rx.try_recv().unwrap();
+        assert_eq!(first.kind, ChangeKind::Delete);
+        assert_eq!(first.path, "old.txt");
+        assert_eq!(second.kind, ChangeKind::Modify);
+        assert_eq!(second.path, "new.txt");
+        assert!(second.meta.is_some());
     }
 }
 

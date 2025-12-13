@@ -213,6 +213,13 @@ async fn handle_batch_message(
             continue;
         };
 
+        if is_replay(db, share_row_id, change.seq).await {
+            if change.seq > 0 {
+                max_seq_for_share = max_seq_for_share.max(change.seq);
+            }
+            continue;
+        }
+
         let existing = db
             .lock()
             .await
@@ -227,10 +234,6 @@ async fn handle_batch_message(
         change.meta = resolve_change_meta(&change, existing.clone());
         if let Some(meta) = &change.meta {
             let _ = db.lock().await.upsert_file_meta(share_row_id, meta);
-        }
-
-        if is_replay(db, share_row_id, change.seq).await {
-            continue;
         }
 
         if let Some(seq) = append_change_and_ack(db, peer_id, share_row_id, &mut change, batch.created_at).await {

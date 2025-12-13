@@ -116,6 +116,17 @@ Remote shares are created under:
 
 Where `<share_name>` is sanitized into a safe relative path (see `utilities::disk_utilities::relative_share_path`).
 
+## Sync semantics (current guarantees)
+
+Localbox currently replicates *change logs and file metadata*, not file contents. Concretely:
+
+- **Ownership / direction:** a share is owned by the node that watches it. Other nodes register it as a *remote share* and do not watch or mutate it. This is effectively **one-way replication per share** (owner → peers).
+- **What propagates:** create/modify/delete events for file paths with metadata (`size`, `mtime`, `hash`). Remote nodes persist these events and metadata in `sync.db` and create the remote-share directory layout, but **do not download/write file bytes yet**.
+- **Delivery model:** changes are sent in batches and may be delivered more than once. Batches are deduplicated by `batch_id`. Per-share ordering is tracked by a monotonically increasing `seq` assigned by the share owner.
+- **Conflict resolution:** if multiple non-delete updates for the same path arrive, Localbox prefers higher `version`, then higher `mtime`, and finally applies when hashes differ (ties). (`version` is currently always `1` for filesystem events.)
+- **Deletions:** deletes are treated as tombstones. A delete only “wins” if it is not a replay (i.e., it has a `seq` newer than what the receiver has already processed for that share).
+- **Renames:** renames are represented as **two events**: `Delete(old_path)` + `Modify(new_path)`. This is not atomic and may be observed as two independent operations.
+
 ## TLS notes
 
 Localbox uses mTLS for peer connections and expects three PEM files:

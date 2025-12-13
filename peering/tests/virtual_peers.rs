@@ -120,6 +120,105 @@ async fn virtual_peers_exchange_changes() {
     let _ = t2.await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn replayed_change_does_not_clobber_file_meta() {
+    let net: Arc<dyn Net> = Arc::new(VirtualNet::default());
+    let fs1: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+    let fs2: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+
+    let tls_paths1 = TlsPaths::new("cert1.pem", "key1.pem", "ca.pem");
+    let tls_paths2 = TlsPaths::new("cert2.pem", "key2.pem", "ca.pem");
+    let tls_material = generate_shared_tls(&["pc-one", "pc-two", "localhost"]);
+    write_shared_tls(fs1.as_ref(), &tls_paths1, &tls_material);
+    write_shared_tls(fs2.as_ref(), &tls_paths2, &tls_material);
+
+    let cfg1 = test_config("pc-one", "inst-one", 6101, 7101, "shareA", &tls_paths1);
+    let cfg2 = test_config("pc-two", "inst-two", 6102, 7101, "shareA", &tls_paths2);
+
+    let db1 = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+    let db2 = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+
+    let shares1 = db1.lock().await.load_shares(&cfg1).unwrap();
+    let shares2 = db2.lock().await.load_shares(&cfg2).unwrap();
+
+    let (net_tx1, net_rx1) = mpsc::channel(16);
+    let (net_tx2, net_rx2) = mpsc::channel(16);
+
+    let pm1 = PeerManager::new(
+        cfg1.clone(),
+        db1.clone(),
+        net_tx1.clone(),
+        shares1.clone(),
+        fs1.clone(),
+        net.clone(),
+    )
+    .unwrap();
+    let tok1 = CancellationToken::new();
+    let tok1_runner = tok1.clone();
+    let pm2 = PeerManager::new(
+        cfg2.clone(),
+        db2.clone(),
+        net_tx2.clone(),
+        shares2.clone(),
+        fs2.clone(),
+        net.clone(),
+    )
+    .unwrap();
+    let tok2 = CancellationToken::new();
+    let tok2_runner = tok2.clone();
+
+    let t1 = tokio::spawn(async move { pm1.run(net_rx1, tok1_runner).await.unwrap() });
+    let t2 = tokio::spawn(async move { pm2.run(net_rx2, tok2_runner).await.unwrap() });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Send seq=2 modify then seq=1 delete for the same path. The delete is a replay and must not
+    // overwrite the file metadata on the receiver.
+    enqueue_batch_with_seq(
+        &db1,
+        &shares1[0].share_id,
+        "a.txt",
+        ChangeKind::Modify,
+        2,
+        [2u8; 32],
+        200,
+        net_tx1.clone(),
+    )
+    .await;
+
+    let share_row2 = wait_for_share(&db2, &shares1[0].share_id).await;
+    wait_for_file_meta(&db2, share_row2, "a.txt").await;
+
+    enqueue_batch_with_seq(
+        &db1,
+        &shares1[0].share_id,
+        "a.txt",
+        ChangeKind::Delete,
+        1,
+        [0u8; 32],
+        100,
+        net_tx1.clone(),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let meta = db2
+        .lock()
+        .await
+        .get_file_meta(share_row2, "a.txt")
+        .unwrap()
+        .unwrap();
+    assert!(!meta.deleted, "replayed delete must not mark file deleted");
+    assert_eq!(meta.hash, [2u8; 32]);
+
+    drop(net_tx1);
+    drop(net_tx2);
+    tok1.cancel();
+    tok2.cancel();
+    let _ = t1.await;
+    let _ = t2.await;
+}
+
 fn test_config(
     pc_name: &str,
     instance_id: &str,
@@ -186,6 +285,47 @@ async fn enqueue_sample_batch(
     let _ = net_tx.try_send(manifest.batch_id);
 }
 
+async fn enqueue_batch_with_seq(
+    db: &Arc<Mutex<Db>>,
+    share_id: &models::ShareId,
+    path: &str,
+    kind: ChangeKind,
+    seq: i64,
+    hash: [u8; 32],
+    mtime: i64,
+    net_tx: mpsc::Sender<String>,
+) {
+    let change = FileChange {
+        seq,
+        share_id: *share_id,
+        path: path.to_string(),
+        kind: kind.clone(),
+        meta: match kind {
+            ChangeKind::Delete => None,
+            _ => Some(FileMeta {
+                path: path.to_string(),
+                size: 1,
+                mtime,
+                hash,
+                version: 1,
+                deleted: false,
+            }),
+        },
+    };
+    let manifest = models::BatchManifest {
+        batch_id: format!("batch-{}-{}", path, seq),
+        share_id: *share_id,
+        from_node: "local".to_string(),
+        created_at: OffsetDateTime::now_utc().unix_timestamp(),
+        changes: vec![change],
+    };
+    let db_guard = db.lock().await;
+    db_guard
+        .enqueue_outbound_batch(&manifest, None)
+        .unwrap();
+    let _ = net_tx.try_send(manifest.batch_id);
+}
+
 async fn wait_for_share(db: &Arc<Mutex<Db>>, share_id: &models::ShareId) -> i64 {
     for _ in 0..20 {
         if let Ok(id) = db.lock().await.get_share_row_id_by_share_id(share_id) {
@@ -194,6 +334,16 @@ async fn wait_for_share(db: &Arc<Mutex<Db>>, share_id: &models::ShareId) -> i64 
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     panic!("share {:?} not registered in time", share_id.0);
+}
+
+async fn wait_for_file_meta(db: &Arc<Mutex<Db>>, share_row_id: i64, path: &str) {
+    for _ in 0..20 {
+        if let Ok(Some(_)) = db.lock().await.get_file_meta(share_row_id, path) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("file meta for {} not present in time", path);
 }
 
 #[derive(Clone)]

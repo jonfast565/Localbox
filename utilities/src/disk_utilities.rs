@@ -63,7 +63,29 @@ pub fn build_meta_with_retry(
     attempts: usize,
     delay_ms: u64,
 ) -> io::Result<FileMeta> {
+    build_meta_with_retry_limited(fs, path, rel_path, attempts, delay_ms, None)
+}
+
+pub fn build_meta_with_retry_limited(
+    fs: &dyn FileSystem,
+    path: &Path,
+    rel_path: &str,
+    attempts: usize,
+    delay_ms: u64,
+    max_file_size_bytes: Option<u64>,
+) -> io::Result<FileMeta> {
     let md = retry_metadata(fs, path, attempts, delay_ms)?;
+    if let Some(max) = max_file_size_bytes {
+        if md.len > max {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "file too large ({} bytes > max {})",
+                    md.len, max
+                ),
+            ));
+        }
+    }
     let hash = retry_hash(fs, path, attempts, delay_ms)?;
     let mtime = md
         .modified

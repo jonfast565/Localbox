@@ -7,8 +7,42 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+const DB_SCHEMA_VERSION: i32 = 1;
+
 pub struct Db {
     conn: Connection,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerRow {
+    pub id: i64,
+    pub pc_name: String,
+    pub instance_id: String,
+    pub last_ip: String,
+    pub last_port: i64,
+    pub last_seen: i64,
+    pub state: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShareRow {
+    pub id: i64,
+    pub share_name: String,
+    pub pc_name: String,
+    pub root_path: String,
+    pub recursive: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerProgressRow {
+    pub peer_id: i64,
+    pub peer_pc_name: String,
+    pub peer_instance_id: String,
+    pub share_row_id: i64,
+    pub share_name: String,
+    pub share_pc_name: String,
+    pub last_seq_sent: i64,
+    pub last_seq_acked: i64,
 }
 
 pub trait DbFactory: Send + Sync {
@@ -151,7 +185,35 @@ impl Db {
             );
         "#,
         )?;
+        self.apply_schema_migrations()?;
         Ok(())
+    }
+
+    fn apply_schema_migrations(&self) -> Result<()> {
+        let current: i32 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+        if current > DB_SCHEMA_VERSION {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+                Some(format!(
+                    "db schema version {} is newer than this binary supports (max {})",
+                    current, DB_SCHEMA_VERSION
+                )),
+            ));
+        }
+
+        if current < DB_SCHEMA_VERSION {
+            self.conn
+                .execute_batch(&format!("PRAGMA user_version = {DB_SCHEMA_VERSION};"))?;
+        }
+
+        Ok(())
+    }
+
+    pub fn schema_version(&self) -> Result<i32> {
+        self.conn.query_row("PRAGMA user_version", [], |row| row.get(0))
     }
 
     /// Ensure shares from config exist; return loaded ShareContexts (indexes loaded).
@@ -168,6 +230,8 @@ impl Db {
                 share_id,
                 root_path: sc.root_path.clone(),
                 recursive: sc.recursive,
+                ignore_patterns: sc.ignore_patterns.clone(),
+                max_file_size_bytes: sc.max_file_size_bytes,
                 index,
             });
         }
@@ -757,6 +821,120 @@ impl Db {
             params![peer_id, share_row_id, new_acked],
         )?;
         Ok(())
+    }
+
+    /* Status/observability helpers */
+
+    pub fn list_peers(&self) -> Result<Vec<PeerRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, pc_name, instance_id, last_ip, last_port, last_seen, state
+            FROM peers
+            ORDER BY last_seen DESC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PeerRow {
+                id: row.get(0)?,
+                pc_name: row.get(1)?,
+                instance_id: row.get(2)?,
+                last_ip: row.get(3)?,
+                last_port: row.get(4)?,
+                last_seen: row.get(5)?,
+                state: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_shares_table(&self) -> Result<Vec<ShareRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, share_name, pc_name, root_path, recursive
+            FROM shares
+            ORDER BY pc_name ASC, share_name ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ShareRow {
+                id: row.get(0)?,
+                share_name: row.get(1)?,
+                pc_name: row.get(2)?,
+                root_path: row.get(3)?,
+                recursive: {
+                    let v: i64 = row.get(4)?;
+                    v != 0
+                },
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_peer_progress_table(&self) -> Result<Vec<PeerProgressRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT
+                p.id,
+                p.pc_name,
+                p.instance_id,
+                s.id,
+                s.share_name,
+                s.pc_name,
+                pp.last_seq_sent,
+                pp.last_seq_acked
+            FROM peer_progress pp
+            JOIN peers p ON p.id = pp.peer_id
+            JOIN shares s ON s.id = pp.share_id
+            ORDER BY p.pc_name ASC, p.instance_id ASC, s.pc_name ASC, s.share_name ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PeerProgressRow {
+                peer_id: row.get(0)?,
+                peer_pc_name: row.get(1)?,
+                peer_instance_id: row.get(2)?,
+                share_row_id: row.get(3)?,
+                share_name: row.get(4)?,
+                share_pc_name: row.get(5)?,
+                last_seq_sent: row.get(6)?,
+                last_seq_acked: row.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn outbound_queue_depth(&self) -> Result<i64> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM outbound_queue WHERE status != 'sent'")?;
+        let n: i64 = stmt.query_row([], |row| row.get(0))?;
+        Ok(n)
+    }
+
+    pub fn outbound_queue_due_now(&self, now_ts: i64) -> Result<i64> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COUNT(*) FROM outbound_queue WHERE status != 'sent' AND next_attempt_at <= ?1",
+        )?;
+        let n: i64 = stmt.query_row(params![now_ts], |row| row.get(0))?;
+        Ok(n)
+    }
+
+    pub fn change_log_total(&self) -> Result<i64> {
+        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM change_log")?;
+        let n: i64 = stmt.query_row([], |row| row.get(0))?;
+        Ok(n)
     }
 }
 

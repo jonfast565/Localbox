@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub tls_cert_path: PathBuf,
     pub tls_key_path: PathBuf,
     pub tls_ca_cert_path: PathBuf,
+    #[serde(default)]
+    pub tls_pinned_ca_fingerprints: Vec<String>,
     pub remote_share_root: PathBuf,
     pub shares: Vec<ShareConfig>,
 }
@@ -23,4 +25,7 @@ pub struct ShareConfig {
     pub name: String,
     pub root_path: PathBuf,
     pub recursive: bool,
+    #[serde(default)]
+    pub ignore_patterns: Vec<String>,
+    pub max_file_size_bytes: Option<u64>,
 }

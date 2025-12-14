@@ -8,10 +8,12 @@ use rustls::server::AllowAnyAuthenticatedClient;
 use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{info, warn};
-use utilities::FileSystem;
+use utilities::{write_atomic, FileSystem};
 
 use std::io::BufReader;
 use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
 
 pub struct TlsComponents {
     pub acceptor: TlsAcceptor,
@@ -23,12 +25,15 @@ impl TlsComponents {
         let (certs, key, ca_store) = match load_tls_from_files(cfg, fs) {
             Ok(tuple) => tuple,
             Err(e) => {
+                if !cfg.tls_pinned_ca_fingerprints.is_empty() {
+                    return Err(e).context("TLS pinning is enabled; refusing to auto-generate TLS materials");
+                }
                 warn!(
                     "Failed to load TLS materials from disk ({}). Generating ephemeral self-signed certs instead.",
                     e
                 );
-                let generated = generate_ephemeral_tls(&cfg.pc_name)?;
-                if let Err(write_err) = persist_generated_tls(cfg, &generated, fs) {
+                let generated = generate_tls_materials(&cfg.pc_name)?;
+                if let Err(write_err) = persist_tls_materials(cfg, &generated, fs) {
                     warn!("Could not write generated TLS materials to disk: {write_err}");
                 }
                 (generated.cert_chain, generated.key, generated.ca_store)
@@ -75,16 +80,14 @@ fn load_private_key(path: &std::path::Path, fs: &dyn FileSystem) -> Result<Priva
     Ok(PrivateKey(key))
 }
 
-fn load_ca_store(path: &std::path::Path, fs: &dyn FileSystem) -> Result<RootCertStore> {
-    let mut store = RootCertStore::empty();
+fn load_ca_store(path: &std::path::Path, fs: &dyn FileSystem) -> Result<Vec<Vec<u8>>> {
     let data = fs.read(path)?;
     let mut reader = BufReader::new(std::io::Cursor::new(data));
     let certs = rustls_pemfile::certs(&mut reader)?;
-    let (added, _ignored) = store.add_parsable_certificates(&certs);
-    if added == 0 {
+    if certs.is_empty() {
         bail!("no CA certificates could be loaded from {}", path.display());
     }
-    Ok(store)
+    Ok(certs)
 }
 
 fn load_tls_from_files(
@@ -95,21 +98,34 @@ fn load_tls_from_files(
         .with_context(|| format!("loading certs from {}", cfg.tls_cert_path.display()))?;
     let key = load_private_key(&cfg.tls_key_path, fs)
         .with_context(|| format!("loading key from {}", cfg.tls_key_path.display()))?;
-    let ca_store = load_ca_store(&cfg.tls_ca_cert_path, fs)
+    let mut ca_certs = load_ca_store(&cfg.tls_ca_cert_path, fs)
         .with_context(|| format!("loading CA store from {}", cfg.tls_ca_cert_path.display()))?;
+
+    if !cfg.tls_pinned_ca_fingerprints.is_empty() {
+        ca_certs = pin_certs(ca_certs, &cfg.tls_pinned_ca_fingerprints)?;
+    }
+
+    let mut ca_store = RootCertStore::empty();
+    let (added, _ignored) = ca_store.add_parsable_certificates(&ca_certs);
+    if added == 0 {
+        bail!(
+            "no CA certificates could be loaded from {} (after pinning/filtering)",
+            cfg.tls_ca_cert_path.display()
+        );
+    }
     Ok((certs, key, ca_store))
 }
 
-struct GeneratedTls {
+pub struct TlsMaterials {
     cert_chain: Vec<Certificate>,
     key: PrivateKey,
     ca_store: RootCertStore,
-    leaf_pem: String,
-    key_pem: String,
-    ca_pem: String,
+    pub cert_chain_pem: String,
+    pub key_pem: String,
+    pub ca_pem: String,
 }
 
-fn generate_ephemeral_tls(node_name: &str) -> Result<GeneratedTls> {
+pub fn generate_tls_materials(node_name: &str) -> Result<TlsMaterials> {
     let mut ca_params = CertificateParams::default();
     ca_params.distinguished_name = {
         let mut dn = DistinguishedName::new();
@@ -144,17 +160,17 @@ fn generate_ephemeral_tls(node_name: &str) -> Result<GeneratedTls> {
 
     let cert_chain = vec![Certificate(leaf_der), Certificate(ca_der)];
     let key = PrivateKey(leaf_key);
-    Ok(GeneratedTls {
+    Ok(TlsMaterials {
         cert_chain,
         key,
         ca_store,
-        leaf_pem,
+        cert_chain_pem: format!("{leaf_pem}\n{ca_pem}"),
         key_pem,
         ca_pem,
     })
 }
 
-fn persist_generated_tls(cfg: &AppConfig, generated: &GeneratedTls, fs: &dyn FileSystem) -> Result<()> {
+pub fn persist_tls_materials(cfg: &AppConfig, generated: &TlsMaterials, fs: &dyn FileSystem) -> Result<()> {
     if let Some(parent) = cfg.tls_cert_path.parent() {
         fs.create_dir_all(parent)?;
     }
@@ -165,9 +181,16 @@ fn persist_generated_tls(cfg: &AppConfig, generated: &GeneratedTls, fs: &dyn Fil
         fs.create_dir_all(parent)?;
     }
 
-    fs.write(&cfg.tls_cert_path, generated.leaf_pem.as_bytes())?;
-    fs.write(&cfg.tls_key_path, generated.key_pem.as_bytes())?;
-    fs.write(&cfg.tls_ca_cert_path, generated.ca_pem.as_bytes())?;
+    write_atomic(fs, &cfg.tls_cert_path, generated.cert_chain_pem.as_bytes())?;
+    write_atomic(fs, &cfg.tls_key_path, generated.key_pem.as_bytes())?;
+
+    // Preserve any existing trust store and append our CA if it's not present.
+    let mut existing = String::new();
+    if let Ok(bytes) = fs.read(&cfg.tls_ca_cert_path) {
+        existing = String::from_utf8_lossy(&bytes).to_string();
+    }
+    let merged = merge_ca_bundle(&existing, &generated.ca_pem);
+    write_atomic(fs, &cfg.tls_ca_cert_path, merged.as_bytes())?;
     info!(
         "Generated new TLS materials at {}, {}, {}",
         cfg.tls_cert_path.display(),
@@ -175,4 +198,56 @@ fn persist_generated_tls(cfg: &AppConfig, generated: &GeneratedTls, fs: &dyn Fil
         cfg.tls_ca_cert_path.display()
     );
     Ok(())
+}
+
+fn merge_ca_bundle(existing_pem: &str, ca_pem: &str) -> String {
+    let mut out = existing_pem.to_string();
+    if !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    let existing_fps = fingerprints_from_pem(existing_pem);
+    let ca_fps = fingerprints_from_pem(ca_pem);
+    let already_present = ca_fps.iter().all(|fp| existing_fps.contains(fp));
+    if !already_present {
+        out.push_str(ca_pem);
+        out.push('\n');
+    }
+    out
+}
+
+fn fingerprints_from_pem(pem: &str) -> Vec<String> {
+    let mut reader = BufReader::new(std::io::Cursor::new(pem.as_bytes()));
+    let certs = rustls_pemfile::certs(&mut reader).unwrap_or_default();
+    certs.into_iter().map(|der| sha256_fp(&der)).collect()
+}
+
+fn sha256_fp(der: &[u8]) -> String {
+    let digest = Sha256::digest(der);
+    digest.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(":")
+}
+
+fn pin_certs(certs: Vec<Vec<u8>>, pinned: &[String]) -> Result<Vec<Vec<u8>>> {
+    let pinned_set: std::collections::HashSet<String> = pinned
+        .iter()
+        .map(|s| {
+            s.chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .map(|c| c.to_ascii_uppercase())
+                .collect::<String>()
+        })
+        .collect();
+
+    let filtered: Vec<Vec<u8>> = certs
+        .into_iter()
+        .filter(|der| {
+            let fp = sha256_fp(der);
+            let norm: String = fp.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+            pinned_set.contains(&norm)
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        bail!("tls_pinned_ca_fingerprints did not match any certificates in the trust store");
+    }
+    Ok(filtered)
 }

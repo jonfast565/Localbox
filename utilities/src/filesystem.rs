@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -24,6 +25,9 @@ pub trait FileSystem: Send + Sync {
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()>;
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>>;
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
 }
 
 #[derive(Debug, Default, Clone)]
@@ -81,6 +85,19 @@ impl FileSystem for RealFileSystem {
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         std::fs::create_dir_all(path)
+    }
+
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
+        let f = std::fs::File::open(path)?;
+        Ok(Box::new(f))
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
     }
 }
 
@@ -298,6 +315,78 @@ impl FileSystem for VirtualFileSystem {
                         modified: SystemTime::now(),
                     });
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
+        let data = self.read(path)?;
+        Ok(Box::new(std::io::Cursor::new(data)))
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let from_norm = Self::normalize(from);
+        let to_norm = Self::normalize(to);
+
+        if from_norm == to_norm {
+            return Ok(());
+        }
+
+        self.ensure_parent(&mut inner, &to_norm)?;
+
+        let node = inner.nodes.remove(&from_norm).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} not found", from_norm.display()),
+            )
+        })?;
+        inner.nodes.insert(to_norm.clone(), node);
+
+        if let Some(parent) = from_norm.parent() {
+            if let Some(children) = inner.children.get_mut(&Self::normalize(parent)) {
+                children.retain(|_, p| p != &from_norm);
+            }
+        }
+        if let Some(parent) = to_norm.parent() {
+            let parent_norm = Self::normalize(parent);
+            let name = to_norm
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            inner
+                .children
+                .entry(parent_norm)
+                .or_default()
+                .insert(name, to_norm);
+        }
+        Ok(())
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let norm = Self::normalize(path);
+        match inner.nodes.get(&norm) {
+            Some(VNode::File { .. }) => {}
+            Some(VNode::Dir { .. }) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("{} is a directory", norm.display()),
+                ))
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{} not found", norm.display()),
+                ))
+            }
+        }
+        inner.nodes.remove(&norm);
+        if let Some(parent) = norm.parent() {
+            if let Some(children) = inner.children.get_mut(&Self::normalize(parent)) {
+                children.retain(|_, p| p != &norm);
             }
         }
         Ok(())

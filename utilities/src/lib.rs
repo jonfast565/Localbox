@@ -2,6 +2,7 @@
 
 use std::ffi::OsStr;
 use std::io;
+use std::io::Read;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -14,10 +15,11 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 pub mod disk_utilities;
 pub mod filesystem;
+pub mod ignore;
 pub mod net;
 
 pub use filesystem::{DirEntry, FileSystem, FsMetadata, RealFileSystem, VirtualFileSystem};
-pub use disk_utilities::{build_meta_with_retry, build_remote_share_root, relative_share_path};
+pub use disk_utilities::{build_meta_with_retry, build_meta_with_retry_limited, build_remote_share_root, relative_share_path};
 pub use net::{DynStream, Net, RealNet, TcpListenerLike, UdpSocketLike, VirtualNet};
 
 /// Guard for the non-blocking file writer so it is not dropped early.
@@ -87,11 +89,32 @@ where
 }
 
 fn compute_file_hash_once(fs: &dyn FileSystem, path: &Path) -> io::Result<[u8; 32]> {
-    let data = fs.read(path)?;
-    let digest = Sha256::digest(&data);
+    let mut reader = fs.open_read(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     Ok(out)
+}
+
+/// Write file contents via a temp file + rename when possible.
+pub fn write_atomic(fs: &dyn FileSystem, path: &Path, data: &[u8]) -> io::Result<()> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().unwrap_or_else(|| OsStr::new("file"));
+    let tmp = parent.join(format!(".{}.tmp", file_name.to_string_lossy()));
+
+    fs.write(&tmp, data)?;
+    let _ = fs.remove_file(path);
+    fs.rename(&tmp, path)?;
+    Ok(())
 }
 
 fn configure_logging(log_path: &Path, fs: &dyn FileSystem) -> Result<()> {

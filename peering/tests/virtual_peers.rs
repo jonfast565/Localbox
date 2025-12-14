@@ -238,11 +238,14 @@ fn test_config(
         tls_cert_path: tls.cert.clone(),
         tls_key_path: tls.key.clone(),
         tls_ca_cert_path: tls.ca.clone(),
+        tls_pinned_ca_fingerprints: Vec::new(),
         remote_share_root: PathBuf::from("remote"),
         shares: vec![ShareConfig {
             name: share_name.to_string(),
             root_path: PathBuf::from("/virtual"),
             recursive: true,
+            ignore_patterns: Vec::new(),
+            max_file_size_bytes: None,
         }],
     }
 }
@@ -272,6 +275,7 @@ async fn enqueue_sample_batch(
         },
     };
     let manifest = models::BatchManifest {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
         batch_id: format!("batch-{}", path),
         share_id: *share_id,
         from_node: "local".to_string(),
@@ -313,6 +317,7 @@ async fn enqueue_batch_with_seq(
         },
     };
     let manifest = models::BatchManifest {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
         batch_id: format!("batch-{}-{}", path, seq),
         share_id: *share_id,
         from_node: "local".to_string(),

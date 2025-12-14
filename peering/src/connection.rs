@@ -10,6 +10,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{error, info, warn};
 use utilities::disk_utilities::build_remote_share_root;
 use utilities::{DynStream, FileSystem, Net};
+use tracing::Instrument;
 
 use crate::writer::{recv_framed_message, send_framed_message, PeerWriter};
 use crate::{DbHandle, SharedWriters};
@@ -90,6 +91,7 @@ async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     fs: Arc<dyn FileSystem>,
 ) -> Result<(HelloMessage, i64)> {
     let hello = HelloMessage {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
         pc_name: cfg.pc_name.clone(),
         instance_id: cfg.instance_id.clone(),
         listen_port: cfg.listen_addr.port(),
@@ -187,25 +189,24 @@ async fn handle_batch_message(
     peer_id: i64,
     batch: models::BatchManifest,
 ) {
+    let span = tracing::info_span!(
+        "handle_batch",
+        batch_id = %batch.batch_id,
+        peer_id = peer_id,
+        share_id = ?batch.share_id.0
+    );
+    async move {
     let is_new = db
         .lock()
         .await
         .record_inbound_batch(&batch.batch_id)
         .unwrap_or(false);
     if !is_new {
-        info!(
-            "Duplicate batch {} from {} ignored",
-            batch.batch_id, batch.from_node
-        );
+        info!(from_node = %batch.from_node, "Duplicate batch ignored");
         return;
     }
 
-    info!(
-        "Received batch {} from {} with {} changes",
-        batch.batch_id,
-        batch.from_node,
-        batch.changes.len()
-    );
+    info!(from_node = %batch.from_node, change_count = batch.changes.len(), "Received batch");
 
     let mut max_seq_for_share = 0;
     for mut change in batch.changes.clone() {
@@ -244,6 +245,9 @@ async fn handle_batch_message(
     if max_seq_for_share > 0 {
         send_batch_ack(connections, peer_id, &batch.share_id, max_seq_for_share).await;
     }
+    }
+    .instrument(span)
+    .await;
 }
 
 async fn send_batch_ack(
@@ -262,6 +266,7 @@ async fn send_batch_ack(
     };
 
     let msg = WireMessage::BatchAck(models::BatchAck {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
         share_id: *share_id,
         upto_seq,
     });
@@ -402,6 +407,8 @@ async fn ensure_remote_shares(
             name: share_name.clone(),
             root_path: share_root,
             recursive: true,
+            ignore_patterns: Vec::new(),
+            max_file_size_bytes: None,
         };
         let share_id = ShareId::new(share_name, &remote.pc_name);
         if let Err(e) = db

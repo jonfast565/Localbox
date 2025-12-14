@@ -39,6 +39,10 @@ pub enum Command {
     Init(InitArgs),
     /// Validate merged configuration (config.toml + CLI overrides)
     Validate(ValidateArgs),
+    /// TLS trust store operations (CA import/export/fingerprints/rotation)
+    Tls(TlsArgs),
+    /// Show current status (peers, shares, progress, queue depth) from the local DB
+    Status(StatusArgs),
 }
 
 #[derive(Debug, Args)]
@@ -51,6 +55,74 @@ pub struct InitArgs {
 #[derive(Debug, Args)]
 pub struct ValidateArgs {}
 
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    /// Print as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct TlsArgs {
+    #[command(subcommand)]
+    pub command: TlsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TlsCommand {
+    /// Ensure TLS materials exist (generate if missing) and print fingerprints
+    Ensure,
+    /// List trusted CA fingerprints (from tls_ca_cert_path)
+    List,
+    /// Print certificate SHA-256 fingerprints (leaf or CA bundle)
+    Fingerprint(FingerprintArgs),
+    /// Export this node's CA certificate (from tls_cert_path chain)
+    ExportCa(ExportCaArgs),
+    /// Import CA certificate(s) into tls_ca_cert_path (deduped by fingerprint)
+    ImportCa(ImportCaArgs),
+    /// Rotate this node's CA + leaf cert and optionally export the new CA
+    Rotate(RotateArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct FingerprintArgs {
+    /// Optional PEM file to fingerprint (otherwise uses configured paths)
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<PathBuf>,
+
+    /// Print only leaf certificate fingerprints (from tls_cert_path)
+    #[arg(long)]
+    pub leaf: bool,
+
+    /// Print only CA/trust-store fingerprints (from tls_ca_cert_path)
+    #[arg(long)]
+    pub ca: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ExportCaArgs {
+    /// Output path for the exported CA certificate PEM
+    #[arg(long, value_name = "PATH")]
+    pub out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct ImportCaArgs {
+    /// Input PEM file containing one or more CA certificates
+    #[arg(long, value_name = "PATH")]
+    pub r#in: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct RotateArgs {
+    /// Write backups alongside existing files using a .bak-<timestamp> suffix
+    #[arg(long)]
+    pub backup: bool,
+
+    /// Optional path to write the newly-generated CA certificate PEM (for distribution)
+    #[arg(long, value_name = "PATH")]
+    pub export_ca: Option<PathBuf>,
+}
 #[derive(Debug, Args, Default)]
 pub struct RunArgs {
     /// Instance identifier for this node
@@ -104,6 +176,14 @@ pub struct RunArgs {
 
 impl Cli {
     pub fn resolve_app_config(&self) -> Result<AppConfig> {
+        self.resolve_app_config_inner(true)
+    }
+
+    pub fn resolve_app_config_allow_empty_shares(&self) -> Result<AppConfig> {
+        self.resolve_app_config_inner(false)
+    }
+
+    fn resolve_app_config_inner(&self, require_shares: bool) -> Result<AppConfig> {
         let file_cfg = load_optional_file_config(self.config.as_deref())?;
 
         let pc_name = hostname::get()
@@ -178,6 +258,11 @@ impl Cli {
             .or_else(|| file_cfg.as_ref().and_then(|c| c.remote_share_root.clone()))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_REMOTE_SHARE_ROOT));
 
+        let tls_pinned_ca_fingerprints = file_cfg
+            .as_ref()
+            .and_then(|c| c.tls_pinned_ca_fingerprints.clone())
+            .unwrap_or_default();
+
         let shares = merge_shares(
             file_cfg
                 .as_ref()
@@ -186,7 +271,7 @@ impl Cli {
             self.run.shares.clone(),
         )?;
 
-        if shares.is_empty() {
+        if require_shares && shares.is_empty() {
             let config_hint = match &self.config {
                 Some(p) => format!("or add shares to {}", p.display()),
                 None => format!("or create {} with `localbox init`", DEFAULT_CONFIG_PATH),
@@ -208,6 +293,7 @@ impl Cli {
             tls_cert_path,
             tls_key_path,
             tls_ca_cert_path,
+            tls_pinned_ca_fingerprints,
             remote_share_root,
             shares,
         })
@@ -253,6 +339,8 @@ impl ShareCli {
             name: self.name,
             root_path: self.root,
             recursive: self.recursive,
+            ignore_patterns: Vec::new(),
+            max_file_size_bytes: None,
         }
     }
 }
@@ -319,6 +407,7 @@ struct FileConfig {
     tls_cert_path: Option<PathBuf>,
     tls_key_path: Option<PathBuf>,
     tls_ca_cert_path: Option<PathBuf>,
+    tls_pinned_ca_fingerprints: Option<Vec<String>>,
     remote_share_root: Option<PathBuf>,
     shares: Option<Vec<FileShareConfig>>,
 }
@@ -330,6 +419,9 @@ struct FileShareConfig {
     root_path: PathBuf,
     #[serde(default = "default_recursive")]
     recursive: bool,
+    #[serde(default)]
+    ignore_patterns: Vec<String>,
+    max_file_size_bytes: Option<u64>,
 }
 
 fn default_recursive() -> bool {
@@ -411,12 +503,21 @@ fn merge_shares(file_shares: Vec<FileShareConfig>, cli_shares: Vec<ShareCli>) ->
             name,
             root_path: s.root_path,
             recursive: s.recursive,
+            ignore_patterns: s.ignore_patterns,
+            max_file_size_bytes: s.max_file_size_bytes,
         });
     }
 
     for s in cli_shares {
         if let Some(idx) = idx_by_name.get(&s.name).copied() {
-            out[idx] = s.into_share_config();
+            let existing = out[idx].clone();
+            out[idx] = ShareConfig {
+                name: s.name,
+                root_path: s.root,
+                recursive: s.recursive,
+                ignore_patterns: existing.ignore_patterns,
+                max_file_size_bytes: existing.max_file_size_bytes,
+            };
         } else {
             idx_by_name.insert(s.name.clone(), out.len());
             out.push(s.into_share_config());
@@ -517,10 +618,17 @@ tls_ca_cert_path = "{tls_ca_cert_path}"
 
 remote_share_root = "{remote_share_root}"
 
+# Optional: restrict trust to specific CA fingerprints (SHA-256 hex; spaces/colons ignored).
+# tls_pinned_ca_fingerprints = [
+#   "AA:BB:CC:...",
+# ]
+
 [[shares]]
 name = "docs"
 root_path = "C:/path/to/docs"
 recursive = true
+# ignore_patterns = ["**/.git/**", "**/*.tmp"]
+# max_file_size_bytes = 1073741824 # 1 GiB
 "#,
         instance_id = DEFAULT_INSTANCE_ID,
         listen_port = DEFAULT_LISTEN_PORT,
@@ -606,11 +714,14 @@ mod tests {
             tls_cert_path: PathBuf::from("cert"),
             tls_key_path: PathBuf::from("key"),
             tls_ca_cert_path: PathBuf::from("ca"),
+            tls_pinned_ca_fingerprints: Vec::new(),
             remote_share_root: PathBuf::from("remote"),
             shares: vec![models::ShareConfig {
                 name: "s".to_string(),
                 root_path: tmp_dir.clone(),
                 recursive: true,
+                ignore_patterns: Vec::new(),
+                max_file_size_bytes: None,
             }],
         };
         validate_app_config(&cfg).unwrap();

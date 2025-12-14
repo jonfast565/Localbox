@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 use utilities::{init_logging, FileSystem, Net, RealFileSystem, RealNet};
 use tokio_util::sync::CancellationToken;
-use utilities::disk_utilities::build_meta_with_retry;
+use utilities::disk_utilities::build_meta_with_retry_limited;
 use utilities::compute_file_hash;
 use uuid::Uuid;
 
@@ -332,43 +332,61 @@ async fn enqueue_batch(
     net_tx: &mpsc::Sender<String>,
     share_labels: &HashMap<[u8; 16], String>,
 ) {
-    let batch_id = Uuid::new_v4().to_string();
-    let manifest = BatchManifest {
-        batch_id: batch_id.clone(),
-        share_id: *share_id,
-        from_node: from_node.to_string(),
-        created_at,
-        changes: changes.to_vec(),
-    };
+    const MAX_OUTBOUND_QUEUE_DEPTH: i64 = 50_000;
+    const MAX_CHANGES_PER_BATCH: usize = 256;
 
-    if let Err(e) = db
-        .lock()
-        .await
-        .enqueue_outbound_batch(&manifest, peer_id)
-    {
-        match peer_id {
-            Some(pid) => error!("Failed to queue batch {batch_id} for peer {pid}: {e}"),
-            None => error!("Failed to queue batch {batch_id} for outbound: {e}"),
-        }
+    let queue_depth = db.lock().await.outbound_queue_depth().unwrap_or(0);
+    if queue_depth >= MAX_OUTBOUND_QUEUE_DEPTH {
+        warn!(
+            "Outbound queue depth {} exceeds limit {}; dropping {} changes for share {:?}",
+            queue_depth,
+            MAX_OUTBOUND_QUEUE_DEPTH,
+            changes.len(),
+            share_id.0
+        );
         return;
     }
 
-    let _ = net_tx.try_send(batch_id.clone());
     let label = format_share_label(share_id, share_labels);
-    match peer_id {
-        Some(pid) => info!(
-            "Aggregated {} changes into batch {} for share {} targeting peer {}",
-            changes.len(),
-            batch_id,
-            label,
-            pid
-        ),
-        None => info!(
-            "Aggregated {} changes into batch {} for share {} (no peers yet)",
-            changes.len(),
-            batch_id,
-            label
-        ),
+    for chunk in changes.chunks(MAX_CHANGES_PER_BATCH) {
+        let batch_id = Uuid::new_v4().to_string();
+        let manifest = BatchManifest {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
+            batch_id: batch_id.clone(),
+            share_id: *share_id,
+            from_node: from_node.to_string(),
+            created_at,
+            changes: chunk.to_vec(),
+        };
+
+        if let Err(e) = db
+            .lock()
+            .await
+            .enqueue_outbound_batch(&manifest, peer_id)
+        {
+            match peer_id {
+                Some(pid) => error!("Failed to queue batch {batch_id} for peer {pid}: {e}"),
+                None => error!("Failed to queue batch {batch_id} for outbound: {e}"),
+            }
+            continue;
+        }
+
+        let _ = net_tx.try_send(batch_id.clone());
+        match peer_id {
+            Some(pid) => info!(
+                "Aggregated {} changes into batch {} for share {} targeting peer {}",
+                chunk.len(),
+                batch_id,
+                label,
+                pid
+            ),
+            None => info!(
+                "Aggregated {} changes into batch {} for share {} (no peers yet)",
+                chunk.len(),
+                batch_id,
+                label
+            ),
+        }
     }
 }
 
@@ -478,6 +496,8 @@ mod tests {
             share_id: ShareId::new("s", "pc"),
             root_path: root.clone(),
             recursive: true,
+            ignore_patterns: Vec::new(),
+            max_file_size_bytes: None,
             index: HashMap::new(),
         };
 
@@ -617,6 +637,7 @@ async fn change_aggregator_task(
     token: CancellationToken,
 ) {
     let mut pending: Vec<FileChange> = Vec::new();
+    const MAX_PENDING_CHANGES: usize = 50_000;
     let mut ticker = interval(Duration::from_millis(agg_window_ms));
 
     loop {
@@ -630,7 +651,15 @@ async fn change_aggregator_task(
                 let label = format_share_label(&change.share_id, &share_labels);
                 if let Some(change) = persist_incoming_change(&db, change).await {
                     info!("Queued change for share {}: {}", label, change.path);
-                    pending.push(change);
+                    if pending.len() >= MAX_PENDING_CHANGES {
+                        warn!(
+                            "Dropping change due to pending buffer limit ({}): {}",
+                            MAX_PENDING_CHANGES,
+                            change.path
+                        );
+                    } else {
+                        pending.push(change);
+                    }
                 } else {
                     warn!("Dropping change for share {} after persistence failure", label);
                 }
@@ -747,9 +776,20 @@ fn handle_path_event(
         }
     };
 
+    if utilities::ignore::is_ignored_rel_path(&rel_path, &share.ignore_patterns) {
+        return;
+    }
+
     let meta_opt = match change_kind {
         ChangeKind::Delete => None,
-        _ => match build_meta_with_retry(fs.as_ref(), &path, &rel_path, attempts, delay_ms) {
+        _ => match build_meta_with_retry_limited(
+            fs.as_ref(),
+            &path,
+            &rel_path,
+            attempts,
+            delay_ms,
+            share.max_file_size_bytes,
+        ) {
             Ok(meta) => Some(meta),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 info!(
@@ -759,11 +799,19 @@ fn handle_path_event(
                 None
             }
             Err(e) => {
-                warn!("Failed to gather file info for {:?}: {e}", path);
+                warn!(
+                    "Failed to gather file info for {:?} ({}): {e}",
+                    path,
+                    share.share_name
+                );
                 None
             }
         },
     };
+
+    if !matches!(change_kind, ChangeKind::Delete) && meta_opt.is_none() {
+        return;
+    }
 
     let change = FileChange {
         seq: 0,
@@ -840,6 +888,14 @@ fn seed_change_log_from_index(
                 Err(_) => continue,
             };
             let rel_path = rel.to_string_lossy().to_string();
+            if utilities::ignore::is_ignored_rel_path(&rel_path, &share.ignore_patterns) {
+                continue;
+            }
+            if let Some(max) = share.max_file_size_bytes {
+                if entry.metadata.len > max {
+                    continue;
+                }
+            }
             if share.index.contains_key(&rel_path) {
                 continue;
             }
@@ -893,6 +949,9 @@ fn handle_rename_event(
     if let Some(from) = from_opt {
         if let Ok(rel) = from.strip_prefix(&share.root_path) {
             let rel_str = rel.to_string_lossy().to_string();
+            if utilities::ignore::is_ignored_rel_path(&rel_str, &share.ignore_patterns) {
+                return;
+            }
             let change = FileChange {
                 seq: 0,
                 share_id: share.share_id,
@@ -913,7 +972,17 @@ fn handle_rename_event(
     if let Some(to) = to_opt {
         if let Ok(rel) = to.strip_prefix(&share.root_path) {
             let rel_str = rel.to_string_lossy().to_string();
-            match build_meta_with_retry(fs.as_ref(), to, &rel_str, attempts, delay_ms) {
+            if utilities::ignore::is_ignored_rel_path(&rel_str, &share.ignore_patterns) {
+                return;
+            }
+            match build_meta_with_retry_limited(
+                fs.as_ref(),
+                to,
+                &rel_str,
+                attempts,
+                delay_ms,
+                share.max_file_size_bytes,
+            ) {
                 Ok(meta) => {
                     let change = FileChange {
                         seq: 0,

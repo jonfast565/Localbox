@@ -274,6 +274,7 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
+ "uuid",
 ]
 
 [[package]]
@@ -641,8 +642,10 @@ dependencies = [
  "models",
  "notify",
  "peering",
+ "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2",
  "time",
  "tokio",
  "tokio-util",
@@ -811,6 +814,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha2",
  "time",
  "tokio",
  "tokio-rustls",

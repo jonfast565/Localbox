@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::share::ShareId;
+use crate::default_wire_protocol_version;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileMeta {
@@ -30,6 +31,8 @@ pub struct FileChange {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchManifest {
+    #[serde(default = "default_wire_protocol_version")]
+    pub protocol_version: u16,
     pub batch_id: String, // e.g. UUID string
     pub share_id: ShareId,
     pub from_node: String, // pc_name

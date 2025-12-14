@@ -21,6 +21,7 @@ fn share_id_changes_with_inputs() {
 #[test]
 fn wire_message_json_round_trip() {
     let msg = WireMessage::Hello(HelloMessage {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
         pc_name: "pc-one".to_string(),
         instance_id: "inst".to_string(),
         listen_port: 5000,
@@ -34,6 +35,7 @@ fn wire_message_json_round_trip() {
     );
 
     let ack = WireMessage::BatchAck(BatchAck {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
         share_id: ShareId::new("shareA", "pc-one"),
         upto_seq: 123,
     });
@@ -58,11 +60,14 @@ fn app_config_json_round_trip() {
         tls_cert_path: PathBuf::from("cert.pem"),
         tls_key_path: PathBuf::from("key.pem"),
         tls_ca_cert_path: PathBuf::from("ca.pem"),
+        tls_pinned_ca_fingerprints: Vec::new(),
         remote_share_root: PathBuf::from("remote"),
         shares: vec![ShareConfig {
             name: "shareA".to_string(),
             root_path: PathBuf::from("/share"),
             recursive: true,
+            ignore_patterns: Vec::new(),
+            max_file_size_bytes: None,
         }],
     };
     let bytes = serde_json::to_vec(&cfg).unwrap();

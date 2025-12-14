@@ -135,9 +135,37 @@ Localbox uses mTLS for peer connections and expects three PEM files:
 - `--tls-key-path` (PKCS#8 private key)
 - `--tls-ca-cert-path` (CA bundle used to authenticate peers)
 
-If these files are missing or invalid, Localbox generates an ephemeral CA + leaf cert, and attempts to write them to the configured paths.
+If these files are missing or invalid, Localbox generates a new local CA + leaf cert and attempts to write them to the configured paths.
 
 For multiple machines to connect, each node must trust the other nodes' CA certificates (for example, by distributing CA certs and concatenating them into the `--tls-ca-cert-path` bundle on every node).
+
+### Trust store workflow (two machines)
+
+On **each** machine, decide where you keep `config.toml` and set the TLS paths (defaults are under `certs/`).
+
+1. Generate or ensure TLS materials exist:
+   - `localbox tls ensure`
+2. Export the local CA certificate from machine A:
+   - `localbox tls export-ca --out pc-a.ca.pem`
+3. Copy `pc-a.ca.pem` to machine B via a secure channel (USB, SCP, etc).
+4. Import it into machine B's trust store:
+   - `localbox tls import-ca --in pc-a.ca.pem`
+5. Repeat in the other direction (export from B, import into A).
+6. Verify what each machine trusts:
+   - `localbox tls list`
+   - Optional: `localbox tls fingerprint --file pc-a.ca.pem`
+
+### Rotation (recommended overlap)
+
+Rotate on a machine (new CA + new leaf cert):
+
+- `localbox tls rotate --backup --export-ca pc-a.ca.new.pem`
+
+Then distribute/import `pc-a.ca.new.pem` to all peers **before** expecting them to trust the rotated machine. Keep the old CA in peers' trust stores until you're confident no one still uses it.
+
+### Optional pinning
+
+If you want to restrict trust to a specific set of CA fingerprints (even if `tls_ca_cert_path` contains more), set `tls_pinned_ca_fingerprints` in `config.toml`. Fingerprints are SHA-256 hex; colons/spaces are ignored.
 
 ## Workspace layout
 

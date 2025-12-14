@@ -523,6 +523,7 @@ async fn enqueue_catchup_if_needed(
                 max_seq
             );
             let manifest = models::BatchManifest {
+                protocol_version: models::WIRE_PROTOCOL_VERSION,
                 batch_id: batch_id.clone(),
                 share_id: share.share_id,
                 from_node: local_name.to_string(),
@@ -541,12 +542,20 @@ async fn enqueue_catchup_if_needed(
                         .bump_last_seq_sent(peer_id, share_row_id, max_seq);
                     let _ = net_tx.try_send(batch_id.clone());
                     info!(
-                        "Queued catch-up batch {} for share {} to peer {} up to seq {}",
-                        batch_id, share.share_name, peer_id, max_seq
+                        batch_id = %batch_id,
+                        peer_id = peer_id,
+                        share_name = %share.share_name,
+                        upto_seq = max_seq,
+                        "Queued catch-up batch"
                     );
                 }
                 Err(e) => {
-                    warn!("Failed to enqueue catch-up batch {}: {e}", batch_id);
+                    warn!(
+                        batch_id = %batch_id,
+                        peer_id = peer_id,
+                        error = %e,
+                        "Failed to enqueue catch-up batch"
+                    );
                     break;
                 }
             }
@@ -597,6 +606,7 @@ async fn enqueue_bootstrap_if_needed(
 
         let batch_id = format!("bootstrap-{}-{}", peer_id, share.share_name);
         let manifest = models::BatchManifest {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
             batch_id: batch_id.clone(),
             share_id: share.share_id,
             from_node: local_name.to_string(),
@@ -616,11 +626,19 @@ async fn enqueue_bootstrap_if_needed(
                     .bump_last_seq_sent(peer_id, share.id, max_seq);
                 let _ = net_tx.try_send(batch_id.clone());
                 info!(
-                    "Queued bootstrap batch {} for share {} to peer {}",
-                    batch_id, share.share_name, remote_name
+                    batch_id = %batch_id,
+                    peer_id = peer_id,
+                    share_name = %share.share_name,
+                    remote_pc_name = %remote_name,
+                    "Queued bootstrap batch"
                 );
             }
-            Err(e) => warn!("Failed to enqueue bootstrap batch {}: {e}", batch_id),
+            Err(e) => warn!(
+                batch_id = %batch_id,
+                peer_id = peer_id,
+                error = %e,
+                "Failed to enqueue bootstrap batch"
+            ),
         }
     }
 }

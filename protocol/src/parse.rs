@@ -63,12 +63,27 @@ pub fn parse_discovery_message(msg: &str) -> Option<DiscoveryMessage> {
 }
 
 pub fn parse_wire_message(bytes: &[u8]) -> Result<WireMessage> {
-    let msg = serde_json::from_slice(bytes)?;
+    let msg: WireMessage = serde_json::from_slice(bytes)?;
+    let v = models::wire::wire_message_protocol_version(&msg);
+    if v > models::WIRE_PROTOCOL_VERSION {
+        anyhow::bail!(
+            "unsupported wire protocol version {} (max supported {})",
+            v,
+            models::WIRE_PROTOCOL_VERSION
+        );
+    }
     Ok(msg)
 }
 
 pub fn parse_batch_manifest(json: &str) -> Result<BatchManifest> {
-    let manifest = serde_json::from_str(json)?;
+    let manifest: BatchManifest = serde_json::from_str(json)?;
+    if manifest.protocol_version > models::WIRE_PROTOCOL_VERSION {
+        anyhow::bail!(
+            "unsupported wire protocol version {} (max supported {})",
+            manifest.protocol_version,
+            models::WIRE_PROTOCOL_VERSION
+        );
+    }
     Ok(manifest)
 }
 
@@ -108,6 +123,7 @@ pub fn decode_wire_message_proto(bytes: &[u8]) -> Result<WireMessage> {
     let env = WireEnvelope::decode(bytes)?;
     match env.msg {
         Some(ProtoMsg::Hello(h)) => Ok(WireMessage::Hello(models::HelloMessage {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
             pc_name: h.pc_name,
             instance_id: h.instance_id,
             listen_port: h.listen_port as u16,
@@ -115,6 +131,7 @@ pub fn decode_wire_message_proto(bytes: &[u8]) -> Result<WireMessage> {
         })),
         Some(ProtoMsg::Batch(b)) => Ok(WireMessage::Batch(batch_from_proto(&b)?)),
         Some(ProtoMsg::BatchAck(a)) => Ok(WireMessage::BatchAck(BatchAck {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
             share_id: models::ShareId(proto_share_id_to_array(&a.share_id)?),
             upto_seq: a.upto_seq,
         })),
@@ -165,6 +182,7 @@ fn batch_to_proto(batch: &BatchManifest) -> ProtoBatch {
 
 fn batch_from_proto(pb: &ProtoBatch) -> Result<BatchManifest> {
     Ok(BatchManifest {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
         batch_id: pb.batch_id.clone(),
         share_id: models::ShareId(proto_share_id_to_array(&pb.share_id)?),
         from_node: pb.from_node.clone(),

@@ -16,11 +16,14 @@ fn test_config(pc_name: &str, share_name: &str) -> AppConfig {
         tls_cert_path: PathBuf::new(),
         tls_key_path: PathBuf::new(),
         tls_ca_cert_path: PathBuf::new(),
+        tls_pinned_ca_fingerprints: Vec::new(),
         remote_share_root: PathBuf::from("remote"),
         shares: vec![ShareConfig {
             name: share_name.to_string(),
             root_path: PathBuf::from("/share"),
             recursive: true,
+            ignore_patterns: Vec::new(),
+            max_file_size_bytes: None,
         }],
     }
 }
@@ -55,6 +58,7 @@ fn outbound_queue_round_trip_and_mark_sent() {
 
     let share_id = shares[0].share_id;
     let manifest = BatchManifest {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
         batch_id: "batch-1".to_string(),
         share_id,
         from_node: "pc-one".to_string(),
@@ -87,6 +91,67 @@ fn outbound_queue_round_trip_and_mark_sent() {
     db.mark_outbound_sent("batch-1").unwrap();
     let due2 = db.dequeue_due_outbound(10, now).unwrap();
     assert!(due2.is_empty());
+}
+
+#[test]
+fn status_helpers_report_queue_depth_and_peers() {
+    let db = Db::open_in_memory().unwrap();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    assert_eq!(db.outbound_queue_depth().unwrap(), 0);
+    assert_eq!(db.outbound_queue_due_now(now).unwrap(), 0);
+    assert_eq!(db.change_log_total().unwrap(), 0);
+    assert!(db.list_peers().unwrap().is_empty());
+
+    let peer_id = db
+        .upsert_peer(
+            "pc-one",
+            "inst-one",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
+            now,
+            "connected",
+        )
+        .unwrap();
+    let peers = db.list_peers().unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].id, peer_id);
+
+    let cfg = test_config("pc-two", "shareA");
+    let shares = db.load_shares(&cfg).unwrap();
+    assert!(!shares.is_empty());
+    assert!(!db.list_shares_table().unwrap().is_empty());
+
+    let share_row_id = shares[0].id;
+    db.set_peer_progress(peer_id, share_row_id, 10, 9).unwrap();
+    let progress = db.list_peer_progress_table().unwrap();
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].last_seq_sent, 10);
+    assert_eq!(progress[0].last_seq_acked, 9);
+
+    let manifest = BatchManifest {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
+        batch_id: "batch-status-1".to_string(),
+        share_id: shares[0].share_id,
+        from_node: "pc-two".to_string(),
+        created_at: now,
+        changes: vec![FileChange {
+            seq: 0,
+            share_id: shares[0].share_id,
+            path: "x.txt".to_string(),
+            kind: ChangeKind::Modify,
+            meta: Some(FileMeta {
+                path: "x.txt".to_string(),
+                size: 1,
+                mtime: now,
+                hash: [1u8; 32],
+                version: 1,
+                deleted: false,
+            }),
+        }],
+    };
+    db.enqueue_outbound_batch(&manifest, Some(peer_id)).unwrap();
+    assert_eq!(db.outbound_queue_depth().unwrap(), 1);
+    assert_eq!(db.outbound_queue_due_now(now).unwrap(), 1);
 }
 
 #[test]
@@ -123,4 +188,3 @@ fn change_log_append_and_list() {
     assert_eq!(changes[0].kind, ChangeKind::Create);
     assert!(changes[0].meta.is_some());
 }
-

@@ -36,6 +36,7 @@ fn parse_discovery_messages() {
 #[test]
 fn wire_message_json_parse_round_trip() {
     let msg = WireMessage::Hello(HelloMessage {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
         pc_name: "pc".to_string(),
         instance_id: "inst".to_string(),
         listen_port: 1,
@@ -53,6 +54,7 @@ fn wire_message_json_parse_round_trip() {
 fn batch_manifest_json_parse() {
     let share_id = ShareId::new("shareA", "pc-one");
     let manifest = BatchManifest {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
         batch_id: "b1".to_string(),
         share_id,
         from_node: "pc-one".to_string(),
@@ -83,6 +85,7 @@ fn batch_manifest_json_parse() {
 #[test]
 fn proto_wire_message_round_trip() {
     let hello = WireMessage::Hello(HelloMessage {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
         pc_name: "pc".to_string(),
         instance_id: "inst".to_string(),
         listen_port: 5000,
@@ -96,6 +99,7 @@ fn proto_wire_message_round_trip() {
     );
 
     let ack = WireMessage::BatchAck(BatchAck {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
         share_id: ShareId::new("shareA", "pc-one"),
         upto_seq: 42,
     });

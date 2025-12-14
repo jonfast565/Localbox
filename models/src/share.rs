@@ -16,6 +16,8 @@ pub struct ShareContext {
     pub share_id: ShareId,
     pub root_path: PathBuf,
     pub recursive: bool,
+    pub ignore_patterns: Vec<String>,
+    pub max_file_size_bytes: Option<u64>,
     pub index: HashMap<String, FileMeta>,
 }
 

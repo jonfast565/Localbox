@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 mod connection;
 mod discovery;
-mod tls;
+pub mod tls;
 mod writer;
 
 type DbHandle = Arc<Mutex<Db>>;
@@ -204,8 +204,10 @@ impl PeerManager {
                         if let Err(e) = writer.lock().await.send(&msg).await {
                             any_fail = true;
                             warn!(
-                                "Failed to send batch {} to peer {:?}: {e}",
-                                item.batch_id, pid
+                                batch_id = %item.batch_id,
+                                peer_id = pid,
+                                error = %e,
+                                "Failed to send batch"
                             );
                         } else {
                             any_sent = true;
@@ -221,9 +223,17 @@ impl PeerManager {
                     }
 
                     if any_sent && !any_fail {
+                        info!(batch_id = %item.batch_id, peer_id = ?target_peer, "Batch sent");
                         let _ = db.lock().await.mark_outbound_sent(&item.batch_id);
                     } else {
                         let backoff = compute_backoff_secs(item.attempts + 1);
+                        warn!(
+                            batch_id = %item.batch_id,
+                            peer_id = ?target_peer,
+                            attempts = item.attempts + 1,
+                            backoff_secs = backoff,
+                            "Batch send failed (will retry)"
+                        );
                         let _ = db.lock().await.mark_outbound_failed(
                             &item.batch_id,
                             "send failure",

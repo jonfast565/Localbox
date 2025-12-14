@@ -62,6 +62,7 @@ mod tests {
     async fn framed_round_trip() {
         let (mut a, mut b) = tokio::io::duplex(8 * 1024);
         let msg = WireMessage::Hello(HelloMessage {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
             pc_name: "pc".to_string(),
             instance_id: "inst".to_string(),
             listen_port: 5000,

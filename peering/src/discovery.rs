@@ -126,10 +126,12 @@ async fn discovery_broadcast_loop(
             _ = interval.tick() => {}
         }
         let msg = format!(
-            "DISCOVER v1 pc_name={} instance_id={} tcp_port={} shares={}",
+            "DISCOVER v1 pc_name={} instance_id={} tls_port={} plain_port={} use_tls={} shares={}",
             cfg.pc_name,
             cfg.instance_id,
             cfg.listen_addr.port(),
+            cfg.plain_listen_addr.port(),
+            cfg.use_tls_for_peers,
             share_names.join(","),
         );
         let broadcast_addr = SocketAddr::new(
@@ -169,7 +171,9 @@ async fn handle_discovery_message(
         DiscoveryMessage::Discover {
             pc_name,
             instance_id,
-            tcp_port,
+            tls_port,
+            plain_port,
+            use_tls_for_peers,
             shares,
         } => {
             handle_discover(
@@ -179,7 +183,9 @@ async fn handle_discovery_message(
                 share_lookup,
                 &pc_name,
                 &instance_id,
-                tcp_port,
+                tls_port,
+                plain_port,
+                use_tls_for_peers,
                 shares,
                 src,
                 socket,
@@ -195,7 +201,9 @@ async fn handle_discovery_message(
         DiscoveryMessage::Here {
             pc_name,
             instance_id,
-            tcp_port,
+            tls_port,
+            plain_port,
+            use_tls_for_peers,
             shares,
         } => {
             handle_here(
@@ -205,7 +213,9 @@ async fn handle_discovery_message(
                 share_lookup,
                 &pc_name,
                 &instance_id,
-                tcp_port,
+                tls_port,
+                plain_port,
+                use_tls_for_peers,
                 shares,
                 src,
                 connector,
@@ -227,7 +237,9 @@ async fn handle_discover(
     share_lookup: &Arc<Vec<ShareContext>>,
     pc_name: &str,
     instance_id: &str,
-    tcp_port: u16,
+    tls_port: u16,
+    plain_port: u16,
+    prefer_tls: bool,
     shares: Vec<String>,
     src: SocketAddr,
     socket: &Arc<dyn UdpSocketLike>,
@@ -247,8 +259,36 @@ async fn handle_discover(
     } else {
         src.ip()
     };
-    let peer_addr = SocketAddr::new(peer_ip, tcp_port);
-    let Some(peer_id) = upsert_peer_with_state(db, pc_name, instance_id, peer_addr, "discovered").await else {
+    let peer_tls_addr = SocketAddr::new(peer_ip, tls_port);
+    let peer_plain_addr = SocketAddr::new(peer_ip, plain_port);
+    let peer_addr = if cfg.use_tls_for_peers && tls_port != 0 {
+        peer_tls_addr
+    } else if !cfg.use_tls_for_peers && plain_port != 0 {
+        peer_plain_addr
+    } else if tls_port != 0 {
+        peer_tls_addr
+    } else {
+        peer_plain_addr
+    };
+    let peer_addr = if cfg.use_tls_for_peers && tls_port != 0 {
+        peer_tls_addr
+    } else if !cfg.use_tls_for_peers && plain_port != 0 {
+        peer_plain_addr
+    } else if tls_port != 0 {
+        peer_tls_addr
+    } else {
+        peer_plain_addr
+    };
+    let Some(peer_id) = upsert_peer_with_state(
+        db,
+        pc_name,
+        instance_id,
+        peer_tls_addr,
+        peer_plain_addr,
+        prefer_tls,
+        "discovered",
+    )
+    .await else {
         return;
     };
 
@@ -278,10 +318,12 @@ async fn handle_discover(
     .await;
 
     let reply = format!(
-        "HERE v1 pc_name={} instance_id={} tcp_port={} shares={}",
+        "HERE v1 pc_name={} instance_id={} tls_port={} plain_port={} use_tls={} shares={}",
         cfg.pc_name,
         cfg.instance_id,
         cfg.listen_addr.port(),
+        cfg.plain_listen_addr.port(),
+        cfg.use_tls_for_peers,
         share_names.join(","),
     );
     if let Err(e) = socket.send_to(reply.as_bytes(), &src).await {
@@ -289,7 +331,8 @@ async fn handle_discover(
     }
 
     spawn_connect_task(
-        peer_addr,
+        peer_tls_addr,
+        peer_plain_addr,
         pc_name,
         cfg,
         db,
@@ -309,7 +352,9 @@ async fn handle_here(
     share_lookup: &Arc<Vec<ShareContext>>,
     pc_name: &str,
     instance_id: &str,
-    tcp_port: u16,
+    tls_port: u16,
+    plain_port: u16,
+    prefer_tls: bool,
     shares: Vec<String>,
     src: SocketAddr,
     connector: TlsConnector,
@@ -328,8 +373,18 @@ async fn handle_here(
     } else {
         src.ip()
     };
-    let peer_addr = SocketAddr::new(peer_ip, tcp_port);
-    let Some(peer_id) = upsert_peer_with_state(db, pc_name, instance_id, peer_addr, "discovered").await else {
+    let peer_tls_addr = SocketAddr::new(peer_ip, tls_port);
+    let peer_plain_addr = SocketAddr::new(peer_ip, plain_port);
+    let Some(peer_id) = upsert_peer_with_state(
+        db,
+        pc_name,
+        instance_id,
+        peer_tls_addr,
+        peer_plain_addr,
+        prefer_tls,
+        "discovered",
+    )
+    .await else {
         return;
     };
 
@@ -363,7 +418,8 @@ async fn handle_here(
     }
 
     spawn_connect_task(
-        peer_addr,
+        peer_tls_addr,
+        peer_plain_addr,
         pc_name,
         cfg,
         db,
@@ -377,7 +433,8 @@ async fn handle_here(
 }
 
 fn spawn_connect_task(
-    peer_addr: SocketAddr,
+    peer_tls_addr: SocketAddr,
+    peer_plain_addr: SocketAddr,
     pc_name: &str,
     cfg: &AppConfig,
     db: &DbHandle,
@@ -394,7 +451,8 @@ fn spawn_connect_task(
     let connections = connections.clone();
     let pc_name_connect = pc_name.to_string();
     tokio::spawn(run_connect_task(
-        peer_addr,
+        peer_tls_addr,
+        peer_plain_addr,
         pc_name_connect,
         cfg_clone,
         db,
@@ -408,7 +466,8 @@ fn spawn_connect_task(
 }
 
 async fn run_connect_task(
-    peer_addr: SocketAddr,
+    peer_tls_addr: SocketAddr,
+    peer_plain_addr: SocketAddr,
     pc_name: String,
     cfg: AppConfig,
     db: DbHandle,
@@ -422,7 +481,8 @@ async fn run_connect_task(
     tokio::select! {
         _ = token.cancelled() => {}
         res = connect_to_peer(
-            peer_addr,
+            peer_tls_addr,
+            peer_plain_addr,
             &pc_name,
             &cfg,
             &db,
@@ -433,7 +493,7 @@ async fn run_connect_task(
             net,
         ) => {
             if let Err(e) = res {
-                warn!("TLS connect to {peer_addr} failed: {e}");
+                warn!("Connect to peer {} failed: {e}", pc_name);
             }
         }
     }
@@ -443,11 +503,29 @@ async fn upsert_peer_with_state(
     db: &DbHandle,
     pc_name: &str,
     instance_id: &str,
-    addr: SocketAddr,
+    tls_addr: SocketAddr,
+    plain_addr: SocketAddr,
+    prefer_tls: bool,
     state: &str,
 ) -> Option<i64> {
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    let res = { db.lock().await.upsert_peer(pc_name, instance_id, addr, now, state) };
+    let chosen_addr = if tls_addr.port() != 0 {
+        tls_addr
+    } else {
+        plain_addr
+    };
+    let res = {
+        db.lock().await.upsert_peer(
+            pc_name,
+            instance_id,
+            chosen_addr,
+            now,
+            state,
+            tls_addr.port(),
+            plain_addr.port(),
+            prefer_tls,
+        )
+    };
     match res {
         Ok(id) => Some(id),
         Err(e) => {

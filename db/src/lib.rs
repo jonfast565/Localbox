@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-const DB_SCHEMA_VERSION: i32 = 1;
+const DB_SCHEMA_VERSION: i32 = 3;
 
 pub struct Db {
     conn: Connection,
@@ -20,8 +20,12 @@ pub struct PeerRow {
     pub instance_id: String,
     pub last_ip: String,
     pub last_port: i64,
+    pub last_tls_port: i64,
+    pub last_plain_port: i64,
     pub last_seen: i64,
     pub state: String,
+    pub prefer_tls: bool,
+    pub last_insecure_seen: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -96,8 +100,12 @@ impl Db {
                 instance_id  TEXT NOT NULL,
                 last_ip      TEXT NOT NULL,
                 last_port    INTEGER NOT NULL,
+                last_tls_port INTEGER NOT NULL,
+                last_plain_port INTEGER NOT NULL,
                 last_seen    INTEGER NOT NULL,
                 state        TEXT NOT NULL,
+                prefer_tls   INTEGER NOT NULL DEFAULT 1,
+                last_insecure_seen INTEGER NOT NULL DEFAULT 0,
                 UNIQUE (pc_name, instance_id)
             );
 
@@ -204,10 +212,44 @@ impl Db {
             ));
         }
 
-        if current < DB_SCHEMA_VERSION {
-            self.conn
-                .execute_batch(&format!("PRAGMA user_version = {DB_SCHEMA_VERSION};"))?;
+        let mut stmt = self.conn.prepare("PRAGMA table_info(peers)")?;
+        let mut rows = stmt.query([])?;
+        let mut has_last_tls_port = false;
+        let mut has_last_plain_port = false;
+        let mut has_last_http_port = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            match name.as_str() {
+                "last_tls_port" => has_last_tls_port = true,
+                "last_plain_port" => has_last_plain_port = true,
+                "last_http_port" => has_last_http_port = true,
+                _ => {}
+            }
         }
+
+        if current < 2 && !has_last_tls_port {
+            self.conn.execute_batch(
+                r#"
+                ALTER TABLE peers ADD COLUMN last_tls_port INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE peers ADD COLUMN last_plain_port INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE peers ADD COLUMN prefer_tls INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE peers ADD COLUMN last_insecure_seen INTEGER NOT NULL DEFAULT 0;
+                "#,
+            )?;
+            has_last_plain_port = true;
+        }
+
+        if current < 3 && !has_last_plain_port {
+            self.conn
+                .execute("ALTER TABLE peers ADD COLUMN last_plain_port INTEGER NOT NULL DEFAULT 0", [])?;
+            if has_last_http_port {
+                self.conn
+                    .execute("UPDATE peers SET last_plain_port = last_http_port", [])?;
+            }
+        }
+
+        self.conn
+            .execute_batch(&format!("PRAGMA user_version = {DB_SCHEMA_VERSION};"))?;
 
         Ok(())
     }
@@ -447,16 +489,22 @@ impl Db {
         addr: SocketAddr,
         now_ts: i64,
         state: &str,
+        tls_port: u16,
+        plain_port: u16,
+        prefer_tls: bool,
     ) -> Result<i64> {
         self.conn.execute(
             r#"
-            INSERT INTO peers (pc_name, instance_id, last_ip, last_port, last_seen, state)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO peers (pc_name, instance_id, last_ip, last_port, last_tls_port, last_plain_port, last_seen, state, prefer_tls)
+            VALUES (?1, ?2, ?3, ?4, ?7, ?8, ?5, ?6, ?9)
             ON CONFLICT(pc_name, instance_id) DO UPDATE SET
                 last_ip = excluded.last_ip,
                 last_port = excluded.last_port,
+                last_tls_port = excluded.last_tls_port,
+                last_plain_port = excluded.last_plain_port,
                 last_seen = excluded.last_seen,
-                state = excluded.state
+                state = excluded.state,
+                prefer_tls = excluded.prefer_tls
             "#,
             params![
                 pc_name,
@@ -465,6 +513,9 @@ impl Db {
                 addr.port() as i64,
                 now_ts,
                 state,
+                tls_port as i64,
+                plain_port as i64,
+                prefer_tls as i64,
             ],
         )?;
 
@@ -473,6 +524,18 @@ impl Db {
             .prepare("SELECT id FROM peers WHERE pc_name=?1 AND instance_id=?2")?;
         let id: i64 = stmt.query_row(params![pc_name, instance_id], |row| row.get(0))?;
         Ok(id)
+    }
+
+    pub fn mark_peer_insecure(&self, peer_id: i64, when_ts: i64) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE peers
+            SET last_insecure_seen = MAX(last_insecure_seen, ?2)
+            WHERE id = ?1
+            "#,
+            params![peer_id, when_ts],
+        )?;
+        Ok(())
     }
 
     pub fn set_peer_shares(&self, peer_id: i64, shares: &[String]) -> Result<()> {
@@ -828,7 +891,7 @@ impl Db {
     pub fn list_peers(&self) -> Result<Vec<PeerRow>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, pc_name, instance_id, last_ip, last_port, last_seen, state
+            SELECT id, pc_name, instance_id, last_ip, last_port, last_tls_port, last_plain_port, last_seen, state, prefer_tls, last_insecure_seen
             FROM peers
             ORDER BY last_seen DESC
             "#,
@@ -840,8 +903,15 @@ impl Db {
                 instance_id: row.get(2)?,
                 last_ip: row.get(3)?,
                 last_port: row.get(4)?,
-                last_seen: row.get(5)?,
-                state: row.get(6)?,
+                last_tls_port: row.get(5)?,
+                last_plain_port: row.get(6)?,
+                last_seen: row.get(7)?,
+                state: row.get(8)?,
+                prefer_tls: {
+                    let v: i64 = row.get(9)?;
+                    v != 0
+                },
+                last_insecure_seen: row.get(10)?,
             })
         })?;
         let mut out = Vec::new();

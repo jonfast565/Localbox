@@ -7,6 +7,8 @@ message Hello {
   string instance_id = 2;
   uint32 listen_port = 3;
   repeated string shares = 4;
+  uint32 plain_port = 5;
+  bool use_tls_for_peers = 6;
 }
 
 enum ChangeKind {

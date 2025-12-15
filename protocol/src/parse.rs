@@ -13,13 +13,17 @@ pub enum DiscoveryMessage {
     Discover {
         pc_name: String,
         instance_id: String,
-        tcp_port: u16,
+        tls_port: u16,
+        plain_port: u16,
+        use_tls_for_peers: bool,
         shares: Vec<String>,
     },
     Here {
         pc_name: String,
         instance_id: String,
-        tcp_port: u16,
+        tls_port: u16,
+        plain_port: u16,
+        use_tls_for_peers: bool,
         shares: Vec<String>,
     },
 }
@@ -29,7 +33,20 @@ pub fn parse_discovery_message(msg: &str) -> Option<DiscoveryMessage> {
         parse_key_values(msg, 2).and_then(|kv| {
             let pc_name = kv.get("pc_name")?.to_string();
             let instance_id = kv.get("instance_id")?.to_string();
-            let tcp_port = kv.get("tcp_port")?.parse::<u16>().ok()?;
+            let tls_port = kv
+                .get("tls_port")
+                .or_else(|| kv.get("tcp_port"))
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(0);
+            let plain_port = kv
+                .get("plain_port")
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(0);
+            let use_tls_for_peers = kv
+                .get("use_tls")
+                .or_else(|| kv.get("use_tls_for_peers"))
+                .and_then(|v| v.parse::<bool>().ok())
+                .unwrap_or(true);
             let shares = kv
                 .get("shares")
                 .map(|s| split_shares(s))
@@ -37,7 +54,9 @@ pub fn parse_discovery_message(msg: &str) -> Option<DiscoveryMessage> {
             Some(DiscoveryMessage::Discover {
                 pc_name,
                 instance_id,
-                tcp_port,
+                tls_port,
+                plain_port,
+                use_tls_for_peers,
                 shares,
             })
         })
@@ -45,7 +64,20 @@ pub fn parse_discovery_message(msg: &str) -> Option<DiscoveryMessage> {
         parse_key_values(msg, 2).and_then(|kv| {
             let pc_name = kv.get("pc_name")?.to_string();
             let instance_id = kv.get("instance_id")?.to_string();
-            let tcp_port = kv.get("tcp_port")?.parse::<u16>().ok()?;
+            let tls_port = kv
+                .get("tls_port")
+                .or_else(|| kv.get("tcp_port"))
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(0);
+            let plain_port = kv
+                .get("plain_port")
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(0);
+            let use_tls_for_peers = kv
+                .get("use_tls")
+                .or_else(|| kv.get("use_tls_for_peers"))
+                .and_then(|v| v.parse::<bool>().ok())
+                .unwrap_or(true);
             let shares = kv
                 .get("shares")
                 .map(|s| split_shares(s))
@@ -53,7 +85,9 @@ pub fn parse_discovery_message(msg: &str) -> Option<DiscoveryMessage> {
             Some(DiscoveryMessage::Here {
                 pc_name,
                 instance_id,
-                tcp_port,
+                tls_port,
+                plain_port,
+                use_tls_for_peers,
                 shares,
             })
         })
@@ -103,6 +137,8 @@ pub fn encode_wire_message_proto(msg: &WireMessage) -> Result<Vec<u8>> {
                 pc_name: h.pc_name.clone(),
                 instance_id: h.instance_id.clone(),
                 listen_port: h.listen_port as u32,
+                plain_port: h.plain_port as u32,
+                use_tls_for_peers: h.use_tls_for_peers,
                 shares: h.shares.clone(),
             })),
         },
@@ -127,6 +163,13 @@ pub fn decode_wire_message_proto(bytes: &[u8]) -> Result<WireMessage> {
             pc_name: h.pc_name,
             instance_id: h.instance_id,
             listen_port: h.listen_port as u16,
+            plain_port: h.plain_port as u16,
+            use_tls_for_peers: if h.use_tls_for_peers {
+                true
+            } else {
+                // Default to true if sender never set the field (http_port=0 is a hint).
+                h.plain_port == 0
+            },
             shares: h.shares,
         })),
         Some(ProtoMsg::Batch(b)) => Ok(WireMessage::Batch(batch_from_proto(&b)?)),

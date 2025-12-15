@@ -66,6 +66,7 @@ impl PeerManager {
             token.clone(),
         );
         let listener = self.spawn_tcp_listener(connections.clone(), token.clone());
+        let plain_listener = self.spawn_plain_listener(connections.clone(), token.clone());
         let sender = self.spawn_outbox_worker(connections.clone(), net_rx, token.clone());
 
         tokio::select! {
@@ -73,7 +74,7 @@ impl PeerManager {
                 info!("PeerManager cancellation requested");
             }
             _ = async {
-                let _ = tokio::join!(discovery, listener, sender);
+                let _ = tokio::join!(discovery, listener, plain_listener, sender);
             } => {}
         }
         Ok(())
@@ -112,7 +113,7 @@ impl PeerManager {
                                 let fs = fs.clone();
                                 let net = net.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = connection::handle_connection(
+                                    if let Err(e) = connection::handle_tls_connection(
                                         stream,
                                         &cfg,
                                         &db,
@@ -131,6 +132,64 @@ impl PeerManager {
                             }
                             Err(e) => {
                                 error!("Accept error: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn spawn_plain_listener(&self, connections: SharedWriters, token: tokio_util::sync::CancellationToken) -> JoinHandle<()> {
+        let cfg = self.cfg.clone();
+        let db = Arc::clone(&self.db);
+        let share_names: Vec<String> = self.shares.iter().map(|s| s.share_name.clone()).collect();
+        let fs = self.fs.clone();
+        let net = self.net.clone();
+
+        tokio::spawn(async move {
+            let listener = match net.bind_tcp_listener(cfg.plain_listen_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("Failed to bind plaintext TCP listener: {e}");
+                    return;
+                }
+            };
+            info!("Plaintext TCP listener on {}", cfg.plain_listen_addr);
+
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    res = listener.accept() => {
+                        match res {
+                            Ok((stream, addr)) => {
+                                warn!("Incoming plaintext connection from {addr}");
+                                let db = Arc::clone(&db);
+                                let cfg = cfg.clone();
+                                let share_names = share_names.clone();
+                                let connections = connections.clone();
+                                let fs = fs.clone();
+                                let net = net.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = connection::handle_plain_connection(
+                                        stream,
+                                        &cfg,
+                                        &db,
+                                        &share_names,
+                                        addr,
+                                        connections,
+                                        fs,
+                                        net,
+                                    )
+                                    .await
+                                    {
+                                        error!("plaintext connection error from {addr}: {e}");
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error!("Plaintext accept error: {e}");
                                 break;
                             }
                         }

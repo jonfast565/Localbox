@@ -25,6 +25,8 @@ fn wire_message_json_round_trip() {
         pc_name: "pc-one".to_string(),
         instance_id: "inst".to_string(),
         listen_port: 5000,
+        plain_port: 5002,
+        use_tls_for_peers: true,
         shares: vec!["shareA".to_string(), "shareB".to_string()],
     });
     let bytes = serde_json::to_vec(&msg).unwrap();
@@ -53,6 +55,8 @@ fn app_config_json_round_trip() {
         pc_name: "pc-one".to_string(),
         instance_id: "inst-one".to_string(),
         listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
+        plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5002),
+        use_tls_for_peers: true,
         discovery_port: 5001,
         aggregation_window_ms: 200,
         db_path: PathBuf::from("db.sqlite"),
@@ -75,6 +79,8 @@ fn app_config_json_round_trip() {
     assert_eq!(cfg.pc_name, decoded.pc_name);
     assert_eq!(cfg.instance_id, decoded.instance_id);
     assert_eq!(cfg.listen_addr, decoded.listen_addr);
+    assert_eq!(cfg.plain_listen_addr, decoded.plain_listen_addr);
+    assert_eq!(cfg.use_tls_for_peers, decoded.use_tls_for_peers);
     assert_eq!(cfg.discovery_port, decoded.discovery_port);
     assert_eq!(cfg.aggregation_window_ms, decoded.aggregation_window_ms);
     assert_eq!(cfg.db_path, decoded.db_path);

@@ -10,7 +10,14 @@ pub struct HelloMessage {
     pub protocol_version: u16,
     pub pc_name: String,
     pub instance_id: String,
+    /// TLS port
     pub listen_port: u16,
+    /// Plain (no TLS) port
+    #[serde(default)]
+    pub plain_port: u16,
+    /// Whether the sender prefers TLS when connecting to peers.
+    #[serde(default = "default_use_tls_for_peers")]
+    pub use_tls_for_peers: bool,
     pub shares: Vec<String>,
 }
 
@@ -35,4 +42,8 @@ pub fn wire_message_protocol_version(msg: &WireMessage) -> u16 {
         WireMessage::Batch(b) => b.protocol_version,
         WireMessage::BatchAck(a) => a.protocol_version,
     }
+}
+
+fn default_use_tls_for_peers() -> bool {
+    true
 }

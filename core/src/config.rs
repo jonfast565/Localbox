@@ -9,6 +9,7 @@ use std::str::FromStr;
 
 const DEFAULT_INSTANCE_ID: &str = "instance-1";
 const DEFAULT_LISTEN_PORT: u16 = 5000;
+const DEFAULT_PLAIN_LISTEN_PORT: u16 = 5002;
 const DEFAULT_DISCOVERY_PORT: u16 = 5001;
 const DEFAULT_AGG_WINDOW_MS: u64 = 2000;
 const DEFAULT_DB_PATH: &str = "sync.db";
@@ -133,6 +134,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub listen_port: Option<u16>,
 
+    /// TCP listen port for plaintext peer connections (no TLS)
+    #[arg(long)]
+    pub plain_listen_port: Option<u16>,
+
     /// UDP discovery port
     #[arg(long)]
     pub discovery_port: Option<u16>,
@@ -164,6 +169,10 @@ pub struct RunArgs {
     /// Root folder where remote/peer-owned shares are synced
     #[arg(long)]
     pub remote_share_root: Option<PathBuf>,
+
+    /// Whether to use TLS when connecting to peers (default: true)
+    #[arg(long)]
+    pub use_tls_for_peers: Option<bool>,
 
     /// Shares to watch in the form name=path[,recursive=true|false] (repeatable)
     #[arg(
@@ -203,6 +212,11 @@ impl Cli {
             .listen_port
             .or_else(|| file_cfg.as_ref().and_then(|c| c.listen_port))
             .unwrap_or(DEFAULT_LISTEN_PORT);
+        let plain_listen_port = self
+            .run
+            .plain_listen_port
+            .or_else(|| file_cfg.as_ref().and_then(|c| c.plain_listen_port))
+            .unwrap_or(DEFAULT_PLAIN_LISTEN_PORT);
 
         let discovery_port = self
             .run
@@ -258,6 +272,12 @@ impl Cli {
             .or_else(|| file_cfg.as_ref().and_then(|c| c.remote_share_root.clone()))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_REMOTE_SHARE_ROOT));
 
+        let use_tls_for_peers = self
+            .run
+            .use_tls_for_peers
+            .or_else(|| file_cfg.as_ref().and_then(|c| c.use_tls_for_peers))
+            .unwrap_or(true);
+
         let tls_pinned_ca_fingerprints = file_cfg
             .as_ref()
             .and_then(|c| c.tls_pinned_ca_fingerprints.clone())
@@ -286,6 +306,8 @@ impl Cli {
             pc_name,
             instance_id,
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
+            plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), plain_listen_port),
+            use_tls_for_peers,
             discovery_port,
             aggregation_window_ms,
             db_path,
@@ -400,6 +422,7 @@ fn parse_share_arg(raw: &str) -> Result<ShareCli, String> {
 struct FileConfig {
     instance_id: Option<String>,
     listen_port: Option<u16>,
+    plain_listen_port: Option<u16>,
     discovery_port: Option<u16>,
     aggregation_window_ms: Option<u64>,
     db_path: Option<PathBuf>,
@@ -408,6 +431,7 @@ struct FileConfig {
     tls_key_path: Option<PathBuf>,
     tls_ca_cert_path: Option<PathBuf>,
     tls_pinned_ca_fingerprints: Option<Vec<String>>,
+    use_tls_for_peers: Option<bool>,
     remote_share_root: Option<PathBuf>,
     shares: Option<Vec<FileShareConfig>>,
 }
@@ -606,6 +630,7 @@ fn default_config_template() -> String {
 
 instance_id = "{instance_id}"
 listen_port = {listen_port}
+plain_listen_port = {plain_listen_port}
 discovery_port = {discovery_port}
 aggregation_window_ms = {agg_ms}
 
@@ -623,6 +648,9 @@ remote_share_root = "{remote_share_root}"
 #   "AA:BB:CC:...",
 # ]
 
+# Whether to use TLS when talking to peers (otherwise plaintext)
+use_tls_for_peers = true
+
 [[shares]]
 name = "docs"
 root_path = "C:/path/to/docs"
@@ -632,6 +660,7 @@ recursive = true
 "#,
         instance_id = DEFAULT_INSTANCE_ID,
         listen_port = DEFAULT_LISTEN_PORT,
+        plain_listen_port = DEFAULT_PLAIN_LISTEN_PORT,
         discovery_port = DEFAULT_DISCOVERY_PORT,
         agg_ms = DEFAULT_AGG_WINDOW_MS,
         db_path = DEFAULT_DB_PATH,
@@ -707,6 +736,8 @@ mod tests {
             pc_name: "pc".to_string(),
             instance_id: "i".to_string(),
             listen_addr: "0.0.0.0:5000".parse().unwrap(),
+            plain_listen_addr: "0.0.0.0:5002".parse().unwrap(),
+            use_tls_for_peers: true,
             discovery_port: 5001,
             aggregation_window_ms: 10,
             db_path: PathBuf::from("db"),

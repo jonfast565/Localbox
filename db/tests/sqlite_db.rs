@@ -9,6 +9,8 @@ fn test_config(pc_name: &str, share_name: &str) -> AppConfig {
         pc_name: pc_name.to_string(),
         instance_id: "inst".to_string(),
         listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        use_tls_for_peers: true,
         discovery_port: 0,
         aggregation_window_ms: 100,
         db_path: PathBuf::new(),
@@ -110,6 +112,9 @@ fn status_helpers_report_queue_depth_and_peers() {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
             now,
             "connected",
+            5000,
+            0,
+            true,
         )
         .unwrap();
     let peers = db.list_peers().unwrap();

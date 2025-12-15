@@ -12,6 +12,7 @@ pub type ClientTls = ClientTlsStream<DynStream>;
 pub enum PeerWriter {
     Server(WriteHalf<ServerTls>),
     Client(WriteHalf<ClientTls>),
+    Plain(WriteHalf<DynStream>),
 }
 
 impl PeerWriter {
@@ -19,6 +20,7 @@ impl PeerWriter {
         match self {
             PeerWriter::Server(w) => send_framed_message(w, msg).await,
             PeerWriter::Client(w) => send_framed_message(w, msg).await,
+            PeerWriter::Plain(w) => send_framed_message(w, msg).await,
         }
     }
 }

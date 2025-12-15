@@ -15,7 +15,7 @@ use tracing::Instrument;
 use crate::writer::{recv_framed_message, send_framed_message, PeerWriter};
 use crate::{DbHandle, SharedWriters};
 
-pub async fn handle_connection(
+pub async fn handle_tls_connection(
     stream: DynStream,
     cfg: &AppConfig,
     db: &DbHandle,
@@ -50,8 +50,44 @@ pub async fn handle_connection(
     Ok(())
 }
 
+pub async fn handle_plain_connection(
+    mut stream: DynStream,
+    cfg: &AppConfig,
+    db: &DbHandle,
+    share_names: &[String],
+    addr: SocketAddr,
+    connections: SharedWriters,
+    fs: Arc<dyn FileSystem>,
+    net: Arc<dyn Net>,
+) -> Result<()> {
+    warn!("Inbound plaintext peer connection from {addr}");
+    let (remote, resolved_peer_id) =
+        perform_handshake(&mut stream, cfg, db, share_names, addr, fs.clone()).await?;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    db.lock().await.mark_peer_insecure(resolved_peer_id, now)?;
+
+    let (reader, writer) = io::split(stream);
+    {
+        let mut guard = connections.lock().await;
+        guard.push((
+            resolved_peer_id,
+            Arc::new(AsyncMutex::new(PeerWriter::Plain(writer))),
+        ));
+    }
+
+    let _reader_task = spawn_incoming_reader(
+        reader,
+        db.clone(),
+        remote,
+        resolved_peer_id,
+        connections.clone(),
+    );
+    Ok(())
+}
+
 pub async fn connect_to_peer(
-    peer_addr: SocketAddr,
+    peer_tls_addr: SocketAddr,
+    peer_plain_addr: SocketAddr,
     server_name: &str,
     cfg: &AppConfig,
     db: &DbHandle,
@@ -61,24 +97,64 @@ pub async fn connect_to_peer(
     fs: Arc<dyn FileSystem>,
     net: Arc<dyn Net>,
 ) -> Result<()> {
-    let tcp = net.connect_tcp(peer_addr).await?;
-    let name = ServerName::try_from(server_name)
-        .or_else(|_| ServerName::try_from(peer_addr.ip().to_string().as_str()))
-        .context("server name for TLS")?;
-    let mut tls_stream = connector.connect(name, tcp).await?;
-    let (remote, peer_id) =
-        perform_handshake(&mut tls_stream, cfg, db, share_names, peer_addr, fs.clone()).await?;
+    let use_tls = if cfg.use_tls_for_peers && peer_tls_addr.port() != 0 {
+        true
+    } else if !cfg.use_tls_for_peers && peer_plain_addr.port() != 0 {
+        false
+    } else {
+        peer_plain_addr.port() == 0
+    };
 
-    let (reader, writer) = io::split(tls_stream);
-    {
-        let mut guard = connections.lock().await;
-        guard.push((
-            peer_id,
-            Arc::new(AsyncMutex::new(PeerWriter::Client(writer))),
-        ));
+    let target_addr = if use_tls {
+        peer_tls_addr
+    } else if peer_plain_addr.port() != 0 {
+        peer_plain_addr
+    } else {
+        peer_tls_addr
+    };
+
+    if !use_tls {
+        warn!("Connecting to peer {} at {} without TLS", server_name, target_addr);
     }
-    let _reader_task = spawn_incoming_reader(reader, db.clone(), remote, peer_id, connections.clone());
-    info!("Established outbound TLS to {}", peer_addr);
+
+    let tcp = net.connect_tcp(target_addr).await?;
+    if use_tls {
+        let name = ServerName::try_from(server_name)
+            .or_else(|_| ServerName::try_from(target_addr.ip().to_string().as_str()))
+            .context("server name for TLS")?;
+        let mut tls_stream = connector.connect(name, tcp).await?;
+        let (remote, peer_id) =
+            perform_handshake(&mut tls_stream, cfg, db, share_names, target_addr, fs.clone())
+                .await?;
+
+        let (reader, writer) = io::split(tls_stream);
+        {
+            let mut guard = connections.lock().await;
+            guard.push((
+                peer_id,
+                Arc::new(AsyncMutex::new(PeerWriter::Client(writer))),
+            ));
+        }
+        let _reader_task = spawn_incoming_reader(reader, db.clone(), remote, peer_id, connections.clone());
+        info!("Established outbound TLS to {}", target_addr);
+    } else {
+        let mut plain_stream = tcp;
+        let (remote, peer_id) =
+            perform_handshake(&mut plain_stream, cfg, db, share_names, target_addr, fs.clone())
+                .await?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        db.lock().await.mark_peer_insecure(peer_id, now)?;
+        let (reader, writer) = io::split(plain_stream);
+        {
+            let mut guard = connections.lock().await;
+            guard.push((
+                peer_id,
+                Arc::new(AsyncMutex::new(PeerWriter::Plain(writer))),
+            ));
+        }
+        let _reader_task = spawn_incoming_reader(reader, db.clone(), remote, peer_id, connections.clone());
+        info!("Established outbound plaintext to {}", target_addr);
+    }
     Ok(())
 }
 
@@ -95,6 +171,8 @@ async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         pc_name: cfg.pc_name.clone(),
         instance_id: cfg.instance_id.clone(),
         listen_port: cfg.listen_addr.port(),
+            plain_port: cfg.plain_listen_addr.port(),
+            use_tls_for_peers: cfg.use_tls_for_peers,
         shares: share_names.to_vec(),
     };
     let msg = WireMessage::Hello(hello);
@@ -103,17 +181,27 @@ async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     match recv_framed_message(stream).await? {
         Some(WireMessage::Hello(remote)) => {
             info!(
-                "Handshake with peer {} (instance={}) at {} shares={:?}",
-                remote.pc_name, remote.instance_id, addr, remote.shares
+                "Handshake with peer {} (instance={}) at {} shares={:?} tls_pref={}",
+                remote.pc_name, remote.instance_id, addr, remote.shares, remote.use_tls_for_peers
             );
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
-            let peer_addr = SocketAddr::new(addr.ip(), remote.listen_port);
+            let peer_addr = SocketAddr::new(
+                addr.ip(),
+                if addr.port() != 0 {
+                    addr.port()
+                } else {
+                    remote.listen_port
+                },
+            );
             let peer_id = db.lock().await.upsert_peer(
                 &remote.pc_name,
                 &remote.instance_id,
                 peer_addr,
                 now,
                 "connected",
+                remote.listen_port,
+                remote.plain_port,
+                remote.use_tls_for_peers,
             )?;
             db.lock().await.set_peer_shares(peer_id, &remote.shares)?;
             ensure_remote_shares(cfg, db, &remote, fs.as_ref()).await;

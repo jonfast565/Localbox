@@ -45,8 +45,12 @@ async fn main() -> anyhow::Result<()> {
                             "instance_id": p.instance_id,
                             "last_ip": p.last_ip,
                             "last_port": p.last_port,
+                            "last_tls_port": p.last_tls_port,
+                            "last_plain_port": p.last_plain_port,
                             "last_seen": p.last_seen,
                             "state": p.state,
+                            "prefer_tls": p.prefer_tls,
+                            "last_insecure_seen": p.last_insecure_seen,
                         })
                     })
                     .collect::<Vec<_>>();
@@ -101,8 +105,17 @@ async fn main() -> anyhow::Result<()> {
             println!("Peers ({}):", peers.len());
             for p in peers {
                 println!(
-                    "  #{:<3} {}@{} {}:{} last_seen={} state={}",
-                    p.id, p.pc_name, p.instance_id, p.last_ip, p.last_port, p.last_seen, p.state
+                    "  #{:<3} {}@{} ip={} tls_port={} plain_port={} last_seen={} state={} prefer_tls={} last_insecure_seen={}",
+                    p.id,
+                    p.pc_name,
+                    p.instance_id,
+                    p.last_ip,
+                    p.last_tls_port,
+                    p.last_plain_port,
+                    p.last_seen,
+                    p.state,
+                    p.prefer_tls,
+                    p.last_insecure_seen
                 );
             }
             println!();

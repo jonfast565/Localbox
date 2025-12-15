@@ -75,7 +75,6 @@ impl Engine {
         db_raw: Db,
     ) -> Result<Self> {
         init_logging(&cfg.log_path, fs.as_ref())?;
-        log_banner();
         let mut db_raw = db_raw;
         let shares = db_raw.load_shares(&cfg)?;
         for sc in &shares {
@@ -541,7 +540,7 @@ mod tests {
     }
 }
 
-fn log_banner() {
+pub(crate) fn log_banner() {
     info!(
         "\n{}\n{}\n  name: {}\n  version: {}\n  author(s): {}\n{}\n",
         APP_BANNER,

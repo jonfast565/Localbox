@@ -194,6 +194,45 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(())
                 }
+                BootstrapCommand::Join(join) => {
+                    let config_path = cli
+                        .config
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+                    if let Some(incoming) = &join.incoming {
+                        let result =
+                            bootstrap::accept_invite(&cfg, &config_path, incoming, join.force)?;
+                        println!(
+                            "Verified invite from {} (fingerprint {}). Token: {}",
+                            result.peer_name, result.fingerprint, result.token
+                        );
+                        println!("Imported {} CA cert(s)", result.ca_certs_added);
+                        if result.config_updated {
+                            println!(
+                                "Updated tls_peer_fingerprints entry for {} in {}",
+                                result.peer_name,
+                                config_path.display()
+                            );
+                        } else {
+                            println!(
+                                "tls_peer_fingerprints already contained {}",
+                                result.peer_name
+                            );
+                        }
+                    } else {
+                        println!("No incoming invite supplied; skipping acceptance step");
+                    }
+                    bootstrap::issue_invite(&cfg, &join.peer, &join.out, join.force)?;
+                    println!(
+                        "Wrote response invite for {} to {}",
+                        join.peer,
+                        join.out.display()
+                    );
+                    println!(
+                        "Send this file back to the peer to complete the bootstrap round trip."
+                    );
+                    Ok(())
+                }
             }
         }
         Some(Command::Tls(tls)) => {

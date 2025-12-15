@@ -1,3 +1,4 @@
+use crate::engine::log_banner;
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use models::{AppConfig, ShareConfig};
@@ -106,6 +107,8 @@ pub enum BootstrapCommand {
     Invite(BootstrapInviteArgs),
     /// Accept and verify an invite bundle
     Accept(BootstrapAcceptArgs),
+    /// Accept an invite and immediately generate a response bundle
+    Join(BootstrapJoinArgs),
 }
 
 #[derive(Debug, Args)]
@@ -130,6 +133,25 @@ pub struct BootstrapAcceptArgs {
     pub file: PathBuf,
 
     /// Allow updating config/trust even if entries already exist
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BootstrapJoinArgs {
+    /// The peer name to embed in the response invite
+    #[arg(long)]
+    pub peer: String,
+
+    /// Output path for the new invite bundle to send back
+    #[arg(long, value_name = "PATH")]
+    pub out: PathBuf,
+
+    /// Optional incoming invite file to accept before generating the response
+    #[arg(long, value_name = "PATH")]
+    pub incoming: Option<PathBuf>,
+
+    /// Overwrite files / update config entries if they already exist
     #[arg(long)]
     pub force: bool,
 }
@@ -575,6 +597,7 @@ fn load_file_config(path: &Path) -> Result<FileConfig> {
             path.display()
         ));
     }
+    log_banner();
 
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;

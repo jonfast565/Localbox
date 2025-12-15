@@ -184,10 +184,10 @@ localbox bootstrap invite --peer workstation-b --out invites/workstation-b.json
 Transfer the JSON bundle via a trusted channel. On the receiving machine run:
 
 ```
-localbox bootstrap accept --file invites/workstation-b.json
+localbox bootstrap join --incoming invites/workstation-b.json --peer workstation-a --out invites/workstation-a.json
 ```
 
-This verifies the signature, imports the CA certs, and appends the peer's fingerprint to `tls_peer_fingerprints` inside your `config.toml` (respecting `--config` if provided).
+`bootstrap join` first verifies the incoming bundle (importing the CA certs and appending the peer's fingerprint) and then generates a response invite you can send back. If you only need to import without generating a response, use `localbox bootstrap accept --file ...`.
 
 ### Optional pinning
 

@@ -79,10 +79,7 @@ pub fn build_meta_with_retry_limited(
         if md.len > max {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!(
-                    "file too large ({} bytes > max {})",
-                    md.len, max
-                ),
+                format!("file too large ({} bytes > max {})", md.len, max),
             ));
         }
     }

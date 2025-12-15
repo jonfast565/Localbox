@@ -65,6 +65,7 @@ fn app_config_json_round_trip() {
         tls_key_path: PathBuf::from("key.pem"),
         tls_ca_cert_path: PathBuf::from("ca.pem"),
         tls_pinned_ca_fingerprints: Vec::new(),
+        tls_peer_fingerprints: std::collections::HashMap::new(),
         remote_share_root: PathBuf::from("remote"),
         shares: vec![ShareConfig {
             name: "shareA".to_string(),

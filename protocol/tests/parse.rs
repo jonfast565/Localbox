@@ -1,19 +1,26 @@
-use models::{BatchAck, BatchManifest, ChangeKind, FileChange, FileMeta, HelloMessage, ShareId, WireMessage};
+use models::{
+    BatchAck, BatchManifest, ChangeKind, FileChange, FileMeta, HelloMessage, ShareId, WireMessage,
+};
 use protocol::{
-    decode_file_chunk_proto, decode_wire_message_proto, encode_file_chunk_proto, encode_wire_message_proto,
-    parse_batch_manifest, parse_discovery_message, parse_wire_message, DiscoveryMessage, FileChunk,
+    decode_file_chunk_proto, decode_wire_message_proto, encode_file_chunk_proto,
+    encode_wire_message_proto, parse_batch_manifest, parse_discovery_message, parse_wire_message,
+    DiscoveryMessage, FileChunk,
 };
 
 #[test]
 fn parse_discovery_messages() {
-    let d = parse_discovery_message("DISCOVER v1 pc_name=pc1 instance_id=i1 tcp_port=5000 shares=a,b,c")
-        .expect("discover should parse");
+    let d = parse_discovery_message(
+        "DISCOVER v1 pc_name=pc1 instance_id=i1 tcp_port=5000 shares=a,b,c",
+    )
+    .expect("discover should parse");
     assert_eq!(
         d,
         DiscoveryMessage::Discover {
             pc_name: "pc1".to_string(),
             instance_id: "i1".to_string(),
-            tcp_port: 5000,
+            tls_port: 5000,
+            plain_port: 0,
+            use_tls_for_peers: true,
             shares: vec!["a".to_string(), "b".to_string(), "c".to_string()],
         }
     );
@@ -25,7 +32,9 @@ fn parse_discovery_messages() {
         DiscoveryMessage::Here {
             pc_name: "pc2".to_string(),
             instance_id: "i2".to_string(),
-            tcp_port: 6000,
+            tls_port: 6000,
+            plain_port: 0,
+            use_tls_for_peers: true,
             shares: vec![],
         }
     );
@@ -40,6 +49,8 @@ fn wire_message_json_parse_round_trip() {
         pc_name: "pc".to_string(),
         instance_id: "inst".to_string(),
         listen_port: 1,
+        plain_port: 2,
+        use_tls_for_peers: true,
         shares: vec!["s".to_string()],
     });
     let json = serde_json::to_vec(&msg).unwrap();
@@ -89,6 +100,8 @@ fn proto_wire_message_round_trip() {
         pc_name: "pc".to_string(),
         instance_id: "inst".to_string(),
         listen_port: 5000,
+        plain_port: 4000,
+        use_tls_for_peers: false,
         shares: vec!["a".to_string()],
     });
     let bytes = encode_wire_message_proto(&hello).unwrap();

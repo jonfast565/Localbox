@@ -19,6 +19,7 @@ fn test_config(pc_name: &str, share_name: &str) -> AppConfig {
         tls_key_path: PathBuf::new(),
         tls_ca_cert_path: PathBuf::new(),
         tls_pinned_ca_fingerprints: Vec::new(),
+        tls_peer_fingerprints: std::collections::HashMap::new(),
         remote_share_root: PathBuf::from("remote"),
         shares: vec![ShareConfig {
             name: share_name.to_string(),
@@ -183,7 +184,9 @@ fn change_log_append_and_list() {
         }),
     };
 
-    let seq = db.append_change_log(share_row_id, &change, created_at).unwrap();
+    let seq = db
+        .append_change_log(share_row_id, &change, created_at)
+        .unwrap();
     assert_eq!(seq, 1);
 
     let changes = db.list_changes_since(share_row_id, 0, 10).unwrap();

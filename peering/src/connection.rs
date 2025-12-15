@@ -1,19 +1,23 @@
 use anyhow::{bail, Context, Result};
-use models::{AppConfig, ChangeKind, FileChange, FileMeta, HelloMessage, ShareConfig, ShareId, WireMessage};
+use models::{
+    AppConfig, ChangeKind, FileChange, FileMeta, HelloMessage, ShareConfig, ShareId, WireMessage,
+};
 use rustls::ServerName;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tracing::Instrument;
 use tracing::{error, info, warn};
 use utilities::disk_utilities::build_remote_share_root;
 use utilities::{DynStream, FileSystem, Net};
-use tracing::Instrument;
 
 use crate::writer::{recv_framed_message, send_framed_message, PeerWriter};
 use crate::{DbHandle, SharedWriters};
+use tls::{fingerprint_from_certificates, normalize_fingerprint};
 
 pub async fn handle_tls_connection(
     stream: DynStream,
@@ -28,8 +32,17 @@ pub async fn handle_tls_connection(
 ) -> Result<()> {
     let tls_stream = tls_acceptor.accept(stream).await?;
     let mut tls_stream = tls_stream;
+    let peer_fp = fingerprint_from_certificates(tls_stream.get_ref().1.peer_certificates());
     let (remote, resolved_peer_id) =
         perform_handshake(&mut tls_stream, cfg, db, share_names, addr, fs.clone()).await?;
+    ensure_peer_fingerprint(cfg, &remote.pc_name, peer_fp.as_deref())?;
+    if let Some(fp) = peer_fp {
+        info!(
+            peer = %remote.pc_name,
+            fingerprint = %fp,
+            "Verified inbound TLS peer certificate"
+        );
+    }
 
     let (reader, writer) = io::split(tls_stream);
     {
@@ -58,7 +71,7 @@ pub async fn handle_plain_connection(
     addr: SocketAddr,
     connections: SharedWriters,
     fs: Arc<dyn FileSystem>,
-    net: Arc<dyn Net>,
+    _net: Arc<dyn Net>,
 ) -> Result<()> {
     warn!("Inbound plaintext peer connection from {addr}");
     let (remote, resolved_peer_id) =
@@ -114,7 +127,10 @@ pub async fn connect_to_peer(
     };
 
     if !use_tls {
-        warn!("Connecting to peer {} at {} without TLS", server_name, target_addr);
+        warn!(
+            "Connecting to peer {} at {} without TLS",
+            server_name, target_addr
+        );
     }
 
     let tcp = net.connect_tcp(target_addr).await?;
@@ -123,9 +139,24 @@ pub async fn connect_to_peer(
             .or_else(|_| ServerName::try_from(target_addr.ip().to_string().as_str()))
             .context("server name for TLS")?;
         let mut tls_stream = connector.connect(name, tcp).await?;
-        let (remote, peer_id) =
-            perform_handshake(&mut tls_stream, cfg, db, share_names, target_addr, fs.clone())
-                .await?;
+        let peer_fp = fingerprint_from_certificates(tls_stream.get_ref().1.peer_certificates());
+        let (remote, peer_id) = perform_handshake(
+            &mut tls_stream,
+            cfg,
+            db,
+            share_names,
+            target_addr,
+            fs.clone(),
+        )
+        .await?;
+        ensure_peer_fingerprint(cfg, &remote.pc_name, peer_fp.as_deref())?;
+        if let Some(fp) = peer_fp {
+            info!(
+                peer = %remote.pc_name,
+                fingerprint = %fp,
+                "Verified outbound TLS peer certificate"
+            );
+        }
 
         let (reader, writer) = io::split(tls_stream);
         {
@@ -135,13 +166,20 @@ pub async fn connect_to_peer(
                 Arc::new(AsyncMutex::new(PeerWriter::Client(writer))),
             ));
         }
-        let _reader_task = spawn_incoming_reader(reader, db.clone(), remote, peer_id, connections.clone());
+        let _reader_task =
+            spawn_incoming_reader(reader, db.clone(), remote, peer_id, connections.clone());
         info!("Established outbound TLS to {}", target_addr);
     } else {
         let mut plain_stream = tcp;
-        let (remote, peer_id) =
-            perform_handshake(&mut plain_stream, cfg, db, share_names, target_addr, fs.clone())
-                .await?;
+        let (remote, peer_id) = perform_handshake(
+            &mut plain_stream,
+            cfg,
+            db,
+            share_names,
+            target_addr,
+            fs.clone(),
+        )
+        .await?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
         db.lock().await.mark_peer_insecure(peer_id, now)?;
         let (reader, writer) = io::split(plain_stream);
@@ -152,7 +190,8 @@ pub async fn connect_to_peer(
                 Arc::new(AsyncMutex::new(PeerWriter::Plain(writer))),
             ));
         }
-        let _reader_task = spawn_incoming_reader(reader, db.clone(), remote, peer_id, connections.clone());
+        let _reader_task =
+            spawn_incoming_reader(reader, db.clone(), remote, peer_id, connections.clone());
         info!("Established outbound plaintext to {}", target_addr);
     }
     Ok(())
@@ -171,8 +210,8 @@ async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         pc_name: cfg.pc_name.clone(),
         instance_id: cfg.instance_id.clone(),
         listen_port: cfg.listen_addr.port(),
-            plain_port: cfg.plain_listen_addr.port(),
-            use_tls_for_peers: cfg.use_tls_for_peers,
+        plain_port: cfg.plain_listen_addr.port(),
+        use_tls_for_peers: cfg.use_tls_for_peers,
         shares: share_names.to_vec(),
     };
     let msg = WireMessage::Hello(hello);
@@ -229,7 +268,13 @@ fn spawn_incoming_reader<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    tokio::spawn(incoming_reader_loop(reader, db, remote, peer_id, connections))
+    tokio::spawn(incoming_reader_loop(
+        reader,
+        db,
+        remote,
+        peer_id,
+        connections,
+    ))
 }
 
 async fn incoming_reader_loop<R>(
@@ -284,55 +329,58 @@ async fn handle_batch_message(
         share_id = ?batch.share_id.0
     );
     async move {
-    let is_new = db
-        .lock()
-        .await
-        .record_inbound_batch(&batch.batch_id)
-        .unwrap_or(false);
-    if !is_new {
-        info!(from_node = %batch.from_node, "Duplicate batch ignored");
-        return;
-    }
-
-    info!(from_node = %batch.from_node, change_count = batch.changes.len(), "Received batch");
-
-    let mut max_seq_for_share = 0;
-    for mut change in batch.changes.clone() {
-        let Some(share_row_id) = resolve_share_row_id(db, &change).await else {
-            continue;
-        };
-
-        if is_replay(db, share_row_id, change.seq).await {
-            if change.seq > 0 {
-                max_seq_for_share = max_seq_for_share.max(change.seq);
-            }
-            continue;
-        }
-
-        let existing = db
+        let is_new = db
             .lock()
             .await
-            .get_file_meta(share_row_id, &change.path)
-            .ok()
-            .flatten();
-
-        if !should_apply_change(&change, existing.as_ref()) {
-            continue;
+            .record_inbound_batch(&batch.batch_id)
+            .unwrap_or(false);
+        if !is_new {
+            info!(from_node = %batch.from_node, "Duplicate batch ignored");
+            return;
         }
 
-        change.meta = resolve_change_meta(&change, existing.clone());
-        if let Some(meta) = &change.meta {
-            let _ = db.lock().await.upsert_file_meta(share_row_id, meta);
+        info!(from_node = %batch.from_node, change_count = batch.changes.len(), "Received batch");
+
+        let mut max_seq_for_share = 0;
+        for mut change in batch.changes.clone() {
+            let Some(share_row_id) = resolve_share_row_id(db, &change).await else {
+                continue;
+            };
+
+            if is_replay(db, share_row_id, change.seq).await {
+                if change.seq > 0 {
+                    max_seq_for_share = max_seq_for_share.max(change.seq);
+                }
+                continue;
+            }
+
+            let existing = db
+                .lock()
+                .await
+                .get_file_meta(share_row_id, &change.path)
+                .ok()
+                .flatten();
+
+            if !should_apply_change(&change, existing.as_ref()) {
+                continue;
+            }
+
+            change.meta = resolve_change_meta(&change, existing.clone());
+            if let Some(meta) = &change.meta {
+                let _ = db.lock().await.upsert_file_meta(share_row_id, meta);
+            }
+
+            if let Some(seq) =
+                append_change_and_ack(db, peer_id, share_row_id, &mut change, batch.created_at)
+                    .await
+            {
+                max_seq_for_share = max_seq_for_share.max(seq);
+            }
         }
 
-        if let Some(seq) = append_change_and_ack(db, peer_id, share_row_id, &mut change, batch.created_at).await {
-            max_seq_for_share = max_seq_for_share.max(seq);
+        if max_seq_for_share > 0 {
+            send_batch_ack(connections, peer_id, &batch.share_id, max_seq_for_share).await;
         }
-    }
-
-    if max_seq_for_share > 0 {
-        send_batch_ack(connections, peer_id, &batch.share_id, max_seq_for_share).await;
-    }
     }
     .instrument(span)
     .await;
@@ -370,7 +418,11 @@ async fn send_batch_ack(
 }
 
 async fn resolve_share_row_id(db: &DbHandle, change: &FileChange) -> Option<i64> {
-    match db.lock().await.get_share_row_id_by_share_id(&change.share_id) {
+    match db
+        .lock()
+        .await
+        .get_share_row_id_by_share_id(&change.share_id)
+    {
         Ok(id) => Some(id),
         Err(e) => {
             info!("Unknown share for change {:?}: {e}", change.share_id.0);
@@ -510,4 +562,39 @@ async fn ensure_remote_shares(
             );
         }
     }
+}
+
+fn ensure_peer_fingerprint(
+    cfg: &AppConfig,
+    peer_name: &str,
+    fingerprint: Option<&str>,
+) -> Result<()> {
+    if cfg.tls_peer_fingerprints.is_empty() {
+        return Ok(());
+    }
+    let Some(expected) = cfg.tls_peer_fingerprints.get(peer_name) else {
+        return Ok(());
+    };
+
+    let Some(actual) = fingerprint else {
+        bail!(
+            "TLS peer {} did not provide a certificate for fingerprint pinning",
+            peer_name
+        );
+    };
+
+    let normalized_actual = normalize_fingerprint(actual);
+    let allowed: HashSet<String> = expected
+        .iter()
+        .map(|fp| normalize_fingerprint(fp))
+        .collect();
+    if !allowed.contains(&normalized_actual) {
+        bail!(
+            "TLS certificate fingerprint mismatch for peer {} (got {}, expected one of {:?})",
+            peer_name,
+            actual,
+            expected
+        );
+    }
+    Ok(())
 }

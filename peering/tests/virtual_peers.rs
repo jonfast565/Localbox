@@ -9,8 +9,8 @@ use peering::PeerManager;
 use rcgen;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, Mutex};
-use utilities::{FileSystem, Net, VirtualFileSystem, VirtualNet};
 use tokio_util::sync::CancellationToken;
+use utilities::{FileSystem, Net, VirtualFileSystem, VirtualNet};
 
 #[tokio::test(flavor = "current_thread")]
 async fn virtual_peers_exchange_changes() {
@@ -108,7 +108,9 @@ async fn virtual_peers_exchange_changes() {
         .list_changes_since(share_row1, 0, 10)
         .unwrap();
     assert!(
-        changes_on_1.iter().any(|c| c.path == "old.txt" && c.kind == ChangeKind::Delete),
+        changes_on_1
+            .iter()
+            .any(|c| c.path == "old.txt" && c.kind == ChangeKind::Delete),
         "peer1 should have received delete for old.txt"
     );
 
@@ -241,6 +243,7 @@ fn test_config(
         tls_key_path: tls.key.clone(),
         tls_ca_cert_path: tls.ca.clone(),
         tls_pinned_ca_fingerprints: Vec::new(),
+        tls_peer_fingerprints: std::collections::HashMap::new(),
         remote_share_root: PathBuf::from("remote"),
         shares: vec![ShareConfig {
             name: share_name.to_string(),
@@ -285,9 +288,7 @@ async fn enqueue_sample_batch(
         changes: vec![change],
     };
     let db_guard = db.lock().await;
-    db_guard
-        .enqueue_outbound_batch(&manifest, None)
-        .unwrap();
+    db_guard.enqueue_outbound_batch(&manifest, None).unwrap();
     let _ = net_tx.try_send(manifest.batch_id);
 }
 
@@ -327,9 +328,7 @@ async fn enqueue_batch_with_seq(
         changes: vec![change],
     };
     let db_guard = db.lock().await;
-    db_guard
-        .enqueue_outbound_batch(&manifest, None)
-        .unwrap();
+    db_guard.enqueue_outbound_batch(&manifest, None).unwrap();
     let _ = net_tx.try_send(manifest.batch_id);
 }
 
@@ -377,10 +376,9 @@ struct TlsMaterial {
 }
 
 fn generate_shared_tls(names: &[&str]) -> TlsMaterial {
-    let cert = rcgen::generate_simple_self_signed(
-        names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-    )
-    .unwrap();
+    let cert =
+        rcgen::generate_simple_self_signed(names.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .unwrap();
     let ca_pem = cert.serialize_pem().unwrap();
     let cert_pem = ca_pem.clone();
     let key_pem = cert.serialize_private_key_pem();

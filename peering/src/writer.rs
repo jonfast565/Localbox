@@ -68,6 +68,8 @@ mod tests {
             pc_name: "pc".to_string(),
             instance_id: "inst".to_string(),
             listen_port: 5000,
+            plain_port: 0,
+            use_tls_for_peers: true,
             shares: vec!["shareA".to_string()],
         });
         let msg_for_sender = msg.clone();

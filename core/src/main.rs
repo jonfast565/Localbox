@@ -1,8 +1,13 @@
 use clap::Parser;
-use localbox::config::{init_config_template, validate_app_config, Cli, Command};
+use localbox::config::{
+    init_config_template, validate_app_config, BootstrapCommand, Cli, Command, DEFAULT_CONFIG_PATH,
+};
+use localbox::monitoring;
 use localbox::Engine;
-use utilities::RealFileSystem;
 use serde_json::json;
+use std::path::PathBuf;
+use tls::{self, bootstrap, workflow};
+use utilities::{copy_file_atomic, write_file_atomic, RealFileSystem};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,6 +27,18 @@ async fn main() -> anyhow::Result<()> {
             validate_app_config(&cfg)?;
             println!("OK");
             Ok(())
+        }
+        Some(Command::Monitor(args)) => {
+            let cfg = cli.resolve_app_config_allow_empty_shares()?;
+            let opts = monitoring::MonitorOptions {
+                interval_secs: args.interval_secs,
+                iterations: args.iterations,
+                queue_threshold: args.queue_threshold,
+                stale_peer_seconds: args.stale_peer_seconds,
+                json: args.json,
+                exit_on_alert: args.exit_on_alert,
+            };
+            monitoring::run_monitor(&cfg, &opts)
         }
         Some(Command::Status(args)) => {
             let cfg = cli.resolve_app_config_allow_empty_shares()?;
@@ -143,24 +160,60 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Some(Command::Bootstrap(args)) => {
+            let cfg = cli.resolve_app_config_allow_empty_shares()?;
+            match &args.command {
+                BootstrapCommand::Invite(invite) => {
+                    bootstrap::issue_invite(&cfg, &invite.peer, &invite.out, invite.force)?;
+                    println!("Wrote invite to {}", invite.out.display());
+                    Ok(())
+                }
+                BootstrapCommand::Accept(accept) => {
+                    let config_path = cli
+                        .config
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+                    let result =
+                        bootstrap::accept_invite(&cfg, &config_path, &accept.file, accept.force)?;
+                    println!(
+                        "Verified invite from {} (fingerprint {}). Token: {}",
+                        result.peer_name, result.fingerprint, result.token
+                    );
+                    println!("Imported {} CA cert(s)", result.ca_certs_added);
+                    if result.config_updated {
+                        println!(
+                            "Updated tls_peer_fingerprints entry for {} in {}",
+                            result.peer_name,
+                            config_path.display()
+                        );
+                    } else {
+                        println!(
+                            "tls_peer_fingerprints already contained {}",
+                            result.peer_name
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        }
         Some(Command::Tls(tls)) => {
             let cfg = cli.resolve_app_config_allow_empty_shares()?;
             match &tls.command {
                 localbox::config::TlsCommand::Ensure => {
                     let fs = RealFileSystem::new();
-                    let _ = peering::tls::TlsComponents::from_config(&cfg, &fs)?;
+                    let _ = tls::TlsComponents::from_config(&cfg, &fs)?;
                     println!("leaf:  {}", cfg.tls_cert_path.display());
                     println!("trust: {}", cfg.tls_ca_cert_path.display());
-                    for fp in localbox::tls_workflow::fingerprints_for_pem_file(&cfg.tls_cert_path)? {
+                    for fp in workflow::fingerprints_for_pem_file(&cfg.tls_cert_path)? {
                         println!("leaf-fp {}", fp.fingerprint);
                     }
-                    for fp in localbox::tls_workflow::fingerprints_for_pem_file(&cfg.tls_ca_cert_path)? {
+                    for fp in workflow::fingerprints_for_pem_file(&cfg.tls_ca_cert_path)? {
                         println!("ca-fp   {}", fp.fingerprint);
                     }
                     Ok(())
                 }
                 localbox::config::TlsCommand::List => {
-                    let fps = localbox::tls_workflow::read_trust_store_fingerprints(&cfg.tls_ca_cert_path)?;
+                    let fps = workflow::read_trust_store_fingerprints(&cfg.tls_ca_cert_path)?;
                     if fps.is_empty() {
                         println!("(empty)");
                     } else {
@@ -177,21 +230,21 @@ async fn main() -> anyhow::Result<()> {
                     let want_ca = args.ca || (!args.leaf && !args.ca);
 
                     if let Some(path) = file {
-                        let fps = localbox::tls_workflow::fingerprints_for_pem_file(path)?;
+                        let fps = workflow::fingerprints_for_pem_file(path)?;
                         for fp in fps {
                             println!("{}", fp.fingerprint);
                             printed_any = true;
                         }
                     } else {
                         if want_leaf {
-                            let fps = localbox::tls_workflow::fingerprints_for_pem_file(&cfg.tls_cert_path)?;
+                            let fps = workflow::fingerprints_for_pem_file(&cfg.tls_cert_path)?;
                             for fp in fps {
                                 println!("leaf {}", fp.fingerprint);
                                 printed_any = true;
                             }
                         }
                         if want_ca {
-                            let fps = localbox::tls_workflow::fingerprints_for_pem_file(&cfg.tls_ca_cert_path)?;
+                            let fps = workflow::fingerprints_for_pem_file(&cfg.tls_ca_cert_path)?;
                             for fp in fps {
                                 println!("ca   {}", fp.fingerprint);
                                 printed_any = true;
@@ -205,34 +258,94 @@ async fn main() -> anyhow::Result<()> {
                     Ok(())
                 }
                 localbox::config::TlsCommand::ExportCa(args) => {
-                    localbox::tls_workflow::export_ca_from_chain_pem(&cfg.tls_cert_path, &args.out)?;
+                    workflow::export_ca_from_chain_pem(&cfg.tls_cert_path, &args.out)?;
                     println!("Wrote {}", args.out.display());
                     Ok(())
                 }
                 localbox::config::TlsCommand::ImportCa(args) => {
-                    let added = localbox::tls_workflow::import_ca_into_trust_store(
-                        &cfg.tls_ca_cert_path,
-                        &args.r#in,
-                    )?;
-                    println!("Added {added} certificate(s) to {}", cfg.tls_ca_cert_path.display());
+                    let added =
+                        workflow::import_ca_into_trust_store(&cfg.tls_ca_cert_path, &args.r#in)?;
+                    println!(
+                        "Added {added} certificate(s) to {}",
+                        cfg.tls_ca_cert_path.display()
+                    );
                     Ok(())
                 }
                 localbox::config::TlsCommand::Rotate(args) => {
                     let fs = RealFileSystem::new();
-                    let materials = peering::tls::generate_tls_materials(&cfg.pc_name)?;
+                    let materials = tls::generate_tls_materials(&cfg.pc_name)?;
                     let ts = time::OffsetDateTime::now_utc().unix_timestamp();
                     let suffix = format!(".bak-{ts}");
                     if args.backup {
-                        let _ = localbox::tls_workflow::backup_file(&cfg.tls_cert_path, &suffix)?;
-                        let _ = localbox::tls_workflow::backup_file(&cfg.tls_key_path, &suffix)?;
-                        let _ = localbox::tls_workflow::backup_file(&cfg.tls_ca_cert_path, &suffix)?;
+                        let _ = workflow::backup_file(&cfg.tls_cert_path, &suffix)?;
+                        let _ = workflow::backup_file(&cfg.tls_key_path, &suffix)?;
+                        let _ = workflow::backup_file(&cfg.tls_ca_cert_path, &suffix)?;
                     }
-                    peering::tls::persist_tls_materials(&cfg, &materials, &fs)?;
+                    tls::persist_tls_materials(&cfg, &materials, &fs)?;
                     if let Some(out) = &args.export_ca {
-                        std::fs::write(out, format!("{}\n", materials.ca_pem))?;
+                        write_file_atomic(out, format!("{}\n", materials.ca_pem).as_bytes())?;
                         println!("Wrote {}", out.display());
                     }
                     println!("Rotated TLS materials");
+                    Ok(())
+                }
+                localbox::config::TlsCommand::Provision(args) => {
+                    let fs = RealFileSystem::new();
+                    let _ = tls::TlsComponents::from_config(&cfg, &fs)?;
+                    std::fs::create_dir_all(&args.out_dir)?;
+                    let leaf_out = args.out_dir.join("leaf.cert.pem");
+                    let key_out = args.out_dir.join("leaf.key.pem");
+                    let ca_out = args.out_dir.join("ca.bundle.pem");
+                    copy_file_atomic(&cfg.tls_cert_path, &leaf_out, args.force)?;
+                    copy_file_atomic(&cfg.tls_key_path, &key_out, args.force)?;
+                    copy_file_atomic(&cfg.tls_ca_cert_path, &ca_out, args.force)?;
+
+                    if let Some(extra_ca) = &args.export_ca {
+                        copy_file_atomic(&cfg.tls_ca_cert_path, extra_ca, args.force)?;
+                    }
+
+                    let leaf_fps = workflow::fingerprints_for_pem_file(&cfg.tls_cert_path)?;
+                    let mut fp_text = String::new();
+                    for fp in &leaf_fps {
+                        fp_text.push_str(&format!("leaf {}\n", fp.fingerprint));
+                    }
+                    for fp in workflow::fingerprints_for_pem_file(&cfg.tls_ca_cert_path)? {
+                        fp_text.push_str(&format!("ca   {}\n", fp.fingerprint));
+                    }
+                    let fp_out = args.out_dir.join("fingerprints.txt");
+                    if fp_out.exists() && !args.force {
+                        anyhow::bail!(
+                            "{} already exists (pass --force to overwrite)",
+                            fp_out.display()
+                        );
+                    }
+                    write_file_atomic(&fp_out, fp_text.as_bytes())?;
+
+                    let mut snippet = String::from("[tls_peer_fingerprints]\n");
+                    snippet.push_str(&format!("\"{}\" = [\n", cfg.pc_name));
+                    for fp in &leaf_fps {
+                        snippet.push_str(&format!("  \"{}\",\n", fp.fingerprint));
+                    }
+                    snippet.push_str("]\n");
+                    let snippet_out = args.out_dir.join("peer-snippet.toml");
+                    if snippet_out.exists() && !args.force {
+                        anyhow::bail!(
+                            "{} already exists (pass --force to overwrite)",
+                            snippet_out.display()
+                        );
+                    }
+                    write_file_atomic(&snippet_out, snippet.as_bytes())?;
+
+                    println!("Wrote TLS bundle to {}", args.out_dir.display());
+                    println!("  - leaf cert  -> {}", leaf_out.display());
+                    println!("  - leaf key   -> {}", key_out.display());
+                    println!("  - CA bundle  -> {}", ca_out.display());
+                    println!("  - fingerprints -> {}", fp_out.display());
+                    println!("  - config snippet -> {}", snippet_out.display());
+                    if let Some(extra_ca) = &args.export_ca {
+                        println!("  - exported CA -> {}", extra_ca.display());
+                    }
+                    println!("Distribute the CA + snippet to peers so they can pin this node.");
                     Ok(())
                 }
             }

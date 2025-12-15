@@ -72,7 +72,11 @@ fn db_migrates_http_port_column_to_plain_port() {
 
     let conn = Connection::open(&path).unwrap();
     let plain_port: i64 = conn
-        .query_row("SELECT last_plain_port FROM peers WHERE pc_name='pc-old'", [], |row| row.get(0))
+        .query_row(
+            "SELECT last_plain_port FROM peers WHERE pc_name='pc-old'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(plain_port, 8080);
 

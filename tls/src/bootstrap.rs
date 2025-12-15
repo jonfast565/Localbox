@@ -1,0 +1,237 @@
+use crate::{fingerprint_hex, workflow};
+use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use models::AppConfig;
+use rand::{rngs::OsRng, RngCore};
+use ring::rand::SystemRandom;
+use ring::signature::{
+    EcdsaKeyPair, Signature, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1,
+    ECDSA_P256_SHA256_ASN1_SIGNING,
+};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::{BufReader, Write};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::NamedTempFile;
+use utilities::write_file_atomic;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InvitePayload {
+    pub version: u32,
+    pub issued_at: i64,
+    pub issuer_pc_name: String,
+    pub issuer_instance_id: String,
+    pub peer_name: String,
+    pub share_names: Vec<String>,
+    pub ca_pem: String,
+    pub leaf_cert_pem: String,
+    pub leaf_fingerprint: String,
+    pub token: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SignedInvite {
+    pub payload: InvitePayload,
+    pub signature: String,
+}
+
+pub struct AcceptResult {
+    pub peer_name: String,
+    pub fingerprint: String,
+    pub token: String,
+    pub ca_certs_added: usize,
+    pub config_updated: bool,
+}
+
+pub fn issue_invite(cfg: &AppConfig, peer: &str, out: &Path, force: bool) -> Result<()> {
+    if out.exists() && !force {
+        bail!(
+            "Refusing to overwrite existing invite at {} (pass --force to overwrite)",
+            out.display()
+        );
+    }
+    let ca_pem = fs::read_to_string(&cfg.tls_ca_cert_path)
+        .with_context(|| format!("failed to read {}", cfg.tls_ca_cert_path.display()))?;
+    let leaf_cert_pem = fs::read_to_string(&cfg.tls_cert_path)
+        .with_context(|| format!("failed to read {}", cfg.tls_cert_path.display()))?;
+    let leaf_der = {
+        let mut reader = BufReader::new(leaf_cert_pem.as_bytes());
+        rustls_pemfile::certs(&mut reader)
+            .context("failed to parse leaf certificate")?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                anyhow!(
+                    "leaf certificate missing from {}",
+                    cfg.tls_cert_path.display()
+                )
+            })?
+    };
+    let leaf_fingerprint = fingerprint_hex(&leaf_der);
+    let token = random_token();
+    let payload = InvitePayload {
+        version: 1,
+        issued_at: current_ts(),
+        issuer_pc_name: cfg.pc_name.clone(),
+        issuer_instance_id: cfg.instance_id.clone(),
+        peer_name: peer.to_string(),
+        share_names: cfg.shares.iter().map(|s| s.name.clone()).collect(),
+        ca_pem,
+        leaf_cert_pem: leaf_cert_pem.clone(),
+        leaf_fingerprint: leaf_fingerprint.clone(),
+        token,
+    };
+    let payload_bytes = serde_json::to_vec(&payload)?;
+    let signature = sign_payload(&cfg.tls_key_path, &payload_bytes)?;
+    let signed = SignedInvite {
+        payload,
+        signature: BASE64.encode(signature.as_ref()),
+    };
+    let data = serde_json::to_vec_pretty(&signed)?;
+    write_file_atomic(out, &data)?;
+    Ok(())
+}
+
+pub fn accept_invite(
+    cfg: &AppConfig,
+    config_path: &Path,
+    invite_path: &Path,
+    force: bool,
+) -> Result<AcceptResult> {
+    if !config_path.exists() && !force {
+        bail!(
+            "Config file {} does not exist; run `localbox init` first or pass --force to create it",
+            config_path.display()
+        );
+    }
+    let raw = fs::read_to_string(invite_path)
+        .with_context(|| format!("failed to read {}", invite_path.display()))?;
+    let signed: SignedInvite = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid invite {}", invite_path.display()))?;
+    if signed.payload.version != 1 {
+        bail!("unsupported invite version {}", signed.payload.version);
+    }
+    let payload_bytes = serde_json::to_vec(&signed.payload)?;
+    let signature = BASE64
+        .decode(signed.signature.as_bytes())
+        .context("invalid base64 signature in invite")?;
+
+    let leaf_der = {
+        let mut reader = BufReader::new(signed.payload.leaf_cert_pem.as_bytes());
+        rustls_pemfile::certs(&mut reader)
+            .context("failed to parse leaf certificates from invite")?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("invite is missing the leaf certificate"))?
+    };
+    let computed_fp = fingerprint_hex(&leaf_der);
+    if computed_fp != signed.payload.leaf_fingerprint {
+        bail!(
+            "leaf fingerprint mismatch in invite (claimed {}, computed {})",
+            signed.payload.leaf_fingerprint,
+            computed_fp
+        );
+    }
+
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &leaf_der)
+        .verify(&payload_bytes, &signature)
+        .map_err(|_| anyhow!("signature verification failed for invite"))?;
+
+    let ca_added = {
+        let mut tmp = NamedTempFile::new().context("failed to create temp file for CA import")?;
+        tmp.write_all(signed.payload.ca_pem.as_bytes())
+            .context("failed to write CA PEM to temp file")?;
+        tmp.flush()?;
+        tmp.as_file().sync_all()?;
+        workflow::import_ca_into_trust_store(&cfg.tls_ca_cert_path, tmp.path())
+            .context("failed to import CA certificates")?
+    };
+
+    let config_updated = update_tls_peer_fingerprints(
+        config_path,
+        &signed.payload.issuer_pc_name,
+        &computed_fp,
+        force,
+    )?;
+
+    Ok(AcceptResult {
+        peer_name: signed.payload.issuer_pc_name,
+        fingerprint: computed_fp,
+        token: signed.payload.token,
+        ca_certs_added: ca_added,
+        config_updated,
+    })
+}
+
+fn sign_payload(key_path: &Path, payload: &[u8]) -> Result<Signature> {
+    let key_data =
+        fs::read(key_path).with_context(|| format!("failed to read {}", key_path.display()))?;
+    let mut reader = BufReader::new(key_data.as_slice());
+    let mut keys = rustls_pemfile::pkcs8_private_keys(&mut reader)
+        .context("failed to parse PKCS#8 private key")?;
+    let key = keys
+        .pop()
+        .ok_or_else(|| anyhow!("no PKCS#8 private key found in {}", key_path.display()))?;
+    let rng = SystemRandom::new();
+    let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &key, &rng)
+        .map_err(|_| anyhow!("failed to build signing key pair"))?;
+    pair.sign(&rng, payload)
+        .map_err(|_| anyhow!("failed to sign invite payload"))
+}
+
+fn random_token() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    BASE64.encode(bytes)
+}
+
+fn current_ts() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn update_tls_peer_fingerprints(
+    config_path: &Path,
+    peer: &str,
+    fingerprint: &str,
+    force: bool,
+) -> Result<bool> {
+    let mut doc: toml::Value = if config_path.exists() {
+        toml::from_str(
+            &fs::read_to_string(config_path)
+                .with_context(|| format!("failed to read {}", config_path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", config_path.display()))?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let table = doc
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("config {} is not a table", config_path.display()))?;
+    let fps_entry = table
+        .entry("tls_peer_fingerprints")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let fps_table = fps_entry
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("tls_peer_fingerprints must be a table"))?;
+    let arr_entry = fps_table
+        .entry(peer.to_string())
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let arr = arr_entry
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("tls_peer_fingerprints for {} must be an array", peer))?;
+    let already_present = arr.iter().any(|v| v.as_str() == Some(fingerprint));
+    if already_present {
+        if !force {
+            return Ok(false);
+        }
+    } else {
+        arr.push(toml::Value::String(fingerprint.to_string()));
+    }
+    let updated = toml::to_string_pretty(&doc)?;
+    write_file_atomic(config_path, updated.as_bytes())?;
+    Ok(!already_present || force)
+}

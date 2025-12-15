@@ -83,11 +83,14 @@ mod tests {
 
     #[test]
     fn matches_simple_globs() {
-        let patterns = vec!["**/*.tmp".to_string(), ".git/*".to_string(), "Thumbs.db".to_string()];
+        let patterns = vec![
+            "**/*.tmp".to_string(),
+            ".git/*".to_string(),
+            "Thumbs.db".to_string(),
+        ];
         assert!(is_ignored_rel_path("a/b/c.tmp", &patterns));
         assert!(is_ignored_rel_path(".git/index", &patterns));
         assert!(is_ignored_rel_path("Thumbs.db", &patterns));
         assert!(!is_ignored_rel_path("a/b/c.txt", &patterns));
     }
 }
-

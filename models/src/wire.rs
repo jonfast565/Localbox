@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::change::BatchManifest;
-use crate::share::ShareId;
 use crate::default_wire_protocol_version;
+use crate::share::ShareId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloMessage {

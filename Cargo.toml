@@ -5,7 +5,8 @@ members = [
     "peering",
     "utilities",
     "core",
-    "protocol"
+    "protocol",
+    "tls"
 ]
 
 resolver = "2"

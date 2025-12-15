@@ -56,8 +56,12 @@ async fn udp_unicast_only_delivers_to_target_addr() {
     assert_eq!(from, a);
 
     let mut buf2 = [0u8; 32];
-    let recv_a = tokio::time::timeout(Duration::from_millis(100), sock_a.recv_from(&mut buf2)).await;
-    assert!(recv_a.is_err(), "sender socket should not receive unicast to a different addr");
+    let recv_a =
+        tokio::time::timeout(Duration::from_millis(100), sock_a.recv_from(&mut buf2)).await;
+    assert!(
+        recv_a.is_err(),
+        "sender socket should not receive unicast to a different addr"
+    );
 }
 
 #[tokio::test]

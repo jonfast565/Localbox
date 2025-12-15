@@ -116,20 +116,22 @@ impl Net for VirtualNet {
     }
 
     async fn connect_tcp(&self, addr: SocketAddr) -> io::Result<DynStream> {
-        let listener_tx = {
-            let inner = self.inner.lock().unwrap();
-            inner
-                .tcp_listeners
-                .get(&addr)
-                .cloned()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionRefused, "no listener"))?
-        };
+        let listener_tx =
+            {
+                let inner = self.inner.lock().unwrap();
+                inner.tcp_listeners.get(&addr).cloned().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::ConnectionRefused, "no listener")
+                })?
+            };
 
         let (client, server) = tokio::io::duplex(64 * 1024);
         let client_stream: DynStream = Box::new(client);
         let server_stream: DynStream = Box::new(server);
         listener_tx
-            .send((server_stream, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)))
+            .send((
+                server_stream,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            ))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::ConnectionAborted, "listener dropped"))?;
         Ok(client_stream)
@@ -152,7 +154,11 @@ impl UdpSocketLike for VirtualUdpSocket {
             let inner = self.net.inner.lock().unwrap();
             match addr.ip() {
                 IpAddr::V4(ip) if ip.is_broadcast() || ip == Ipv4Addr::new(255, 255, 255, 255) => {
-                    for (_target, tx) in inner.udp_sockets.iter().filter(|(a, _)| a.port() == addr.port()) {
+                    for (_target, tx) in inner
+                        .udp_sockets
+                        .iter()
+                        .filter(|(a, _)| a.port() == addr.port())
+                    {
                         senders.push(tx.clone());
                     }
                 }

@@ -1,9 +1,10 @@
+use crate::{fingerprint_hex, normalize_fingerprint};
 use anyhow::{anyhow, bail, Context, Result};
-use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use utilities::{copy_file_atomic, write_file_atomic};
 
 const PEM_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
 const PEM_END: &str = "-----END CERTIFICATE-----";
@@ -13,39 +14,15 @@ pub struct CertFingerprint {
     pub der: Vec<u8>,
 }
 
-pub fn sha256_fingerprint_hex(der: &[u8]) -> String {
-    let digest = Sha256::digest(der);
-    digest
-        .iter()
-        .map(|b| format!("{:02X}", b))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
-pub fn normalize_fingerprint(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .map(|c| c.to_ascii_uppercase())
-        .collect()
-}
-
-pub fn read_cert_der_from_pem(path: &Path) -> Result<Vec<Vec<u8>>> {
-    let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let mut reader = BufReader::new(std::io::Cursor::new(data));
-    let certs = rustls_pemfile::certs(&mut reader)
-        .map_err(|e| anyhow!("failed to parse PEM certs from {}: {e}", path.display()))?;
-    if certs.is_empty() {
-        bail!("no certificates found in {}", path.display());
-    }
-    Ok(certs)
-}
-
 pub fn fingerprints_for_pem_file(path: &Path) -> Result<Vec<CertFingerprint>> {
     read_cert_der_from_pem(path)?
         .into_iter()
         .map(|der| {
-            let fp = sha256_fingerprint_hex(&der);
-            Ok(CertFingerprint { fingerprint: fp, der })
+            let fp = fingerprint_hex(&der);
+            Ok(CertFingerprint {
+                fingerprint: fp,
+                der,
+            })
         })
         .collect()
 }
@@ -58,22 +35,7 @@ pub fn read_trust_store_fingerprints(path: &Path) -> Result<Vec<String>> {
     let mut reader = BufReader::new(std::io::Cursor::new(data));
     let certs = rustls_pemfile::certs(&mut reader)
         .map_err(|e| anyhow!("failed to parse PEM certs from {}: {e}", path.display()))?;
-    Ok(certs.into_iter().map(|der| sha256_fingerprint_hex(&der)).collect())
-}
-
-pub fn extract_pem_cert_blocks(pem_text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = pem_text;
-    loop {
-        let Some(start) = rest.find(PEM_BEGIN) else { break };
-        let after_start = &rest[start..];
-        let Some(end_rel) = after_start.find(PEM_END) else { break };
-        let end = start + end_rel + PEM_END.len();
-        let block = rest[start..end].to_string();
-        out.push(block);
-        rest = &rest[end..];
-    }
-    out
+    Ok(certs.into_iter().map(|der| fingerprint_hex(&der)).collect())
 }
 
 pub fn export_ca_from_chain_pem(cert_chain_path: &Path, out_path: &Path) -> Result<()> {
@@ -89,7 +51,7 @@ pub fn export_ca_from_chain_pem(cert_chain_path: &Path, out_path: &Path) -> Resu
     let ca_block = blocks
         .last()
         .ok_or_else(|| anyhow!("missing CA certificate in chain"))?;
-    write_atomic(out_path, format!("{ca_block}\n").as_bytes())
+    write_file_atomic(out_path, format!("{ca_block}\n").as_bytes())
         .with_context(|| format!("failed to write {}", out_path.display()))?;
     Ok(())
 }
@@ -147,7 +109,7 @@ pub fn import_ca_into_trust_store(trust_store_path: &Path, input_pem_path: &Path
         }
     }
     existing_text.push_str(&to_append);
-    write_atomic(trust_store_path, existing_text.as_bytes())
+    write_file_atomic(trust_store_path, existing_text.as_bytes())
         .with_context(|| format!("failed to write {}", trust_store_path.display()))?;
     Ok(appended)
 }
@@ -163,21 +125,37 @@ pub fn backup_file(path: &Path, suffix: &str) -> Result<Option<PathBuf>> {
         .to_string();
     let backup_name = format!("{file_name}{suffix}");
     let backup_path = path.with_file_name(backup_name);
-    fs::copy(path, &backup_path)
+    copy_file_atomic(path, &backup_path, true)
         .with_context(|| format!("failed to create backup {}", backup_path.display()))?;
     Ok(Some(backup_path))
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = parent.join(format!(
-        ".{}.tmp",
-        path.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-    ));
-    fs::write(&tmp, data).with_context(|| format!("failed to write {}", tmp.display()))?;
-    let _ = fs::remove_file(path);
-    fs::rename(&tmp, path).with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+fn read_cert_der_from_pem(path: &Path) -> Result<Vec<Vec<u8>>> {
+    let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut reader = BufReader::new(std::io::Cursor::new(data));
+    let certs = rustls_pemfile::certs(&mut reader)
+        .map_err(|e| anyhow!("failed to parse PEM certs from {}: {e}", path.display()))?;
+    if certs.is_empty() {
+        bail!("no certificates found in {}", path.display());
+    }
+    Ok(certs)
+}
+
+fn extract_pem_cert_blocks(pem_text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = pem_text;
+    loop {
+        let Some(start) = rest.find(PEM_BEGIN) else {
+            break;
+        };
+        let after_start = &rest[start..];
+        let Some(end_rel) = after_start.find(PEM_END) else {
+            break;
+        };
+        let end = start + end_rel + PEM_END.len();
+        let block = rest[start..end].to_string();
+        out.push(block);
+        rest = &rest[end..];
+    }
+    out
 }

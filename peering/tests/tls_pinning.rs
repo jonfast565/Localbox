@@ -32,6 +32,7 @@ fn pinning_blocks_auto_generation() {
         tls_key_path: PathBuf::from("key.pem"),
         tls_ca_cert_path: PathBuf::from("trust.pem"),
         tls_pinned_ca_fingerprints: vec!["AA".to_string()],
+        tls_peer_fingerprints: std::collections::HashMap::new(),
         remote_share_root: PathBuf::from("remote"),
         shares: vec![ShareConfig {
             name: "s".to_string(),
@@ -42,7 +43,7 @@ fn pinning_blocks_auto_generation() {
         }],
     };
 
-    let res = peering::tls::TlsComponents::from_config(&cfg, fs.as_ref());
+    let res = tls::TlsComponents::from_config(&cfg, fs.as_ref());
     assert!(res.is_err());
     let err = res.err().unwrap().to_string();
     assert!(err.contains("pinning is enabled"));
@@ -51,14 +52,23 @@ fn pinning_blocks_auto_generation() {
 #[test]
 fn pinning_allows_matching_ca() {
     let fs: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
-    let materials = peering::tls::generate_tls_materials("pc").unwrap();
+    let materials = tls::generate_tls_materials("pc").unwrap();
 
-    fs.write(PathBuf::from("cert.pem").as_path(), materials.cert_chain_pem.as_bytes())
-        .unwrap();
-    fs.write(PathBuf::from("key.pem").as_path(), materials.key_pem.as_bytes())
-        .unwrap();
-    fs.write(PathBuf::from("trust.pem").as_path(), materials.ca_pem.as_bytes())
-        .unwrap();
+    fs.write(
+        PathBuf::from("cert.pem").as_path(),
+        materials.cert_chain_pem.as_bytes(),
+    )
+    .unwrap();
+    fs.write(
+        PathBuf::from("key.pem").as_path(),
+        materials.key_pem.as_bytes(),
+    )
+    .unwrap();
+    fs.write(
+        PathBuf::from("trust.pem").as_path(),
+        materials.ca_pem.as_bytes(),
+    )
+    .unwrap();
 
     let ca_der = {
         let bytes = fs.read(PathBuf::from("trust.pem").as_path()).unwrap();
@@ -81,6 +91,7 @@ fn pinning_allows_matching_ca() {
         tls_key_path: PathBuf::from("key.pem"),
         tls_ca_cert_path: PathBuf::from("trust.pem"),
         tls_pinned_ca_fingerprints: vec![ca_fp],
+        tls_peer_fingerprints: std::collections::HashMap::new(),
         remote_share_root: PathBuf::from("remote"),
         shares: vec![ShareConfig {
             name: "s".to_string(),
@@ -91,5 +102,5 @@ fn pinning_allows_matching_ca() {
         }],
     };
 
-    peering::tls::TlsComponents::from_config(&cfg, fs.as_ref()).unwrap();
+    tls::TlsComponents::from_config(&cfg, fs.as_ref()).unwrap();
 }

@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::io::Read;
@@ -28,6 +29,7 @@ pub trait FileSystem: Send + Sync {
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
+    fn as_any(&self) -> &dyn Any;
 }
 
 #[derive(Debug, Default, Clone)]
@@ -75,12 +77,7 @@ impl FileSystem for RealFileSystem {
     }
 
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        std::fs::write(path, data)
+        crate::write_file_atomic(path, data)
     }
 
     fn create_dir_all(&self, path: &Path) -> io::Result<()> {
@@ -93,11 +90,15 @@ impl FileSystem for RealFileSystem {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to)
+        crate::rename_file_atomic(from, to)
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -145,14 +146,20 @@ impl VirtualFileSystem {
                     components.pop();
                 }
                 Component::Normal(c) => {
-                    let mut p = components.last().cloned().unwrap_or_else(|| PathBuf::from("/"));
+                    let mut p = components
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| PathBuf::from("/"));
                     p.push(c);
                     components.push(p);
                 }
                 Component::Prefix(_) => {}
             }
         }
-        components.last().cloned().unwrap_or_else(|| PathBuf::from("/"))
+        components
+            .last()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("/"))
     }
 
     fn ensure_parent(&self, inner: &mut VirtualFsInner, path: &Path) -> io::Result<()> {
@@ -290,7 +297,10 @@ impl FileSystem for VirtualFileSystem {
                         .to_string(),
                     norm.clone(),
                 );
-            inner.nodes.entry(parent_norm).or_insert(VNode::Dir { modified: now });
+            inner
+                .nodes
+                .entry(parent_norm)
+                .or_insert(VNode::Dir { modified: now });
         }
         Ok(())
     }
@@ -390,5 +400,9 @@ impl FileSystem for VirtualFileSystem {
             }
         }
         Ok(())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

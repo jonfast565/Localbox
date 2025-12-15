@@ -33,13 +33,7 @@ fn read_dir_lists_children() {
         .read_dir(Path::new("/d/e"))
         .unwrap()
         .into_iter()
-        .map(|e| {
-            e.path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string()
-        })
+        .map(|e| e.path.file_name().unwrap().to_string_lossy().to_string())
         .collect::<Vec<_>>();
     entries.sort();
 

@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 use db::Db;
@@ -12,13 +12,13 @@ use notify::{
 use peering::PeerManager;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
-use utilities::{init_logging, FileSystem, Net, RealFileSystem, RealNet};
+use tokio::time::{interval, Duration};
 use tokio_util::sync::CancellationToken;
-use utilities::disk_utilities::build_meta_with_retry_limited;
+use tracing::{error, info, warn};
 use utilities::compute_file_hash;
+use utilities::disk_utilities::build_meta_with_retry_limited;
+use utilities::{init_logging, FileSystem, Net, RealFileSystem, RealNet};
 use uuid::Uuid;
 
 const APP_BANNER: &str = r#"
@@ -59,7 +59,11 @@ impl Engine {
         Self::with_fs_net_db(cfg, fs, net, db)
     }
 
-    pub fn with_in_memory_db(cfg: AppConfig, fs: Arc<dyn FileSystem>, net: Arc<dyn Net>) -> Result<Self> {
+    pub fn with_in_memory_db(
+        cfg: AppConfig,
+        fs: Arc<dyn FileSystem>,
+        net: Arc<dyn Net>,
+    ) -> Result<Self> {
         let db = Db::open_in_memory()?;
         Self::with_fs_net_db(cfg, fs, net, db)
     }
@@ -105,7 +109,11 @@ impl Engine {
         Ok(engine)
     }
 
-    fn spawn_change_aggregator(&mut self, rx: mpsc::Receiver<FileChange>, token: CancellationToken) {
+    fn spawn_change_aggregator(
+        &mut self,
+        rx: mpsc::Receiver<FileChange>,
+        token: CancellationToken,
+    ) {
         let db = Arc::clone(&self.db);
         let agg_window_ms = self.cfg.aggregation_window_ms;
         let net_tx = self.net_tx.clone();
@@ -163,8 +171,10 @@ impl Engine {
         )?;
 
         // Periodic cleanup of old batches.
-        let cleanup_task =
-            tokio::spawn(cleanup_old_batches_task(Arc::clone(&self.db), token.clone()));
+        let cleanup_task = tokio::spawn(cleanup_old_batches_task(
+            Arc::clone(&self.db),
+            token.clone(),
+        ));
 
         let net_rx = self.net_rx.take().expect("net_rx must be present");
 
@@ -211,7 +221,10 @@ impl Engine {
     }
 }
 
-async fn persist_incoming_change(db: &Arc<Mutex<Db>>, mut change: FileChange) -> Option<FileChange> {
+async fn persist_incoming_change(
+    db: &Arc<Mutex<Db>>,
+    mut change: FileChange,
+) -> Option<FileChange> {
     let share_row_id = db
         .lock()
         .await
@@ -235,7 +248,11 @@ async fn persist_incoming_change(db: &Arc<Mutex<Db>>, mut change: FileChange) ->
             deleted: true,
         });
         deleted_meta.deleted = true;
-        if let Err(e) = db.lock().await.upsert_file_meta(share_row_id, &deleted_meta) {
+        if let Err(e) = db
+            .lock()
+            .await
+            .upsert_file_meta(share_row_id, &deleted_meta)
+        {
             error!("DB upsert_file_meta (delete) error: {e}");
         }
         change.meta = Some(deleted_meta);
@@ -261,9 +278,7 @@ async fn persist_incoming_change(db: &Arc<Mutex<Db>>, mut change: FileChange) ->
     Some(change)
 }
 
-fn group_pending_by_share(
-    pending: &mut Vec<FileChange>,
-) -> HashMap<[u8; 16], Vec<FileChange>> {
+fn group_pending_by_share(pending: &mut Vec<FileChange>) -> HashMap<[u8; 16], Vec<FileChange>> {
     let mut per_share: HashMap<[u8; 16], Vec<FileChange>> = HashMap::new();
     for ch in pending.drain(..) {
         per_share
@@ -359,11 +374,7 @@ async fn enqueue_batch(
             changes: chunk.to_vec(),
         };
 
-        if let Err(e) = db
-            .lock()
-            .await
-            .enqueue_outbound_batch(&manifest, peer_id)
-        {
+        if let Err(e) = db.lock().await.enqueue_outbound_batch(&manifest, peer_id) {
             match peer_id {
                 Some(pid) => error!("Failed to queue batch {batch_id} for peer {pid}: {e}"),
                 None => error!("Failed to queue batch {batch_id} for outbound: {e}"),
@@ -390,7 +401,10 @@ async fn enqueue_batch(
     }
 }
 
-fn format_share_label(share_id: &models::ShareId, share_labels: &HashMap<[u8; 16], String>) -> String {
+fn format_share_label(
+    share_id: &models::ShareId,
+    share_labels: &HashMap<[u8; 16], String>,
+) -> String {
     if let Some(name) = share_labels.get(&share_id.0) {
         format!(
             "{} ({})",
@@ -405,8 +419,8 @@ fn format_share_label(share_id: &models::ShareId, share_labels: &HashMap<[u8; 16
 #[cfg(test)]
 mod tests {
     use super::{format_share_label, group_pending_by_share, handle_rename_event, map_event_kind};
-    use models::{ChangeKind, FileChange, ShareId};
     use models::ShareContext;
+    use models::{ChangeKind, FileChange, ShareId};
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::EventKind;
     use std::collections::HashMap;
@@ -472,14 +486,19 @@ mod tests {
             Some(ChangeKind::Create)
         );
         assert_eq!(
-            map_event_kind(&EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any))),
+            map_event_kind(&EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Any
+            ))),
             Some(ChangeKind::Modify)
         );
         assert_eq!(
             map_event_kind(&EventKind::Remove(RemoveKind::File)),
             Some(ChangeKind::Delete)
         );
-        assert_eq!(map_event_kind(&EventKind::Access(notify::event::AccessKind::Any)), None);
+        assert_eq!(
+            map_event_kind(&EventKind::Access(notify::event::AccessKind::Any)),
+            None
+        );
     }
 
     #[test]
@@ -717,7 +736,11 @@ async fn cleanup_old_batches_task(db: Arc<Mutex<Db>>, token: CancellationToken) 
     }
 }
 
-async fn run_peering(peer_mgr: PeerManager, net_rx: mpsc::Receiver<String>, token: CancellationToken) {
+async fn run_peering(
+    peer_mgr: PeerManager,
+    net_rx: mpsc::Receiver<String>,
+    token: CancellationToken,
+) {
     if let Err(e) = peer_mgr.run(net_rx, token).await {
         error!("PeerManager error: {e}");
     }
@@ -792,17 +815,13 @@ fn handle_path_event(
         ) {
             Ok(meta) => Some(meta),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                info!(
-                    "File missing during event, treating as delete: {:?}",
-                    path
-                );
+                info!("File missing during event, treating as delete: {:?}", path);
                 None
             }
             Err(e) => {
                 warn!(
                     "Failed to gather file info for {:?} ({}): {e}",
-                    path,
-                    share.share_name
+                    path, share.share_name
                 );
                 None
             }

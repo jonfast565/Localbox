@@ -240,8 +240,10 @@ impl Db {
         }
 
         if current < 3 && !has_last_plain_port {
-            self.conn
-                .execute("ALTER TABLE peers ADD COLUMN last_plain_port INTEGER NOT NULL DEFAULT 0", [])?;
+            self.conn.execute(
+                "ALTER TABLE peers ADD COLUMN last_plain_port INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
             if has_last_http_port {
                 self.conn
                     .execute("UPDATE peers SET last_plain_port = last_http_port", [])?;
@@ -255,7 +257,8 @@ impl Db {
     }
 
     pub fn schema_version(&self) -> Result<i32> {
-        self.conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        self.conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
     }
 
     /// Ensure shares from config exist; return loaded ShareContexts (indexes loaded).

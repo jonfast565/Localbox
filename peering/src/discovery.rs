@@ -3,21 +3,21 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsConnector;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use utilities::{Net, UdpSocketLike};
-use tokio_util::sync::CancellationToken;
 
 use crate::connection::connect_to_peer;
 use crate::{DbHandle, SharedWriters};
 use protocol::{parse_discovery_message, DiscoveryMessage};
 use std::collections::HashSet;
+use tls::ManagedTls;
 
 pub fn spawn_discovery(
     cfg: AppConfig,
     db: DbHandle,
     shares: Vec<ShareContext>,
-    connector: TlsConnector,
+    tls: Arc<ManagedTls>,
     connections: SharedWriters,
     net_tx: tokio::sync::mpsc::Sender<String>,
     fs: Arc<dyn utilities::FileSystem>,
@@ -32,7 +32,7 @@ pub fn spawn_discovery(
         db,
         share_names,
         share_lookup,
-        connector,
+        tls,
         connections,
         net_tx,
         fs,
@@ -46,7 +46,7 @@ async fn discovery_loop(
     db: DbHandle,
     share_names: Vec<String>,
     share_lookup: Arc<Vec<ShareContext>>,
-    connector: TlsConnector,
+    tls: Arc<ManagedTls>,
     connections: SharedWriters,
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
     fs: Arc<dyn utilities::FileSystem>,
@@ -94,7 +94,7 @@ async fn discovery_loop(
                             msg.as_ref(),
                             src,
                             &socket,
-                            connector.clone(),
+                            tls.clone(),
                             connections.clone(),
                             net_tx.clone(),
                             fs.clone(),
@@ -152,7 +152,7 @@ async fn handle_discovery_message(
     msg: &str,
     src: SocketAddr,
     socket: &Arc<dyn UdpSocketLike>,
-    connector: TlsConnector,
+    tls: Arc<ManagedTls>,
     connections: SharedWriters,
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
     fs: Arc<dyn utilities::FileSystem>,
@@ -189,7 +189,7 @@ async fn handle_discovery_message(
                 shares,
                 src,
                 socket,
-                connector,
+                tls.clone(),
                 connections,
                 net_tx,
                 fs.clone(),
@@ -218,7 +218,7 @@ async fn handle_discovery_message(
                 use_tls_for_peers,
                 shares,
                 src,
-                connector,
+                tls.clone(),
                 connections,
                 net_tx,
                 fs.clone(),
@@ -243,7 +243,7 @@ async fn handle_discover(
     shares: Vec<String>,
     src: SocketAddr,
     socket: &Arc<dyn UdpSocketLike>,
-    connector: TlsConnector,
+    tls: Arc<ManagedTls>,
     connections: SharedWriters,
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
     fs: Arc<dyn utilities::FileSystem>,
@@ -270,15 +270,6 @@ async fn handle_discover(
     } else {
         peer_plain_addr
     };
-    let peer_addr = if cfg.use_tls_for_peers && tls_port != 0 {
-        peer_tls_addr
-    } else if !cfg.use_tls_for_peers && plain_port != 0 {
-        peer_plain_addr
-    } else if tls_port != 0 {
-        peer_tls_addr
-    } else {
-        peer_plain_addr
-    };
     let Some(peer_id) = upsert_peer_with_state(
         db,
         pc_name,
@@ -288,7 +279,8 @@ async fn handle_discover(
         prefer_tls,
         "discovered",
     )
-    .await else {
+    .await
+    else {
         return;
     };
 
@@ -338,7 +330,7 @@ async fn handle_discover(
         db,
         share_names,
         connections,
-        connector,
+        tls.clone(),
         fs,
         net.clone(),
         token,
@@ -357,7 +349,7 @@ async fn handle_here(
     prefer_tls: bool,
     shares: Vec<String>,
     src: SocketAddr,
-    connector: TlsConnector,
+    tls: Arc<ManagedTls>,
     connections: SharedWriters,
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
     fs: Arc<dyn utilities::FileSystem>,
@@ -375,6 +367,15 @@ async fn handle_here(
     };
     let peer_tls_addr = SocketAddr::new(peer_ip, tls_port);
     let peer_plain_addr = SocketAddr::new(peer_ip, plain_port);
+    let peer_addr = if cfg.use_tls_for_peers && tls_port != 0 {
+        peer_tls_addr
+    } else if !cfg.use_tls_for_peers && plain_port != 0 {
+        peer_plain_addr
+    } else if tls_port != 0 {
+        peer_tls_addr
+    } else {
+        peer_plain_addr
+    };
     let Some(peer_id) = upsert_peer_with_state(
         db,
         pc_name,
@@ -384,7 +385,8 @@ async fn handle_here(
         prefer_tls,
         "discovered",
     )
-    .await else {
+    .await
+    else {
         return;
     };
 
@@ -425,7 +427,7 @@ async fn handle_here(
         db,
         share_names,
         connections,
-        connector,
+        tls.clone(),
         fs,
         net.clone(),
         token,
@@ -440,7 +442,7 @@ fn spawn_connect_task(
     db: &DbHandle,
     share_names: &[String],
     connections: SharedWriters,
-    connector: TlsConnector,
+    tls: Arc<ManagedTls>,
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     token: CancellationToken,
@@ -458,7 +460,7 @@ fn spawn_connect_task(
         db,
         share_names,
         connections,
-        connector,
+        tls,
         fs,
         net,
         token,
@@ -473,25 +475,28 @@ async fn run_connect_task(
     db: DbHandle,
     share_names: Vec<String>,
     connections: SharedWriters,
-    connector: TlsConnector,
+    tls: Arc<ManagedTls>,
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     token: CancellationToken,
 ) {
     tokio::select! {
         _ = token.cancelled() => {}
-        res = connect_to_peer(
-            peer_tls_addr,
-            peer_plain_addr,
-            &pc_name,
-            &cfg,
-            &db,
-            &share_names,
-            connections,
-            connector,
-            fs,
-            net,
-        ) => {
+        res = async {
+            let connector = tls.connector().await;
+            connect_to_peer(
+                peer_tls_addr,
+                peer_plain_addr,
+                &pc_name,
+                &cfg,
+                &db,
+                &share_names,
+                connections,
+                connector,
+                fs,
+                net,
+            ).await
+        } => {
             if let Err(e) = res {
                 warn!("Connect to peer {} failed: {e}", pc_name);
             }
@@ -568,11 +573,7 @@ async fn enqueue_catchup_if_needed(
             };
         let mut start = last_sent;
         loop {
-            let changes = match db
-                .lock()
-                .await
-                .list_changes_since(share_row_id, start, 256)
-            {
+            let changes = match db.lock().await.list_changes_since(share_row_id, start, 256) {
                 Ok(ch) => ch,
                 Err(e) => {
                     warn!(

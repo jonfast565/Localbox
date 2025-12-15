@@ -4,17 +4,17 @@ use anyhow::Result;
 use db::Db;
 use models::{AppConfig, ShareContext, WireMessage};
 use time::OffsetDateTime;
+use tls::ManagedTls;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use utilities::{FileSystem, Net};
-use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
 
 mod connection;
 mod discovery;
-pub mod tls;
 mod writer;
 
 type DbHandle = Arc<Mutex<Db>>;
@@ -23,7 +23,7 @@ type SharedWriters = Arc<Mutex<Vec<(i64, Arc<tokio::sync::Mutex<writer::PeerWrit
 pub struct PeerManager {
     cfg: AppConfig,
     db: DbHandle,
-    tls: tls::TlsComponents,
+    tls: Arc<ManagedTls>,
     net_tx: mpsc::Sender<String>,
     fs: Arc<dyn FileSystem>,
     net: Arc<dyn Net>,
@@ -39,7 +39,7 @@ impl PeerManager {
         fs: Arc<dyn FileSystem>,
         net: Arc<dyn Net>,
     ) -> Result<Self> {
-        let tls = tls::TlsComponents::from_config(&cfg, fs.as_ref())?;
+        let tls = Arc::new(ManagedTls::new(&cfg, fs.clone())?);
         Ok(Self {
             cfg,
             db,
@@ -51,21 +51,28 @@ impl PeerManager {
         })
     }
 
-    pub async fn run(&self, net_rx: mpsc::Receiver<String>, token: CancellationToken) -> Result<()> {
+    pub async fn run(
+        &self,
+        net_rx: mpsc::Receiver<String>,
+        token: CancellationToken,
+    ) -> Result<()> {
         let connections: SharedWriters = Arc::new(Mutex::new(Vec::new()));
+
+        let tls = self.tls.clone();
+        let tls_watch = tls.clone().spawn_watcher(token.clone());
 
         let discovery = discovery::spawn_discovery(
             self.cfg.clone(),
             Arc::clone(&self.db),
             self.shares.clone(),
-            self.tls.connector.clone(),
+            tls.clone(),
             connections.clone(),
             self.net_tx.clone(),
             self.fs.clone(),
             self.net.clone(),
             token.clone(),
         );
-        let listener = self.spawn_tcp_listener(connections.clone(), token.clone());
+        let listener = self.spawn_tcp_listener(connections.clone(), tls.clone(), token.clone());
         let plain_listener = self.spawn_plain_listener(connections.clone(), token.clone());
         let sender = self.spawn_outbox_worker(connections.clone(), net_rx, token.clone());
 
@@ -74,17 +81,21 @@ impl PeerManager {
                 info!("PeerManager cancellation requested");
             }
             _ = async {
-                let _ = tokio::join!(discovery, listener, plain_listener, sender);
+                let _ = tokio::join!(discovery, listener, plain_listener, sender, tls_watch);
             } => {}
         }
         Ok(())
     }
 
-    fn spawn_tcp_listener(&self, connections: SharedWriters, token: tokio_util::sync::CancellationToken) -> JoinHandle<()> {
+    fn spawn_tcp_listener(
+        &self,
+        connections: SharedWriters,
+        tls: Arc<ManagedTls>,
+        token: tokio_util::sync::CancellationToken,
+    ) -> JoinHandle<()> {
         let cfg = self.cfg.clone();
         let db = Arc::clone(&self.db);
         let share_names: Vec<String> = self.shares.iter().map(|s| s.share_name.clone()).collect();
-        let tls_acceptor = self.tls.acceptor.clone();
         let fs = self.fs.clone();
         let net = self.net.clone();
 
@@ -109,22 +120,24 @@ impl PeerManager {
                                 let cfg = cfg.clone();
                                 let share_names = share_names.clone();
                                 let connections = connections.clone();
-                                let tls_acceptor = tls_acceptor.clone();
+                                let tls = tls.clone();
                                 let fs = fs.clone();
                                 let net = net.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = connection::handle_tls_connection(
-                                        stream,
-                                        &cfg,
-                                        &db,
-                                        &share_names,
-                                        addr,
-                                        connections,
-                                        tls_acceptor,
-                                        fs,
-                                        net,
-                                    )
-                                    .await
+                                    let tls_acceptor = tls.acceptor().await;
+                                    if let Err(e) =
+                                        connection::handle_tls_connection(
+                                            stream,
+                                            &cfg,
+                                            &db,
+                                            &share_names,
+                                            addr,
+                                            connections,
+                                            tls_acceptor,
+                                            fs,
+                                            net,
+                                        )
+                                        .await
                                     {
                                         error!("connection error from {addr}: {e}");
                                     }
@@ -141,7 +154,11 @@ impl PeerManager {
         })
     }
 
-    fn spawn_plain_listener(&self, connections: SharedWriters, token: tokio_util::sync::CancellationToken) -> JoinHandle<()> {
+    fn spawn_plain_listener(
+        &self,
+        connections: SharedWriters,
+        token: tokio_util::sync::CancellationToken,
+    ) -> JoinHandle<()> {
         let cfg = self.cfg.clone();
         let db = Arc::clone(&self.db);
         let share_names: Vec<String> = self.shares.iter().map(|s| s.share_name.clone()).collect();
@@ -199,7 +216,6 @@ impl PeerManager {
         })
     }
 
-
     fn spawn_outbox_worker(
         &self,
         connections: SharedWriters,
@@ -208,7 +224,7 @@ impl PeerManager {
     ) -> JoinHandle<()> {
         let db = Arc::clone(&self.db);
         tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
                     _ = token.cancelled() => break,

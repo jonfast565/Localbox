@@ -18,7 +18,7 @@ const DEFAULT_TLS_CERT_PATH: &str = "certs/localbox.cert.pem";
 const DEFAULT_TLS_KEY_PATH: &str = "certs/localbox.key.pem";
 const DEFAULT_TLS_CA_CERT_PATH: &str = "certs/ca.cert.pem";
 const DEFAULT_REMOTE_SHARE_ROOT: &str = "remote-shares";
-const DEFAULT_CONFIG_PATH: &str = "config.toml";
+pub const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
 #[derive(Debug, Parser)]
 #[command(name = "localbox", about = "LocalBox core engine")]
@@ -40,8 +40,12 @@ pub enum Command {
     Init(InitArgs),
     /// Validate merged configuration (config.toml + CLI overrides)
     Validate(ValidateArgs),
+    /// Watch metrics and emit alerts
+    Monitor(MonitorArgs),
     /// TLS trust store operations (CA import/export/fingerprints/rotation)
     Tls(TlsArgs),
+    /// Create or accept signed bootstrap invites
+    Bootstrap(BootstrapArgs),
     /// Show current status (peers, shares, progress, queue depth) from the local DB
     Status(StatusArgs),
 }
@@ -57,10 +61,77 @@ pub struct InitArgs {
 pub struct ValidateArgs {}
 
 #[derive(Debug, Args)]
+pub struct MonitorArgs {
+    /// Poll interval in seconds
+    #[arg(long, default_value_t = 10)]
+    pub interval_secs: u64,
+
+    /// Optional maximum iterations before exiting (default: run forever)
+    #[arg(long)]
+    pub iterations: Option<u32>,
+
+    /// Queue depth threshold that triggers an alert
+    #[arg(long, default_value_t = 100)]
+    pub queue_threshold: u64,
+
+    /// Consider peers stale if last_seen is older than this many seconds
+    #[arg(long, default_value_t = 300)]
+    pub stale_peer_seconds: i64,
+
+    /// Emit JSON snapshots instead of human-readable logs
+    #[arg(long)]
+    pub json: bool,
+
+    /// Exit with an error as soon as an alert fires
+    #[arg(long)]
+    pub exit_on_alert: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct StatusArgs {
     /// Print as JSON
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BootstrapArgs {
+    #[command(subcommand)]
+    pub command: BootstrapCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BootstrapCommand {
+    /// Issue a signed invite bundle for a peer
+    Invite(BootstrapInviteArgs),
+    /// Accept and verify an invite bundle
+    Accept(BootstrapAcceptArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct BootstrapInviteArgs {
+    /// The peer name to embed in the invite
+    #[arg(long)]
+    pub peer: String,
+
+    /// Output path for the invite bundle (JSON)
+    #[arg(long, value_name = "PATH")]
+    pub out: PathBuf,
+
+    /// Overwrite any existing invite at --out
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BootstrapAcceptArgs {
+    /// Path to the invite bundle to import
+    #[arg(long, value_name = "PATH")]
+    pub file: PathBuf,
+
+    /// Allow updating config/trust even if entries already exist
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -83,6 +154,8 @@ pub enum TlsCommand {
     ImportCa(ImportCaArgs),
     /// Rotate this node's CA + leaf cert and optionally export the new CA
     Rotate(RotateArgs),
+    /// Bundle TLS materials (cert/key/CA/fingerprints) for peer provisioning
+    Provision(ProvisionArgs),
 }
 
 #[derive(Debug, Args)]
@@ -121,6 +194,21 @@ pub struct RotateArgs {
     pub backup: bool,
 
     /// Optional path to write the newly-generated CA certificate PEM (for distribution)
+    #[arg(long, value_name = "PATH")]
+    pub export_ca: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ProvisionArgs {
+    /// Directory to write the exported bundle (must exist or be creatable)
+    #[arg(long, value_name = "DIR")]
+    pub out_dir: PathBuf,
+
+    /// Overwrite existing files in the output directory
+    #[arg(long)]
+    pub force: bool,
+
+    /// Optional filename for an additional CA export (helpful for distribution)
     #[arg(long, value_name = "PATH")]
     pub export_ca: Option<PathBuf>,
 }
@@ -282,6 +370,10 @@ impl Cli {
             .as_ref()
             .and_then(|c| c.tls_pinned_ca_fingerprints.clone())
             .unwrap_or_default();
+        let tls_peer_fingerprints = file_cfg
+            .as_ref()
+            .and_then(|c| c.tls_peer_fingerprints.clone())
+            .unwrap_or_default();
 
         let shares = merge_shares(
             file_cfg
@@ -306,7 +398,10 @@ impl Cli {
             pc_name,
             instance_id,
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
-            plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), plain_listen_port),
+            plain_listen_addr: SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                plain_listen_port,
+            ),
             use_tls_for_peers,
             discovery_port,
             aggregation_window_ms,
@@ -316,6 +411,7 @@ impl Cli {
             tls_key_path,
             tls_ca_cert_path,
             tls_pinned_ca_fingerprints,
+            tls_peer_fingerprints,
             remote_share_root,
             shares,
         })
@@ -345,6 +441,7 @@ pub fn validate_app_config(cfg: &AppConfig) -> Result<()> {
     validate_share_configs(&cfg.shares)?;
     validate_share_paths(&cfg.shares)?;
     validate_remote_share_root(&cfg.remote_share_root)?;
+    validate_tls_peer_fingerprints(&cfg.tls_peer_fingerprints)?;
     Ok(())
 }
 
@@ -431,6 +528,7 @@ struct FileConfig {
     tls_key_path: Option<PathBuf>,
     tls_ca_cert_path: Option<PathBuf>,
     tls_pinned_ca_fingerprints: Option<Vec<String>>,
+    tls_peer_fingerprints: Option<HashMap<String, Vec<String>>>,
     use_tls_for_peers: Option<bool>,
     remote_share_root: Option<PathBuf>,
     shares: Option<Vec<FileShareConfig>>,
@@ -480,8 +578,8 @@ fn load_file_config(path: &Path) -> Result<FileConfig> {
 
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let cfg: FileConfig = toml::from_str(&raw)
-        .map_err(|e| anyhow!("invalid TOML in {}: {e}", path.display()))?;
+    let cfg: FileConfig =
+        toml::from_str(&raw).map_err(|e| anyhow!("invalid TOML in {}: {e}", path.display()))?;
 
     if let Some(shares) = &cfg.shares {
         validate_file_share_names_unique(shares, path)?;
@@ -510,7 +608,10 @@ fn validate_file_share_names_unique(shares: &[FileShareConfig], path: &Path) -> 
     Ok(())
 }
 
-fn merge_shares(file_shares: Vec<FileShareConfig>, cli_shares: Vec<ShareCli>) -> Result<Vec<ShareConfig>> {
+fn merge_shares(
+    file_shares: Vec<FileShareConfig>,
+    cli_shares: Vec<ShareCli>,
+) -> Result<Vec<ShareConfig>> {
     let mut out: Vec<ShareConfig> = Vec::new();
     let mut idx_by_name: HashMap<String, usize> = HashMap::new();
 
@@ -621,6 +722,47 @@ fn validate_remote_share_root(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_tls_peer_fingerprints(map: &HashMap<String, Vec<String>>) -> Result<()> {
+    for (peer, fps) in map {
+        let trimmed = peer.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("tls_peer_fingerprints keys cannot be empty"));
+        }
+        if trimmed != peer {
+            return Err(anyhow!(
+                "tls_peer_fingerprints key '{}' has surrounding whitespace",
+                peer
+            ));
+        }
+        if fps.is_empty() {
+            return Err(anyhow!(
+                "tls_peer_fingerprints entry for '{}' must contain at least one fingerprint",
+                peer
+            ));
+        }
+        for fp in fps {
+            let normalized = fp.trim();
+            if normalized.is_empty() {
+                return Err(anyhow!(
+                    "tls_peer_fingerprints entry for '{}' contains an empty fingerprint",
+                    peer
+                ));
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | ' '))
+            {
+                return Err(anyhow!(
+                    "tls_peer_fingerprints value '{}' for '{}' must be hex with optional ':' or spaces",
+                    fp,
+                    peer
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn default_config_template() -> String {
     format!(
         r#"# Localbox configuration (TOML)
@@ -646,6 +788,12 @@ remote_share_root = "{remote_share_root}"
 # Optional: restrict trust to specific CA fingerprints (SHA-256 hex; spaces/colons ignored).
 # tls_pinned_ca_fingerprints = [
 #   "AA:BB:CC:...",
+# ]
+
+# Optional: pin individual peer leaf certificates (per pc_name).
+# [tls_peer_fingerprints]
+# "workstation-1" = [
+#   "11:22:33:...",
 # ]
 
 # Whether to use TLS when talking to peers (otherwise plaintext)
@@ -677,6 +825,7 @@ mod tests {
     use super::{default_config_template, parse_share_arg, validate_app_config, Cli};
     use clap::Parser;
     use models::AppConfig;
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -708,12 +857,8 @@ mod tests {
         std::fs::write(&path, "\n").unwrap();
 
         let path_str = path.to_string_lossy().to_string();
-        let cli = Cli::try_parse_from([
-            "localbox".to_string(),
-            "--config".to_string(),
-            path_str,
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["localbox".to_string(), "--config".to_string(), path_str])
+            .unwrap();
         let err = cli.resolve_app_config().unwrap_err().to_string();
         assert!(err.contains("no shares configured"));
         assert!(err.contains("--share"));
@@ -746,6 +891,7 @@ mod tests {
             tls_key_path: PathBuf::from("key"),
             tls_ca_cert_path: PathBuf::from("ca"),
             tls_pinned_ca_fingerprints: Vec::new(),
+            tls_peer_fingerprints: HashMap::new(),
             remote_share_root: PathBuf::from("remote"),
             shares: vec![models::ShareConfig {
                 name: "s".to_string(),

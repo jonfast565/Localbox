@@ -8,6 +8,7 @@ models = { path = "../models" }
 db = { path = "../db" }
 utilities = { path = "../utilities" }
 protocol = { path = "../protocol" }
+tls = { path = "../tls" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

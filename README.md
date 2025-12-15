@@ -129,13 +129,13 @@ Localbox currently replicates *change logs and file metadata*, not file contents
 
 ## TLS notes
 
-Localbox uses mTLS for peer connections and expects three PEM files:
+Localbox uses TLS 1.3 with mutual authentication and expects three PEM files:
 
 - `--tls-cert-path` (leaf certificate)
 - `--tls-key-path` (PKCS#8 private key)
 - `--tls-ca-cert-path` (CA bundle used to authenticate peers)
 
-If these files are missing or invalid, Localbox generates a new local CA + leaf cert and attempts to write them to the configured paths.
+If these files are missing or invalid, Localbox generates a new local CA + leaf cert and attempts to write them to the configured paths. The running daemon automatically reloads TLS materials when any of the files change, so you can rotate certificates without restarting.
 
 For multiple machines to connect, each node must trust the other nodes' CA certificates (for example, by distributing CA certs and concatenating them into the `--tls-ca-cert-path` bundle on every node).
 
@@ -163,9 +163,57 @@ Rotate on a machine (new CA + new leaf cert):
 
 Then distribute/import `pc-a.ca.new.pem` to all peers **before** expecting them to trust the rotated machine. Keep the old CA in peers' trust stores until you're confident no one still uses it.
 
+### Provisioning bundles
+
+To provision a new peer (or refresh secrets) and share fingerprints/config snippets with others, run:
+
+```
+localbox tls provision --out ./tls-bundle
+```
+
+This copies the current leaf cert, key, CA bundle, fingerprints, and a `[tls_peer_fingerprints]` snippet into the provided directory. Distribute the CA bundle + snippet to other peers so they can trust and pin this node.
+
+### Signed bootstrap invites
+
+To make onboarding safer and less error-prone, you can generate a signed invite bundle on the source machine:
+
+```
+localbox bootstrap invite --peer workstation-b --out invites/workstation-b.json
+```
+
+Transfer the JSON bundle via a trusted channel. On the receiving machine run:
+
+```
+localbox bootstrap accept --file invites/workstation-b.json
+```
+
+This verifies the signature, imports the CA certs, and appends the peer's fingerprint to `tls_peer_fingerprints` inside your `config.toml` (respecting `--config` if provided).
+
 ### Optional pinning
 
-If you want to restrict trust to a specific set of CA fingerprints (even if `tls_ca_cert_path` contains more), set `tls_pinned_ca_fingerprints` in `config.toml`. Fingerprints are SHA-256 hex; colons/spaces are ignored.
+There are two levels of pinning:
+
+- Restrict trust to a specific set of CA fingerprints with `tls_pinned_ca_fingerprints` (SHA-256 hex; spaces/colons ignored).
+- Pin individual peer leaf certificates via `tls_peer_fingerprints`:
+
+```toml
+[tls_peer_fingerprints]
+"workstation-1" = [
+  "AA:BB:CC:...",
+]
+```
+
+Connection attempts fail if the presented certificate fingerprint is not in the configured list for that peer.
+
+## Monitoring & alerting
+
+Use the built-in monitor to keep an eye on queue depth and peer freshness:
+
+```
+localbox monitor --queue-threshold 50 --stale-peer-seconds 120 --exit-on-alert
+```
+
+It polls the database, prints human-readable or JSON snapshots (`--json`), and emits alerts (optionally exiting non-zero) when thresholds are exceeded.
 
 ## Workspace layout
 

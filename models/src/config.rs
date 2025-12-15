@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -21,6 +22,8 @@ pub struct AppConfig {
     pub tls_ca_cert_path: PathBuf,
     #[serde(default)]
     pub tls_pinned_ca_fingerprints: Vec<String>,
+    #[serde(default)]
+    pub tls_peer_fingerprints: HashMap<String, Vec<String>>,
     pub remote_share_root: PathBuf,
     pub shares: Vec<ShareConfig>,
 }

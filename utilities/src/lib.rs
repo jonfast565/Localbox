@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
 use std::ffi::OsStr;
-use std::io;
-use std::io::Read;
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use once_cell::sync::OnceCell;
@@ -18,8 +18,11 @@ pub mod filesystem;
 pub mod ignore;
 pub mod net;
 
+pub use disk_utilities::{
+    build_meta_with_retry, build_meta_with_retry_limited, build_remote_share_root,
+    relative_share_path,
+};
 pub use filesystem::{DirEntry, FileSystem, FsMetadata, RealFileSystem, VirtualFileSystem};
-pub use disk_utilities::{build_meta_with_retry, build_meta_with_retry_limited, build_remote_share_root, relative_share_path};
 pub use net::{DynStream, Net, RealNet, TcpListenerLike, UdpSocketLike, VirtualNet};
 
 /// Guard for the non-blocking file writer so it is not dropped early.
@@ -59,7 +62,9 @@ pub fn retry_hash(
     attempts: usize,
     delay_ms: u64,
 ) -> io::Result<[u8; 32]> {
-    retry_io(path, attempts, delay_ms, || compute_file_hash_once(fs, path))
+    retry_io(path, attempts, delay_ms, || {
+        compute_file_hash_once(fs, path)
+    })
 }
 
 /// Generic retry helper for IO operations against `path`.
@@ -107,13 +112,117 @@ fn compute_file_hash_once(fs: &dyn FileSystem, path: &Path) -> io::Result<[u8; 3
 
 /// Write file contents via a temp file + rename when possible.
 pub fn write_atomic(fs: &dyn FileSystem, path: &Path, data: &[u8]) -> io::Result<()> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    if fs.as_any().is::<RealFileSystem>() {
+        return write_file_atomic(path, data);
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let file_name = path.file_name().unwrap_or_else(|| OsStr::new("file"));
     let tmp = parent.join(format!(".{}.tmp", file_name.to_string_lossy()));
 
     fs.write(&tmp, data)?;
     let _ = fs.remove_file(path);
     fs.rename(&tmp, path)?;
+    Ok(())
+}
+
+fn unique_tmp_name(base: &OsStr) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let mut stem = base.to_string_lossy().to_string();
+    if stem.is_empty() {
+        stem = "file".to_string();
+    }
+    PathBuf::from(format!(".{}.tmp-{}-{}", stem, pid, nonce))
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let dir = File::open(path)?;
+    dir.sync_data()
+}
+
+pub fn write_file_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(unique_tmp_name(
+        path.file_name().unwrap_or_else(|| OsStr::new("file")),
+    ));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&tmp)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+pub fn copy_file_atomic(src: &Path, dst: &Path, overwrite: bool) -> io::Result<()> {
+    if dst.exists() && !overwrite {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", dst.display()),
+        ));
+    }
+    if let Some(parent) = dst.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let parent = dst
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(unique_tmp_name(
+        dst.file_name().unwrap_or_else(|| OsStr::new("file")),
+    ));
+    {
+        let mut reader = File::open(src)?;
+        let mut writer = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        io::copy(&mut reader, &mut writer)?;
+        writer.sync_all()?;
+    }
+    fs::rename(&tmp, dst)?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+pub fn rename_file_atomic(from: &Path, to: &Path) -> io::Result<()> {
+    if let Some(parent) = to.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(from, to)?;
+        sync_directory(parent)?;
+    } else {
+        fs::rename(from, to)?;
+    }
+    if let Some(parent) = from.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = sync_directory(parent);
+        }
+    }
     Ok(())
 }
 

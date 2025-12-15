@@ -562,6 +562,28 @@ impl Db {
         Ok(id)
     }
 
+    pub fn get_share_row(&self, share_row_id: i64) -> Result<ShareRow> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, share_name, pc_name, root_path, recursive
+            FROM shares
+            WHERE id = ?1
+            "#,
+        )?;
+        stmt.query_row(params![share_row_id], |row| {
+            Ok(ShareRow {
+                id: row.get(0)?,
+                share_name: row.get(1)?,
+                pc_name: row.get(2)?,
+                root_path: row.get(3)?,
+                recursive: {
+                    let v: i64 = row.get(4)?;
+                    v != 0
+                },
+            })
+        })
+    }
+
     pub fn list_peer_ids_for_share_name(&self, share_name: &str) -> Result<Vec<i64>> {
         let mut stmt = self.conn.prepare(
             r#"

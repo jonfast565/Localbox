@@ -29,6 +29,15 @@ pub struct FileChange {
     pub meta: Option<FileMeta>, // None for delete
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileChunk {
+    pub share_id: ShareId,
+    pub path: String,
+    pub offset: u64,
+    pub data: Vec<u8>,
+    pub eof: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchManifest {
     #[serde(default = "default_wire_protocol_version")]

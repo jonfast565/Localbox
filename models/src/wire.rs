@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::change::BatchManifest;
+use crate::change::{BatchManifest, FileChunk};
 use crate::default_wire_protocol_version;
 use crate::share::ShareId;
 
@@ -34,6 +34,7 @@ pub enum WireMessage {
     Hello(HelloMessage),
     Batch(BatchManifest),
     BatchAck(BatchAck),
+    FileChunk(FileChunk),
 }
 
 pub fn wire_message_protocol_version(msg: &WireMessage) -> u16 {
@@ -41,6 +42,7 @@ pub fn wire_message_protocol_version(msg: &WireMessage) -> u16 {
         WireMessage::Hello(h) => h.protocol_version,
         WireMessage::Batch(b) => b.protocol_version,
         WireMessage::BatchAck(a) => a.protocol_version,
+        WireMessage::FileChunk(_) => crate::WIRE_PROTOCOL_VERSION,
     }
 }
 

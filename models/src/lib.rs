@@ -12,7 +12,7 @@ pub mod peer;
 pub mod share;
 pub mod wire;
 
-pub use change::{BatchManifest, ChangeKind, FileChange, FileMeta};
+pub use change::{BatchManifest, ChangeKind, FileChange, FileChunk, FileMeta};
 pub use config::{AppConfig, ShareConfig};
 pub use peer::{Peer, PeerState};
 pub use share::{ShareContext, ShareId};

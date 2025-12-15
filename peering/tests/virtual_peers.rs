@@ -1,16 +1,20 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use db::Db;
-use models::{AppConfig, ChangeKind, FileChange, FileMeta, ShareConfig};
+use models::{AppConfig, ChangeKind, FileChange, FileMeta, ShareConfig, ShareContext};
 use peering::PeerManager;
 use rcgen;
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
-use utilities::{FileSystem, Net, VirtualFileSystem, VirtualNet};
+use utilities::{
+    disk_utilities::build_remote_share_root, FileSystem, Net, VirtualFileSystem, VirtualNet,
+};
 
 #[tokio::test(flavor = "current_thread")]
 async fn virtual_peers_exchange_changes() {
@@ -65,11 +69,14 @@ async fn virtual_peers_exchange_changes() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Node1 sends a modify.
+    let modify_bytes = b"hello-peer";
     enqueue_sample_batch(
         &db1,
-        &shares1[0].share_id,
+        &shares1[0],
+        fs1.clone(),
         "a.txt",
         ChangeKind::Modify,
+        Some(modify_bytes),
         net_tx1.clone(),
     )
     .await;
@@ -79,9 +86,11 @@ async fn virtual_peers_exchange_changes() {
     // Node2 sends a delete.
     enqueue_sample_batch(
         &db2,
-        &shares2[0].share_id,
+        &shares2[0],
+        fs2.clone(),
         "old.txt",
         ChangeKind::Delete,
+        None,
         net_tx2.clone(),
     )
     .await;
@@ -99,6 +108,14 @@ async fn virtual_peers_exchange_changes() {
         changes_on_2.iter().any(|c| c.path == "a.txt"),
         "peer2 should have received a.txt"
     );
+    let remote_root = build_remote_share_root(
+        &cfg2.remote_share_root,
+        &cfg1.pc_name,
+        &cfg1.instance_id,
+        &shares1[0].share_name,
+    );
+    let mirrored_bytes = fs2.read(&remote_root.join("a.txt")).unwrap();
+    assert_eq!(mirrored_bytes.as_slice(), modify_bytes);
 
     // Verify db1 received delete.
     let share_row1 = wait_for_share(&db1, &shares2[0].share_id).await;
@@ -176,14 +193,15 @@ async fn replayed_change_does_not_clobber_file_meta() {
 
     // Send seq=2 modify then seq=1 delete for the same path. The delete is a replay and must not
     // overwrite the file metadata on the receiver.
+    let replay_bytes = b"seq-two";
     enqueue_batch_with_seq(
         &db1,
-        &shares1[0].share_id,
+        &shares1[0],
+        fs1.clone(),
         "a.txt",
         ChangeKind::Modify,
         2,
-        [2u8; 32],
-        200,
+        Some(replay_bytes),
         net_tx1.clone(),
     )
     .await;
@@ -193,12 +211,12 @@ async fn replayed_change_does_not_clobber_file_meta() {
 
     enqueue_batch_with_seq(
         &db1,
-        &shares1[0].share_id,
+        &shares1[0],
+        fs1.clone(),
         "a.txt",
         ChangeKind::Delete,
         1,
-        [0u8; 32],
-        100,
+        None,
         net_tx1.clone(),
     )
     .await;
@@ -211,7 +229,184 @@ async fn replayed_change_does_not_clobber_file_meta() {
         .unwrap()
         .unwrap();
     assert!(!meta.deleted, "replayed delete must not mark file deleted");
-    assert_eq!(meta.hash, [2u8; 32]);
+    assert_eq!(meta.hash, hash_bytes(replay_bytes));
+
+    drop(net_tx1);
+    drop(net_tx2);
+    tok1.cancel();
+    tok2.cancel();
+    let _ = t1.await;
+    let _ = t2.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn large_files_stream_correctly() {
+    let net: Arc<dyn Net> = Arc::new(VirtualNet::default());
+    let fs1: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+    let fs2: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+
+    let tls_paths1 = TlsPaths::new("cert1.pem", "key1.pem", "ca.pem");
+    let tls_paths2 = TlsPaths::new("cert2.pem", "key2.pem", "ca.pem");
+    let tls_material = generate_shared_tls(&["pc-one", "pc-two", "localhost"]);
+    write_shared_tls(fs1.as_ref(), &tls_paths1, &tls_material);
+    write_shared_tls(fs2.as_ref(), &tls_paths2, &tls_material);
+
+    let cfg1 = test_config("pc-one", "inst-one", 6201, 7201, "shareA", &tls_paths1);
+    let cfg2 = test_config("pc-two", "inst-two", 6202, 7201, "shareA", &tls_paths2);
+
+    let db1 = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+    let db2 = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+
+    let shares1 = db1.lock().await.load_shares(&cfg1).unwrap();
+    let shares2 = db2.lock().await.load_shares(&cfg2).unwrap();
+
+    let (net_tx1, net_rx1) = mpsc::channel(16);
+    let (net_tx2, net_rx2) = mpsc::channel(16);
+
+    let pm1 = PeerManager::new(
+        cfg1.clone(),
+        db1.clone(),
+        net_tx1.clone(),
+        shares1.clone(),
+        fs1.clone(),
+        net.clone(),
+    )
+    .unwrap();
+    let tok1 = CancellationToken::new();
+    let tok1_runner = tok1.clone();
+    let pm2 = PeerManager::new(
+        cfg2.clone(),
+        db2.clone(),
+        net_tx2.clone(),
+        shares2.clone(),
+        fs2.clone(),
+        net.clone(),
+    )
+    .unwrap();
+    let tok2 = CancellationToken::new();
+    let tok2_runner = tok2.clone();
+
+    let t1 = tokio::spawn(async move { pm1.run(net_rx1, tok1_runner).await.unwrap() });
+    let t2 = tokio::spawn(async move { pm2.run(net_rx2, tok2_runner).await.unwrap() });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let large_bytes = vec![0xAB; 512 * 1024 + 1337];
+    enqueue_sample_batch(
+        &db1,
+        &shares1[0],
+        fs1.clone(),
+        "big.bin",
+        ChangeKind::Modify,
+        Some(&large_bytes),
+        net_tx1.clone(),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let remote_root = build_remote_share_root(
+        &cfg2.remote_share_root,
+        &cfg1.pc_name,
+        &cfg1.instance_id,
+        &shares1[0].share_name,
+    );
+    let mirrored_bytes = wait_for_remote_file(&fs2, &remote_root, "big.bin").await;
+    assert_eq!(mirrored_bytes, large_bytes);
+
+    drop(net_tx1);
+    drop(net_tx2);
+    tok1.cancel();
+    tok2.cancel();
+    let _ = t1.await;
+    let _ = t2.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn deletes_remove_remote_files() {
+    let net: Arc<dyn Net> = Arc::new(VirtualNet::default());
+    let fs1: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+    let fs2: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+
+    let tls_paths1 = TlsPaths::new("cert1.pem", "key1.pem", "ca.pem");
+    let tls_paths2 = TlsPaths::new("cert2.pem", "key2.pem", "ca.pem");
+    let tls_material = generate_shared_tls(&["pc-one", "pc-two", "localhost"]);
+    write_shared_tls(fs1.as_ref(), &tls_paths1, &tls_material);
+    write_shared_tls(fs2.as_ref(), &tls_paths2, &tls_material);
+
+    let cfg1 = test_config("pc-one", "inst-one", 6301, 7301, "shareA", &tls_paths1);
+    let cfg2 = test_config("pc-two", "inst-two", 6302, 7301, "shareA", &tls_paths2);
+
+    let db1 = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+    let db2 = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+
+    let shares1 = db1.lock().await.load_shares(&cfg1).unwrap();
+    let shares2 = db2.lock().await.load_shares(&cfg2).unwrap();
+
+    let (net_tx1, net_rx1) = mpsc::channel(16);
+    let (net_tx2, net_rx2) = mpsc::channel(16);
+
+    let pm1 = PeerManager::new(
+        cfg1.clone(),
+        db1.clone(),
+        net_tx1.clone(),
+        shares1.clone(),
+        fs1.clone(),
+        net.clone(),
+    )
+    .unwrap();
+    let tok1 = CancellationToken::new();
+    let tok1_runner = tok1.clone();
+    let pm2 = PeerManager::new(
+        cfg2.clone(),
+        db2.clone(),
+        net_tx2.clone(),
+        shares2.clone(),
+        fs2.clone(),
+        net.clone(),
+    )
+    .unwrap();
+    let tok2 = CancellationToken::new();
+    let tok2_runner = tok2.clone();
+
+    let t1 = tokio::spawn(async move { pm1.run(net_rx1, tok1_runner).await.unwrap() });
+    let t2 = tokio::spawn(async move { pm2.run(net_rx2, tok2_runner).await.unwrap() });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    enqueue_sample_batch(
+        &db1,
+        &shares1[0],
+        fs1.clone(),
+        "transient.txt",
+        ChangeKind::Modify,
+        Some(b"temporary"),
+        net_tx1.clone(),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let remote_root = build_remote_share_root(
+        &cfg2.remote_share_root,
+        &cfg1.pc_name,
+        &cfg1.instance_id,
+        &shares1[0].share_name,
+    );
+    let _ = wait_for_remote_file(&fs2, &remote_root, "transient.txt").await;
+
+    enqueue_sample_batch(
+        &db1,
+        &shares1[0],
+        fs1.clone(),
+        "transient.txt",
+        ChangeKind::Delete,
+        None,
+        net_tx1.clone(),
+    )
+    .await;
+
+    wait_for_remote_file_removed(&fs2, &remote_root, "transient.txt").await;
 
     drop(net_tx1);
     drop(net_tx2);
@@ -257,32 +452,38 @@ fn test_config(
 
 async fn enqueue_sample_batch(
     db: &Arc<Mutex<Db>>,
-    share_id: &models::ShareId,
+    share: &ShareContext,
+    fs: Arc<dyn FileSystem>,
     path: &str,
     kind: ChangeKind,
+    contents: Option<&[u8]>,
     net_tx: mpsc::Sender<String>,
 ) {
+    let mut meta = None;
+    if !matches!(kind, ChangeKind::Delete) {
+        let data = contents.unwrap_or(b"default");
+        write_share_file(fs.as_ref(), share, path, data);
+        meta = Some(FileMeta {
+            path: path.to_string(),
+            size: data.len() as u64,
+            mtime: OffsetDateTime::now_utc().unix_timestamp(),
+            hash: hash_bytes(data),
+            version: 1,
+            deleted: false,
+        });
+    }
     let change = FileChange {
         seq: 0,
-        share_id: *share_id,
+        share_id: share.share_id,
         path: path.to_string(),
         kind: kind.clone(),
-        meta: match kind {
-            ChangeKind::Delete => None,
-            _ => Some(FileMeta {
-                path: path.to_string(),
-                size: 1,
-                mtime: OffsetDateTime::now_utc().unix_timestamp(),
-                hash: [1u8; 32],
-                version: 1,
-                deleted: false,
-            }),
-        },
+        meta,
     };
+    let unique = BATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
     let manifest = models::BatchManifest {
         protocol_version: models::WIRE_PROTOCOL_VERSION,
-        batch_id: format!("batch-{}", path),
-        share_id: *share_id,
+        batch_id: format!("batch-{}-{unique}", path),
+        share_id: share.share_id,
         from_node: "local".to_string(),
         created_at: OffsetDateTime::now_utc().unix_timestamp(),
         changes: vec![change],
@@ -294,35 +495,38 @@ async fn enqueue_sample_batch(
 
 async fn enqueue_batch_with_seq(
     db: &Arc<Mutex<Db>>,
-    share_id: &models::ShareId,
+    share: &ShareContext,
+    fs: Arc<dyn FileSystem>,
     path: &str,
     kind: ChangeKind,
     seq: i64,
-    hash: [u8; 32],
-    mtime: i64,
+    contents: Option<&[u8]>,
     net_tx: mpsc::Sender<String>,
 ) {
+    let mut meta = None;
+    if !matches!(kind, ChangeKind::Delete) {
+        let data = contents.unwrap_or(b"default");
+        write_share_file(fs.as_ref(), share, path, data);
+        meta = Some(FileMeta {
+            path: path.to_string(),
+            size: data.len() as u64,
+            mtime: OffsetDateTime::now_utc().unix_timestamp(),
+            hash: hash_bytes(data),
+            version: 1,
+            deleted: false,
+        });
+    }
     let change = FileChange {
         seq,
-        share_id: *share_id,
+        share_id: share.share_id,
         path: path.to_string(),
         kind: kind.clone(),
-        meta: match kind {
-            ChangeKind::Delete => None,
-            _ => Some(FileMeta {
-                path: path.to_string(),
-                size: 1,
-                mtime,
-                hash,
-                version: 1,
-                deleted: false,
-            }),
-        },
+        meta,
     };
     let manifest = models::BatchManifest {
         protocol_version: models::WIRE_PROTOCOL_VERSION,
         batch_id: format!("batch-{}-{}", path, seq),
-        share_id: *share_id,
+        share_id: share.share_id,
         from_node: "local".to_string(),
         created_at: OffsetDateTime::now_utc().unix_timestamp(),
         changes: vec![change],
@@ -351,6 +555,56 @@ async fn wait_for_file_meta(db: &Arc<Mutex<Db>>, share_row_id: i64, path: &str) 
     }
     panic!("file meta for {} not present in time", path);
 }
+
+fn write_share_file(fs: &dyn FileSystem, share: &ShareContext, rel: &str, data: &[u8]) {
+    let full_path = share.root_path.join(rel);
+    if let Some(parent) = full_path.parent() {
+        let _ = fs.create_dir_all(parent);
+    }
+    let _ = fs.write(&full_path, data);
+}
+
+fn hash_bytes(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+async fn wait_for_remote_file(
+    fs: &Arc<dyn FileSystem>,
+    root: &Path,
+    rel: &str,
+) -> Vec<u8> {
+    let target = root.join(rel);
+    for _ in 0..50 {
+        match fs.read(&target) {
+            Ok(bytes) => return bytes,
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+    panic!("remote file {} never materialized", target.display());
+}
+
+async fn wait_for_remote_file_removed(
+    fs: &Arc<dyn FileSystem>,
+    root: &Path,
+    rel: &str,
+) {
+    let target = root.join(rel);
+    for _ in 0..50 {
+        match fs.metadata(&target) {
+            Ok(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+    panic!("remote file {} was never removed", target.display());
+}
+
+static BATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct TlsPaths {

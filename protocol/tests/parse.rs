@@ -126,7 +126,7 @@ fn proto_wire_message_round_trip() {
 
 #[test]
 fn proto_file_chunk_round_trip() {
-    let share_id = ShareId::new("shareA", "pc-one").0;
+    let share_id = ShareId::new("shareA", "pc-one");
     let chunk = FileChunk {
         share_id,
         path: "a.txt".to_string(),

@@ -1,22 +1,26 @@
 use anyhow::{bail, Context, Result};
 use models::{
-    AppConfig, ChangeKind, FileChange, FileMeta, HelloMessage, ShareConfig, ShareId, WireMessage,
+    AppConfig, ChangeKind, FileChange, FileChunk, FileMeta, HelloMessage, ShareConfig, ShareId,
+    WireMessage,
 };
 use rustls::ServerName;
 use std::collections::HashSet;
+use std::io::ErrorKind;
+use std::mem;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use time::OffsetDateTime;
-use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio::io::{split, AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::Instrument;
 use tracing::{error, info, warn};
 use utilities::disk_utilities::build_remote_share_root;
-use utilities::{DynStream, FileSystem, Net};
+use utilities::{write_atomic, DynStream, FileSystem, Net};
 
 use crate::writer::{recv_framed_message, send_framed_message, PeerWriter};
-use crate::{DbHandle, SharedWriters};
+use crate::{DbHandle, InboundFileState, PendingFiles, SharedWriters};
 use tls::{fingerprint_from_certificates, normalize_fingerprint};
 
 pub async fn handle_tls_connection(
@@ -26,6 +30,7 @@ pub async fn handle_tls_connection(
     share_names: &[String],
     addr: SocketAddr,
     connections: SharedWriters,
+    pending_files: PendingFiles,
     tls_acceptor: TlsAcceptor,
     fs: Arc<dyn FileSystem>,
     _net: Arc<dyn Net>,
@@ -44,7 +49,7 @@ pub async fn handle_tls_connection(
         );
     }
 
-    let (reader, writer) = io::split(tls_stream);
+    let (reader, writer) = split(tls_stream);
     {
         let mut guard = connections.lock().await;
         guard.push((
@@ -59,6 +64,8 @@ pub async fn handle_tls_connection(
         remote,
         resolved_peer_id,
         connections.clone(),
+        pending_files,
+        fs,
     );
     Ok(())
 }
@@ -70,6 +77,7 @@ pub async fn handle_plain_connection(
     share_names: &[String],
     addr: SocketAddr,
     connections: SharedWriters,
+    pending_files: PendingFiles,
     fs: Arc<dyn FileSystem>,
     _net: Arc<dyn Net>,
 ) -> Result<()> {
@@ -79,7 +87,7 @@ pub async fn handle_plain_connection(
     let now = OffsetDateTime::now_utc().unix_timestamp();
     db.lock().await.mark_peer_insecure(resolved_peer_id, now)?;
 
-    let (reader, writer) = io::split(stream);
+    let (reader, writer) = split(stream);
     {
         let mut guard = connections.lock().await;
         guard.push((
@@ -94,6 +102,8 @@ pub async fn handle_plain_connection(
         remote,
         resolved_peer_id,
         connections.clone(),
+        pending_files,
+        fs,
     );
     Ok(())
 }
@@ -106,6 +116,7 @@ pub async fn connect_to_peer(
     db: &DbHandle,
     share_names: &[String],
     connections: SharedWriters,
+    pending_files: PendingFiles,
     connector: TlsConnector,
     fs: Arc<dyn FileSystem>,
     net: Arc<dyn Net>,
@@ -158,7 +169,7 @@ pub async fn connect_to_peer(
             );
         }
 
-        let (reader, writer) = io::split(tls_stream);
+        let (reader, writer) = split(tls_stream);
         {
             let mut guard = connections.lock().await;
             guard.push((
@@ -166,8 +177,15 @@ pub async fn connect_to_peer(
                 Arc::new(AsyncMutex::new(PeerWriter::Client(writer))),
             ));
         }
-        let _reader_task =
-            spawn_incoming_reader(reader, db.clone(), remote, peer_id, connections.clone());
+        let _reader_task = spawn_incoming_reader(
+            reader,
+            db.clone(),
+            remote,
+            peer_id,
+            connections.clone(),
+            pending_files,
+            fs,
+        );
         info!("Established outbound TLS to {}", target_addr);
     } else {
         let mut plain_stream = tcp;
@@ -182,7 +200,7 @@ pub async fn connect_to_peer(
         .await?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
         db.lock().await.mark_peer_insecure(peer_id, now)?;
-        let (reader, writer) = io::split(plain_stream);
+        let (reader, writer) = split(plain_stream);
         {
             let mut guard = connections.lock().await;
             guard.push((
@@ -190,8 +208,15 @@ pub async fn connect_to_peer(
                 Arc::new(AsyncMutex::new(PeerWriter::Plain(writer))),
             ));
         }
-        let _reader_task =
-            spawn_incoming_reader(reader, db.clone(), remote, peer_id, connections.clone());
+        let _reader_task = spawn_incoming_reader(
+            reader,
+            db.clone(),
+            remote,
+            peer_id,
+            connections.clone(),
+            pending_files,
+            fs,
+        );
         info!("Established outbound plaintext to {}", target_addr);
     }
     Ok(())
@@ -264,6 +289,8 @@ fn spawn_incoming_reader<R>(
     remote: HelloMessage,
     peer_id: i64,
     connections: SharedWriters,
+    pending_files: PendingFiles,
+    fs: Arc<dyn FileSystem>,
 ) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -274,6 +301,8 @@ where
         remote,
         peer_id,
         connections,
+        pending_files,
+        fs,
     ))
 }
 
@@ -283,6 +312,8 @@ async fn incoming_reader_loop<R>(
     remote: HelloMessage,
     peer_id: i64,
     connections: SharedWriters,
+    pending_files: PendingFiles,
+    fs: Arc<dyn FileSystem>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -292,7 +323,15 @@ async fn incoming_reader_loop<R>(
                 info!("Unexpected Hello from {}: {:?}", h.pc_name, h);
             }
             Ok(Some(WireMessage::Batch(b))) => {
-                handle_batch_message(&db, &connections, peer_id, b).await;
+                handle_batch_message(
+                    &db,
+                    &connections,
+                    &pending_files,
+                    Arc::clone(&fs),
+                    peer_id,
+                    b,
+                )
+                .await;
             }
             Ok(Some(WireMessage::BatchAck(ack))) => {
                 let db_guard = db.lock().await;
@@ -303,6 +342,9 @@ async fn incoming_reader_loop<R>(
                     "Received ack for share {:?} upto seq {} from {}",
                     ack.share_id.0, ack.upto_seq, remote.pc_name
                 );
+            }
+            Ok(Some(WireMessage::FileChunk(chunk))) => {
+                handle_file_chunk_message(chunk, &pending_files, Arc::clone(&fs)).await;
             }
             Ok(None) => {
                 info!("Peer {} disconnected", remote.pc_name);
@@ -319,6 +361,8 @@ async fn incoming_reader_loop<R>(
 async fn handle_batch_message(
     db: &DbHandle,
     connections: &SharedWriters,
+    pending_files: &PendingFiles,
+    fs: Arc<dyn FileSystem>,
     peer_id: i64,
     batch: models::BatchManifest,
 ) {
@@ -341,12 +385,35 @@ async fn handle_batch_message(
 
         info!(from_node = %batch.from_node, change_count = batch.changes.len(), "Received batch");
 
+        let share_row_id = match db
+            .lock()
+            .await
+            .get_share_row_id_by_share_id(&batch.share_id)
+        {
+            Ok(id) => id,
+            Err(e) => {
+                info!(
+                    "Unknown share {:?} for inbound batch {}: {e}",
+                    batch.share_id.0, batch.batch_id
+                );
+                return;
+            }
+        };
+        let share_row = match db.lock().await.get_share_row(share_row_id) {
+            Ok(row) => row,
+            Err(e) => {
+                warn!(
+                    share_id = ?batch.share_id.0,
+                    error = %e,
+                    "Failed to load share row"
+                );
+                return;
+            }
+        };
+        let share_root = PathBuf::from(share_row.root_path.clone());
+
         let mut max_seq_for_share = 0;
         for mut change in batch.changes.clone() {
-            let Some(share_row_id) = resolve_share_row_id(db, &change).await else {
-                continue;
-            };
-
             if is_replay(db, share_row_id, change.seq).await {
                 if change.seq > 0 {
                     max_seq_for_share = max_seq_for_share.max(change.seq);
@@ -370,6 +437,23 @@ async fn handle_batch_message(
                 let _ = db.lock().await.upsert_file_meta(share_row_id, meta);
             }
 
+            match change.kind {
+                ChangeKind::Delete => {
+                    drop_existing_pending(pending_files, change.share_id, &change.path).await;
+                    apply_delete_to_disk(&share_root, &change.path, fs.as_ref()).await;
+                }
+                _ => {
+                    prepare_pending_file(
+                        pending_files,
+                        change.share_id,
+                        &change.path,
+                        &share_root,
+                        fs.as_ref(),
+                    )
+                    .await;
+                }
+            }
+
             if let Some(seq) =
                 append_change_and_ack(db, peer_id, share_row_id, &mut change, batch.created_at)
                     .await
@@ -384,6 +468,107 @@ async fn handle_batch_message(
     }
     .instrument(span)
     .await;
+}
+
+async fn prepare_pending_file(
+    pending_files: &PendingFiles,
+    share_id: ShareId,
+    rel_path: &str,
+    share_root: &Path,
+    fs: &dyn FileSystem,
+) {
+    let target = share_root.join(rel_path);
+    if let Some(parent) = target.parent() {
+        if let Err(e) = fs.create_dir_all(parent) {
+            warn!(
+                path = %target.display(),
+                error = %e,
+                "Failed to create parent directory for inbound file"
+            );
+            return;
+        }
+    }
+    let mut guard = pending_files.lock().await;
+    guard.insert(
+        (share_id, rel_path.to_string()),
+        InboundFileState {
+            target_path: target,
+            buffer: Vec::new(),
+            expected_offset: 0,
+        },
+    );
+}
+
+async fn drop_existing_pending(pending_files: &PendingFiles, share_id: ShareId, rel_path: &str) {
+    let mut guard = pending_files.lock().await;
+    guard.remove(&(share_id, rel_path.to_string()));
+}
+
+async fn apply_delete_to_disk(share_root: &Path, rel_path: &str, fs: &dyn FileSystem) {
+    let target = share_root.join(rel_path);
+    match fs.remove_file(&target) {
+        Ok(_) => info!(path = %target.display(), "Deleted inbound file"),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            path = %target.display(),
+            error = %e,
+            "Failed to delete inbound file"
+        ),
+    }
+}
+
+async fn handle_file_chunk_message(
+    chunk: FileChunk,
+    pending_files: &PendingFiles,
+    fs: Arc<dyn FileSystem>,
+) {
+    let key = (chunk.share_id, chunk.path.clone());
+    let mut completed: Option<(PathBuf, Vec<u8>)> = None;
+    {
+        let mut guard = pending_files.lock().await;
+        if let Some(state) = guard.get_mut(&key) {
+            if chunk.offset != state.expected_offset {
+                warn!(
+                    share_id = ?chunk.share_id.0,
+                    path = %chunk.path,
+                    expected = state.expected_offset,
+                    got = chunk.offset,
+                    "Out-of-order file chunk"
+                );
+                if chunk.offset != 0 {
+                    return;
+                }
+                state.buffer.clear();
+                state.expected_offset = 0;
+            }
+            state.buffer.extend_from_slice(&chunk.data);
+            state.expected_offset = chunk.offset + chunk.data.len() as u64;
+            if chunk.eof {
+                let target = state.target_path.clone();
+                let data = mem::take(&mut state.buffer);
+                guard.remove(&key);
+                completed = Some((target, data));
+            }
+        } else {
+            warn!(
+                share_id = ?chunk.share_id.0,
+                path = %chunk.path,
+                "Received file chunk with no pending file entry"
+            );
+        }
+    }
+
+    if let Some((target, data)) = completed {
+        if let Err(e) = write_atomic(fs.as_ref(), &target, &data) {
+            error!(
+                path = %target.display(),
+                error = %e,
+                "Failed to materialize inbound file"
+            );
+        } else {
+            info!(path = %target.display(), "Wrote inbound file");
+        }
+    }
 }
 
 async fn send_batch_ack(
@@ -413,20 +598,6 @@ async fn send_batch_ack(
                 "Failed to send BatchAck to peer {} for share {:?}: {e}",
                 target_peer_id, share_id.0
             );
-        }
-    }
-}
-
-async fn resolve_share_row_id(db: &DbHandle, change: &FileChange) -> Option<i64> {
-    match db
-        .lock()
-        .await
-        .get_share_row_id_by_share_id(&change.share_id)
-    {
-        Ok(id) => Some(id),
-        Err(e) => {
-            info!("Unknown share for change {:?}: {e}", change.share_id.0);
-            None
         }
     }
 }

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use models::{BatchAck, BatchManifest, ChangeKind, FileChange, FileMeta, WireMessage};
+use models::{BatchAck, BatchManifest, ChangeKind, FileChange, FileChunk, FileMeta, WireMessage};
 use prost::Message;
 
 use crate::proto::{
@@ -121,15 +121,6 @@ pub fn parse_batch_manifest(json: &str) -> Result<BatchManifest> {
     Ok(manifest)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileChunk {
-    pub share_id: [u8; 16],
-    pub path: String,
-    pub offset: u64,
-    pub data: Vec<u8>,
-    pub eof: bool,
-}
-
 pub fn encode_wire_message_proto(msg: &WireMessage) -> Result<Vec<u8>> {
     let envelope = match msg {
         WireMessage::Hello(h) => WireEnvelope {
@@ -149,6 +140,15 @@ pub fn encode_wire_message_proto(msg: &WireMessage) -> Result<Vec<u8>> {
             msg: Some(ProtoMsg::BatchAck(ProtoBatchAck {
                 share_id: a.share_id.0.to_vec(),
                 upto_seq: a.upto_seq,
+            })),
+        },
+        WireMessage::FileChunk(chunk) => WireEnvelope {
+            msg: Some(ProtoMsg::FileChunk(ProtoFileChunk {
+                share_id: chunk.share_id.0.to_vec(),
+                path: chunk.path.clone(),
+                offset: chunk.offset,
+                data: chunk.data.clone(),
+                eof: chunk.eof,
             })),
         },
     };
@@ -178,16 +178,20 @@ pub fn decode_wire_message_proto(bytes: &[u8]) -> Result<WireMessage> {
             share_id: models::ShareId(proto_share_id_to_array(&a.share_id)?),
             upto_seq: a.upto_seq,
         })),
-        Some(ProtoMsg::FileChunk(_)) => {
-            anyhow::bail!("unexpected file chunk in WireMessage decode")
-        }
+        Some(ProtoMsg::FileChunk(fc)) => Ok(WireMessage::FileChunk(FileChunk {
+            share_id: models::ShareId(proto_share_id_to_array(&fc.share_id)?),
+            path: fc.path,
+            offset: fc.offset,
+            data: fc.data,
+            eof: fc.eof,
+        })),
         None => anyhow::bail!("empty wire envelope"),
     }
 }
 
 pub fn encode_file_chunk_proto(chunk: &FileChunk) -> Result<Vec<u8>> {
     let proto = ProtoFileChunk {
-        share_id: chunk.share_id.to_vec(),
+        share_id: chunk.share_id.0.to_vec(),
         path: chunk.path.clone(),
         offset: chunk.offset,
         data: chunk.data.clone(),
@@ -203,7 +207,7 @@ pub fn decode_file_chunk_proto(bytes: &[u8]) -> Result<FileChunk> {
     let env = WireEnvelope::decode(bytes)?;
     match env.msg {
         Some(ProtoMsg::FileChunk(fc)) => Ok(FileChunk {
-            share_id: proto_share_id_to_array(&fc.share_id)?,
+            share_id: models::ShareId(proto_share_id_to_array(&fc.share_id)?),
             path: fc.path,
             offset: fc.offset,
             data: fc.data,

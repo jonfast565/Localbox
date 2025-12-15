@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 use utilities::{Net, UdpSocketLike};
 
 use crate::connection::connect_to_peer;
-use crate::{DbHandle, SharedWriters};
+use crate::{DbHandle, PendingFiles, SharedWriters};
 use protocol::{parse_discovery_message, DiscoveryMessage};
 use std::collections::HashSet;
 use tls::ManagedTls;
@@ -16,16 +16,17 @@ use tls::ManagedTls;
 pub fn spawn_discovery(
     cfg: AppConfig,
     db: DbHandle,
-    shares: Vec<ShareContext>,
+    shares: Arc<Vec<ShareContext>>,
     tls: Arc<ManagedTls>,
     connections: SharedWriters,
     net_tx: tokio::sync::mpsc::Sender<String>,
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
+    pending_files: PendingFiles,
     token: CancellationToken,
 ) -> JoinHandle<()> {
     let share_names: Vec<String> = shares.iter().map(|s| s.share_name.clone()).collect();
-    let share_lookup = Arc::new(shares);
+    let share_lookup = shares;
     let net_tx = Arc::new(net_tx);
     tokio::spawn(discovery_loop(
         cfg,
@@ -37,6 +38,7 @@ pub fn spawn_discovery(
         net_tx,
         fs,
         net,
+        pending_files,
         token,
     ))
 }
@@ -51,6 +53,7 @@ async fn discovery_loop(
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
+    pending_files: PendingFiles,
     token: CancellationToken,
 ) {
     let addr: SocketAddr = format!("0.0.0.0:{}", cfg.discovery_port)
@@ -99,6 +102,7 @@ async fn discovery_loop(
                             net_tx.clone(),
                             fs.clone(),
                             net.clone(),
+                            pending_files.clone(),
                             token.clone(),
                         )
                         .await;
@@ -157,6 +161,7 @@ async fn handle_discovery_message(
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
+    pending_files: PendingFiles,
     token: CancellationToken,
 ) {
     let parsed = match parse_discovery_message(msg) {
@@ -194,6 +199,7 @@ async fn handle_discovery_message(
                 net_tx,
                 fs.clone(),
                 net.clone(),
+                pending_files.clone(),
                 token.clone(),
             )
             .await;
@@ -223,6 +229,7 @@ async fn handle_discovery_message(
                 net_tx,
                 fs.clone(),
                 net.clone(),
+                pending_files.clone(),
                 token.clone(),
             )
             .await;
@@ -248,6 +255,7 @@ async fn handle_discover(
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
+    pending_files: PendingFiles,
     token: CancellationToken,
 ) {
     if is_self_peer(cfg, pc_name, instance_id) {
@@ -333,6 +341,7 @@ async fn handle_discover(
         tls.clone(),
         fs,
         net.clone(),
+        pending_files,
         token,
     );
 }
@@ -354,6 +363,7 @@ async fn handle_here(
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
+    pending_files: PendingFiles,
     token: CancellationToken,
 ) {
     if is_self_peer(cfg, pc_name, instance_id) {
@@ -430,6 +440,7 @@ async fn handle_here(
         tls.clone(),
         fs,
         net.clone(),
+        pending_files,
         token,
     );
 }
@@ -445,6 +456,7 @@ fn spawn_connect_task(
     tls: Arc<ManagedTls>,
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
+    pending_files: PendingFiles,
     token: CancellationToken,
 ) {
     let cfg_clone = cfg.clone();
@@ -463,6 +475,7 @@ fn spawn_connect_task(
         tls,
         fs,
         net,
+        pending_files,
         token,
     ));
 }
@@ -478,6 +491,7 @@ async fn run_connect_task(
     tls: Arc<ManagedTls>,
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
+    pending_files: PendingFiles,
     token: CancellationToken,
 ) {
     tokio::select! {
@@ -492,6 +506,7 @@ async fn run_connect_task(
                 &db,
                 &share_names,
                 connections,
+                pending_files.clone(),
                 connector,
                 fs,
                 net,

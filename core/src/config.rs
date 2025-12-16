@@ -93,6 +93,25 @@ pub struct StatusArgs {
     /// Print as JSON
     #[arg(long)]
     pub json: bool,
+
+    #[command(subcommand)]
+    pub section: Option<StatusSection>,
+}
+
+#[derive(Debug, Subcommand, Clone, Copy, PartialEq, Eq)]
+pub enum StatusSection {
+    /// Show DB status
+    Db,
+    /// Show outbound queue status
+    Queue,
+    /// Show metrics
+    Metrics,
+    /// Show peers
+    Peers,
+    /// Show shares
+    Shares,
+    /// Show peer progress
+    PeerProgress,
 }
 
 #[derive(Debug, Args)]

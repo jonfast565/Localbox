@@ -1,6 +1,8 @@
 use clap::Parser;
+use comfy_table::{presets::ASCII_FULL_CONDENSED, Table};
 use localbox::config::{
-    init_config_template, validate_app_config, BootstrapCommand, Cli, Command, DEFAULT_CONFIG_PATH,
+    init_config_template, validate_app_config, BootstrapCommand, Cli, Command, StatusSection,
+    DEFAULT_CONFIG_PATH,
 };
 use localbox::monitoring;
 use localbox::Engine;
@@ -48,115 +50,291 @@ async fn main() -> anyhow::Result<()> {
             let peers = db.list_peers()?;
             let shares = db.list_shares_table()?;
             let progress = db.list_peer_progress_table()?;
+            let peer_count = peers.len();
+            let share_count = shares.len();
+            let progress_count = progress.len();
             let queue_depth = db.outbound_queue_depth()?;
             let queue_due = db.outbound_queue_due_now(now)?;
             let change_log_total = db.change_log_total()?;
+            let db_filename = cfg
+                .db_path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "".into());
 
             if args.json {
-                let peers_json = peers
-                    .into_iter()
-                    .map(|p| {
-                        json!({
-                            "id": p.id,
-                            "pc_name": p.pc_name,
-                            "instance_id": p.instance_id,
-                            "last_ip": p.last_ip,
-                            "last_port": p.last_port,
-                            "last_tls_port": p.last_tls_port,
-                            "last_plain_port": p.last_plain_port,
-                            "last_seen": p.last_seen,
-                            "state": p.state,
-                            "prefer_tls": p.prefer_tls,
-                            "last_insecure_seen": p.last_insecure_seen,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let shares_json = shares
-                    .into_iter()
-                    .map(|s| {
-                        json!({
-                            "id": s.id,
-                            "share_name": s.share_name,
-                            "pc_name": s.pc_name,
-                            "root_path": s.root_path,
-                            "recursive": s.recursive,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let progress_json = progress
-                    .into_iter()
-                    .map(|r| {
-                        json!({
-                            "peer_id": r.peer_id,
-                            "peer_pc_name": r.peer_pc_name,
-                            "peer_instance_id": r.peer_instance_id,
-                            "share_row_id": r.share_row_id,
-                            "share_name": r.share_name,
-                            "share_pc_name": r.share_pc_name,
-                            "last_seq_sent": r.last_seq_sent,
-                            "last_seq_acked": r.last_seq_acked,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "db_path": cfg.db_path.to_string_lossy(),
-                        "metrics": {
-                            "outbound_queue_depth": queue_depth,
-                            "outbound_queue_due_now": queue_due,
-                            "change_log_total": change_log_total,
+                let db_json = || -> serde_json::Value {
+                    json!({
+                        "path": cfg.db_path.to_string_lossy(),
+                        "filename": db_filename.clone(),
+                        "table_counts": {
+                            "peers": peer_count,
+                            "shares": share_count,
+                            "peer_progress": progress_count,
                         },
-                        "peers": peers_json,
-                        "shares": shares_json,
-                        "peer_progress": progress_json,
-                    }))?
-                );
+                    })
+                };
+                let peers_json = || -> Vec<serde_json::Value> {
+                    peers
+                        .iter()
+                        .map(|p| {
+                            json!({
+                                "id": p.id,
+                                "pc_name": p.pc_name,
+                                "instance_id": p.instance_id,
+                                "last_ip": p.last_ip,
+                                "last_port": p.last_port,
+                                "last_tls_port": p.last_tls_port,
+                                "last_plain_port": p.last_plain_port,
+                                "last_seen": p.last_seen,
+                                "state": p.state,
+                                "prefer_tls": p.prefer_tls,
+                                "last_insecure_seen": p.last_insecure_seen,
+                            })
+                        })
+                        .collect()
+                };
+                let shares_json = || -> Vec<serde_json::Value> {
+                    shares
+                        .iter()
+                        .map(|s| {
+                            json!({
+                                "id": s.id,
+                                "share_name": s.share_name,
+                                "pc_name": s.pc_name,
+                                "root_path": s.root_path,
+                                "recursive": s.recursive,
+                            })
+                        })
+                        .collect()
+                };
+                let progress_json = || -> Vec<serde_json::Value> {
+                    progress
+                        .iter()
+                        .map(|r| {
+                            json!({
+                                "peer_id": r.peer_id,
+                                "peer_pc_name": r.peer_pc_name,
+                                "peer_instance_id": r.peer_instance_id,
+                                "share_row_id": r.share_row_id,
+                                "share_name": r.share_name,
+                                "share_pc_name": r.share_pc_name,
+                                "last_seq_sent": r.last_seq_sent,
+                                "last_seq_acked": r.last_seq_acked,
+                            })
+                        })
+                        .collect()
+                };
+                match args.section {
+                    None => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "db": db_json(),
+                                "metrics": {
+                                    "outbound_queue_depth": queue_depth,
+                                    "outbound_queue_due_now": queue_due,
+                                    "change_log_total": change_log_total,
+                                },
+                                "peers": peers_json(),
+                                "shares": shares_json(),
+                                "peer_progress": progress_json(),
+                            }))?
+                        );
+                    }
+                    Some(StatusSection::Db) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({ "db": db_json() }))?
+                        );
+                    }
+                    Some(StatusSection::Queue) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "queue": {
+                                    "outbound_queue_depth": queue_depth,
+                                    "outbound_queue_due_now": queue_due,
+                                },
+                            }))?
+                        );
+                    }
+                    Some(StatusSection::Metrics) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "metrics": {
+                                    "change_log_total": change_log_total,
+                                },
+                            }))?
+                        );
+                    }
+                    Some(StatusSection::Peers) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({ "peers": peers_json() }))?
+                        );
+                    }
+                    Some(StatusSection::Shares) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({ "shares": shares_json() }))?
+                        );
+                    }
+                    Some(StatusSection::PeerProgress) => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({ "peer_progress": progress_json() }))?
+                        );
+                    }
+                }
                 return Ok(());
             }
 
-            println!("DB: {}", cfg.db_path.display());
-            println!("Queue: depth={} due_now={}", queue_depth, queue_due);
-            println!("Metrics: change_log_total={}", change_log_total);
-            println!();
-            println!("Peers ({}):", peers.len());
-            for p in peers {
-                println!(
-                    "  #{:<3} {}@{} ip={} tls_port={} plain_port={} last_seen={} state={} prefer_tls={} last_insecure_seen={}",
-                    p.id,
-                    p.pc_name,
-                    p.instance_id,
-                    p.last_ip,
-                    p.last_tls_port,
-                    p.last_plain_port,
-                    p.last_seen,
-                    p.state,
-                    p.prefer_tls,
-                    p.last_insecure_seen
-                );
-            }
-            println!();
-            println!("Shares ({}):", shares.len());
-            for s in shares {
-                println!(
-                    "  #{:<3} {}@{} root={} recursive={}",
-                    s.id, s.share_name, s.pc_name, s.root_path, s.recursive
-                );
-            }
-            println!();
-            println!("Peer progress ({}):", progress.len());
-            for r in progress {
-                println!(
-                    "  peer #{:<3} {}@{} -> share #{:<3} {}@{} sent={} acked={}",
-                    r.peer_id,
-                    r.peer_pc_name,
-                    r.peer_instance_id,
-                    r.share_row_id,
-                    r.share_name,
-                    r.share_pc_name,
-                    r.last_seq_sent,
-                    r.last_seq_acked
-                );
+            let default_sections = [
+                StatusSection::Db,
+                StatusSection::Queue,
+                StatusSection::Metrics,
+                StatusSection::Peers,
+                StatusSection::Shares,
+                StatusSection::PeerProgress,
+            ];
+            let sections: Vec<StatusSection> = match args.section {
+                Some(section) => vec![section],
+                None => default_sections.to_vec(),
+            };
+
+            let mut first_section = true;
+            for section in sections {
+                if !first_section {
+                    println!();
+                }
+                first_section = false;
+
+                match section {
+                    StatusSection::Db => {
+                        println!("DB status:");
+                        let mut db_table = Table::new();
+                        db_table.load_preset(ASCII_FULL_CONDENSED);
+                        db_table.set_header(vec!["db_path", "filename"]);
+                        db_table.add_row(vec![cfg.db_path.display().to_string(), db_filename.clone()]);
+                        println!("{db_table}");
+
+                        let mut count_table = Table::new();
+                        count_table.load_preset(ASCII_FULL_CONDENSED);
+                        count_table.set_header(vec!["table", "rowcount"]);
+                        count_table.add_row(vec![
+                            "peers".to_string(),
+                            peer_count.to_string(),
+                        ]);
+                        count_table.add_row(vec![
+                            "shares".to_string(),
+                            share_count.to_string(),
+                        ]);
+                        count_table.add_row(vec![
+                            "peer_progress".to_string(),
+                            progress_count.to_string(),
+                        ]);
+                        println!("{count_table}");
+                    }
+                    StatusSection::Queue => {
+                        println!("Queue status:");
+                        let mut queue_table = Table::new();
+                        queue_table.load_preset(ASCII_FULL_CONDENSED);
+                        queue_table.set_header(vec!["depth", "due_now"]);
+                        queue_table.add_row(vec![queue_depth.to_string(), queue_due.to_string()]);
+                        println!("{queue_table}");
+                    }
+                    StatusSection::Metrics => {
+                        println!("Metrics status:");
+                        let mut metrics_table = Table::new();
+                        metrics_table.load_preset(ASCII_FULL_CONDENSED);
+                        metrics_table.set_header(vec!["change_log_total"]);
+                        metrics_table.add_row(vec![change_log_total.to_string()]);
+                        println!("{metrics_table}");
+                    }
+                    StatusSection::Peers => {
+                        println!("Peers ({}):", peers.len());
+                        if peers.is_empty() {
+                            println!("  (none)");
+                        } else {
+                            let mut peer_table = Table::new();
+                            peer_table.load_preset(ASCII_FULL_CONDENSED);
+                            peer_table.set_header(vec![
+                                "id",
+                                "peer",
+                                "ip",
+                                "tls_port",
+                                "plain_port",
+                                "last_seen",
+                                "state",
+                                "prefer_tls",
+                                "last_insecure_seen",
+                            ]);
+                            for p in &peers {
+                                peer_table.add_row(vec![
+                                    p.id.to_string(),
+                                    format!("{}@{}", p.pc_name, p.instance_id),
+                                    p.last_ip.clone(),
+                                    p.last_tls_port.to_string(),
+                                    p.last_plain_port.to_string(),
+                                    p.last_seen.to_string(),
+                                    p.state.clone(),
+                                    p.prefer_tls.to_string(),
+                                    p.last_insecure_seen.to_string(),
+                                ]);
+                            }
+                            println!("{peer_table}");
+                        }
+                    }
+                    StatusSection::Shares => {
+                        println!("Shares ({}):", shares.len());
+                        if shares.is_empty() {
+                            println!("  (none)");
+                        } else {
+                            let mut share_table = Table::new();
+                            share_table.load_preset(ASCII_FULL_CONDENSED);
+                            share_table.set_header(vec!["id", "share", "root_path", "recursive"]);
+                            for s in &shares {
+                                share_table.add_row(vec![
+                                    s.id.to_string(),
+                                    format!("{}@{}", s.share_name, s.pc_name),
+                                    s.root_path.clone(),
+                                    s.recursive.to_string(),
+                                ]);
+                            }
+                            println!("{share_table}");
+                        }
+                    }
+                    StatusSection::PeerProgress => {
+                        println!("Peer progress ({}):", progress.len());
+                        if progress.is_empty() {
+                            println!("  (none)");
+                        } else {
+                            let mut progress_table = Table::new();
+                            progress_table.load_preset(ASCII_FULL_CONDENSED);
+                            progress_table.set_header(vec![
+                                "peer_id",
+                                "peer",
+                                "share_id",
+                                "share",
+                                "last_seq_sent",
+                                "last_seq_acked",
+                            ]);
+                            for r in &progress {
+                                progress_table.add_row(vec![
+                                    r.peer_id.to_string(),
+                                    format!("{}@{}", r.peer_pc_name, r.peer_instance_id),
+                                    r.share_row_id.to_string(),
+                                    format!("{}@{}", r.share_name, r.share_pc_name),
+                                    r.last_seq_sent.to_string(),
+                                    r.last_seq_acked.to_string(),
+                                ]);
+                            }
+                            println!("{progress_table}");
+                        }
+                    }
+                }
             }
             Ok(())
         }

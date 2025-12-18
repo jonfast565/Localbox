@@ -22,7 +22,7 @@ const DEFAULT_REMOTE_SHARE_ROOT: &str = "remote-shares";
 pub const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
 #[derive(Debug, Parser)]
-#[command(name = "localbox", about = "LocalBox core engine")]
+#[command(name = "localbox", about = "LocalBox Core Engine", version = env!("CARGO_PKG_VERSION"))]
 pub struct Cli {
     /// Path to a TOML config file (defaults to ./config.toml if it exists)
     #[arg(long, global = true, value_name = "PATH")]

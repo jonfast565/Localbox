@@ -1,0 +1,25 @@
+[package]
+name = "localbox-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["jfast"]
+
+[dependencies]
+models = { package = "localbox-models", path = "../localbox-models" }
+db = { package = "localbox-db", path = "../localbox-db" }
+peering = { package = "localbox-peering", path = "../localbox-peering" }
+utilities = { package = "localbox-utilities", path = "../localbox-utilities" }
+tls = { package = "localbox-tls", path = "../localbox-tls" }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+hostname = "0.4"
+time = "0.3"
+notify = "6"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+comfy-table = "7"

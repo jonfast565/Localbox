@@ -25,23 +25,23 @@ Localbox is a peer-to-peer file replication engine for small networks. Each node
 
 2. **Generate a starter config:**
    ```bash
-   cargo run -p localbox -- init --force
+   cargo run -p localbox-core -- init --force
    # edit config.toml to add your shares, ports, TLS paths, etc.
    ```
 
 3. **Ensure TLS materials exist (per node):**
    ```bash
-   cargo run -p localbox -- tls ensure
-   cargo run -p localbox -- tls fingerprint    # inspect fingerprints for pinning
+   cargo run -p localbox-core -- tls ensure
+   cargo run -p localbox-core -- tls fingerprint    # inspect fingerprints for pinning
    ```
 
 4. **Bootstrap peers with signed invites (optional but recommended):**
    ```bash
    # On node A
-   cargo run -p localbox -- bootstrap invite --peer workstation-b --out invites/workstation-b.json
+   cargo run -p localbox-core -- bootstrap invite --peer workstation-b --out invites/workstation-b.json
 
    # On node B
-   cargo run -p localbox -- bootstrap join \
+   cargo run -p localbox-core -- bootstrap join \
      --incoming invites/workstation-b.json \
      --peer workstation-a \
      --out invites/workstation-a.json
@@ -51,7 +51,7 @@ Localbox is a peer-to-peer file replication engine for small networks. Each node
 5. **Run two nodes (example on one host):**
    ```bash
    # Terminal 1
-   cargo run -p localbox -- \
+   cargo run -p localbox-core -- run \
      --instance-id node-a \
      --listen-port 5000 \
      --plain-listen-port 5002 \
@@ -62,7 +62,7 @@ Localbox is a peer-to-peer file replication engine for small networks. Each node
      --share docs=/tmp/docs-a,recursive=true
 
    # Terminal 2
-   cargo run -p localbox -- \
+   cargo run -p localbox-core -- run \
      --instance-id node-b \
      --listen-port 6000 \
      --plain-listen-port 6002 \
@@ -75,8 +75,8 @@ Localbox is a peer-to-peer file replication engine for small networks. Each node
 
 6. **Monitor / inspect:**
    ```bash
-   cargo run -p localbox -- monitor --queue-threshold 50 --stale-peer-seconds 120
-   cargo run -p localbox -- status --json
+   cargo run -p localbox-core -- monitor --queue-threshold 50 --stale-peer-seconds 120
+   cargo run -p localbox-core -- status --json
    ```
 
 ## Sync & Peering Semantics
@@ -87,6 +87,17 @@ Localbox is a peer-to-peer file replication engine for small networks. Each node
 - **Deletes:** Deletions drop pending buffers, remove any on-disk file (best effort), and persist a tombstone.
 - **Durability:** All metadata lives in SQLite (`sync.db`). Remote writes use atomic rename + directory fsync to avoid torn files.
 - **Discovery:** Nodes broadcast `DISCOVER` and respond with `HERE` messages, forming outbound connections based on TLS preference. Plaintext is supported for legacy testing but flagged and recorded in the DB.
+
+## Application States
+
+Set `app_state` in `config.toml` (or `--app-state` on the CLI) to control what a node is allowed to do:
+
+- `mirror_only` – Hosts remote shares only. No local shares are advertised or watched, so the node only mirrors peers.
+- `host_only` – Watches and shares local folders with others but refuses to host remote shares.
+- `mirrorhost` – Default dual-role behavior: watch local shares *and* host remote shares.
+- `zombie` – Neither shares nor hosts. Useful for plumbing/tests when you just need the process up but idle.
+
+Nodes advertise their capability to peers so that hosts don't waste time pushing shares to mirror-disabled or zombie nodes.
 
 ## Monitoring & Operations
 
@@ -106,13 +117,13 @@ Localbox is a peer-to-peer file replication engine for small networks. Each node
 
 ## Repository Layout
 
-- `core/` – `localbox` binary (CLI + engine).
-- `db/` – SQLite access layer and persistence helpers.
-- `models/` – Shared structs/enums for config, wire models, and change logs.
-- `peering/` – Discovery, TLS/plain connections, batching, and file chunk streaming.
-- `protocol/` – Protobuf schema + helpers for framing messages and chunks.
-- `tls/` – TLS runtime management, invite workflow, trust-store utilities.
-- `utilities/` – Filesystem/network abstractions, hashing, logging.
+- `core/` – `localbox-core` package (CLI + engine, binary `localbox`).
+- `db/` – `localbox-db` (SQLite access layer and persistence helpers).
+- `models/` – `localbox-models` (config/wire/change-log structs).
+- `peering/` – `localbox-peering` (discovery, TLS/plain connections, batching, chunk streaming).
+- `protocol/` – `localbox-protocol` (Protobuf schema + framing helpers).
+- `tls/` – `localbox-tls` (runtime TLS, invite workflow, trust-store utilities).
+- `utilities/` – `localbox-utilities` (filesystem/network abstractions, hashing, logging).
 
 ## Development & Testing
 

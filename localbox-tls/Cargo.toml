@@ -1,0 +1,26 @@
+[package]
+name = "localbox-tls"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+models = { package = "localbox-models", path = "../localbox-models" }
+utilities = { package = "localbox-utilities", path = "../localbox-utilities" }
+tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
+tokio-rustls = "0.24"
+tokio-util = { version = "0.7", features = ["rt"] }
+rustls = "0.21"
+rustls-pemfile = "1"
+rustls-webpki = "0.101"
+rcgen = "0.12"
+sha2 = "0.10"
+tracing = "0.1"
+base64 = "0.21"
+rand = "0.8"
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+untrusted = "0.9"
+toml = "0.8"

@@ -1,12 +1,12 @@
 [workspace]
 members = [
-    "models",
-    "db",
-    "peering",
-    "utilities",
-    "core",
-    "protocol",
-    "tls"
+    "localbox-models",
+    "localbox-db",
+    "localbox-peering",
+    "localbox-utilities",
+    "localbox-core",
+    "localbox-protocol",
+    "localbox-tls"
 ]
 
 resolver = "2"

@@ -1,6 +1,6 @@
 use crate::engine::log_banner;
 use anyhow::{anyhow, Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use models::{AppConfig, ApplicationState, ShareConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -466,10 +466,12 @@ impl Cli {
                 Some(p) => format!("or add shares to {}", p.display()),
                 None => format!("or create {} with `localbox init`", DEFAULT_CONFIG_PATH),
             };
-            return Err(anyhow!(
+            let message = format!(
                 "no shares configured; pass `--share NAME=PATH[,recursive=true|false]` {}",
                 config_hint
-            ));
+            );
+            let clap_error = Cli::command().error(ErrorKind::ValueValidation, message);
+            return Err(clap_error.into());
         }
 
         Ok(AppConfig {
@@ -945,8 +947,13 @@ mod tests {
         std::fs::write(&path, "\n").unwrap();
 
         let path_str = path.to_string_lossy().to_string();
-        let cli = Cli::try_parse_from(["localbox".to_string(), "--config".to_string(), path_str])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "localbox".to_string(),
+            "run".to_string(),
+            "--config".to_string(),
+            path_str,
+        ])
+        .unwrap();
         let err = cli.resolve_app_config().unwrap_err().to_string();
         assert!(err.contains("no shares configured"));
         assert!(err.contains("--share"));
@@ -961,6 +968,7 @@ mod tests {
         let path_str = path.to_string_lossy().to_string();
         let cli = Cli::try_parse_from([
             "localbox".to_string(),
+            "run".to_string(),
             "--config".to_string(),
             path_str.clone(),
             "--app-state".to_string(),

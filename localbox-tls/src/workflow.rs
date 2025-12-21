@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use utilities::copy_file_atomic;
+use utilities::{copy_file_atomic, write_file_atomic};
 
 const PEM_BEGIN: &str = "-----BEGIN CERTIFICATE-----";
 const PEM_END: &str = "-----END CERTIFICATE-----";
@@ -51,16 +51,7 @@ pub fn export_ca_from_chain_pem(cert_chain_path: &Path, out_path: &Path) -> Resu
     let ca_block = blocks
         .last()
         .ok_or_else(|| anyhow!("missing CA certificate in chain"))?;
-    if let Some(parent) = out_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-    }
-    if out_path.exists() {
-        let _ = fs::remove_file(out_path);
-    }
-    fs::write(out_path, format!("{ca_block}\n"))
+    write_file_atomic(out_path, format!("{ca_block}\n").as_bytes())
         .with_context(|| format!("failed to write {}", out_path.display()))?;
     Ok(())
 }
@@ -118,10 +109,7 @@ pub fn import_ca_into_trust_store(trust_store_path: &Path, input_pem_path: &Path
         }
     }
     existing_text.push_str(&to_append);
-    if trust_store_path.exists() {
-        let _ = fs::remove_file(trust_store_path);
-    }
-    fs::write(trust_store_path, existing_text)
+    write_file_atomic(trust_store_path, existing_text.as_bytes())
         .with_context(|| format!("failed to write {}", trust_store_path.display()))?;
     Ok(appended)
 }

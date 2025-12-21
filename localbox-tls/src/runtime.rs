@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use utilities::FileSystem;
+use utilities::{write_atomic, FileSystem};
 
 use std::io::BufReader;
 use std::sync::{Arc, Mutex};
@@ -206,8 +206,8 @@ pub fn persist_tls_materials(
         fs.create_dir_all(parent)?;
     }
 
-    fs.write(&cfg.tls_cert_path, generated.cert_chain_pem.as_bytes())?;
-    fs.write(&cfg.tls_key_path, generated.key_pem.as_bytes())?;
+    write_atomic(fs, &cfg.tls_cert_path, generated.cert_chain_pem.as_bytes())?;
+    write_atomic(fs, &cfg.tls_key_path, generated.key_pem.as_bytes())?;
 
     // Preserve any existing trust store and append our CA if it's not present.
     let mut existing = String::new();
@@ -215,7 +215,7 @@ pub fn persist_tls_materials(
         existing = String::from_utf8_lossy(&bytes).to_string();
     }
     let merged = merge_ca_bundle(&existing, &generated.ca_pem);
-    fs.write(&cfg.tls_ca_cert_path, merged.as_bytes())?;
+    write_atomic(fs, &cfg.tls_ca_cert_path, merged.as_bytes())?;
     info!(
         "Generated new TLS materials at {}, {}, {}",
         cfg.tls_cert_path.display(),

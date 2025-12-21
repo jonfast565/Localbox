@@ -1,3 +1,4 @@
+use localbox_models as models;
 use models::{
     AppConfig, ApplicationState, BatchAck, HelloMessage, ShareConfig, ShareId, WireMessage,
 };

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use localbox_utilities as utilities;
 use utilities::{Net, VirtualNet};
 
 #[tokio::test]

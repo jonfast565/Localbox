@@ -169,6 +169,9 @@ pub fn write_file_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
         .open(&tmp)?;
     file.write_all(data)?;
     file.sync_all()?;
+    if path.exists() {
+        let _ = fs::remove_file(path);
+    }
     fs::rename(&tmp, path)?;
     sync_directory(parent)?;
     Ok(())

@@ -374,7 +374,11 @@ impl Cli {
     ) -> Result<AppConfig> {
         let file_cfg = load_optional_file_config(self.config.as_deref())?;
         let default_run = RunArgs::default();
-        let run = overrides.unwrap_or(&default_run);
+        let cli_run = match &self.command {
+            Command::Run(r) => Some(r),
+            _ => None,
+        };
+        let run = overrides.or(cli_run).unwrap_or(&default_run);
 
         let pc_name = hostname::get()
             .unwrap_or_else(|_| "unknown-pc".into())
@@ -452,6 +456,7 @@ impl Cli {
             .map(ApplicationState::from)
             .or_else(|| file_cfg.as_ref().and_then(|c| c.app_state))
             .unwrap_or_default();
+        let must_require_shares = require_shares && app_state.can_share();
 
         let tls_pinned_ca_fingerprints = file_cfg
             .as_ref()
@@ -470,7 +475,7 @@ impl Cli {
             run.shares.clone(),
         )?;
 
-        if require_shares && shares.is_empty() && app_state.can_share() {
+        if must_require_shares && shares.is_empty() {
             let config_hint = match &self.config {
                 Some(p) => format!("or add shares to {}", p.display()),
                 None => format!("or create {} with `localbox init`", DEFAULT_CONFIG_PATH),

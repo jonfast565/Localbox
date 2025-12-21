@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
+use localbox_db as db;
 use db::Db;
 use models::{
     AppConfig, ApplicationState, BatchManifest, ChangeKind, FileChange, FileMeta, ShareConfig,

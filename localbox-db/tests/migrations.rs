@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use localbox_db as db;
 use db::Db;
 use rusqlite::Connection;
 use uuid::Uuid;

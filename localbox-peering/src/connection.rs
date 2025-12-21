@@ -435,7 +435,12 @@ async fn handle_batch_message(
 
             change.meta = resolve_change_meta(&change, existing.clone());
             if let Some(meta) = &change.meta {
-                let _ = db.lock().await.upsert_file_meta(share_row_id, meta);
+                let mut meta = meta.clone();
+                if meta.version <= 0 || change.seq > meta.version {
+                    meta.version = change.seq.max(1);
+                }
+                let _ = db.lock().await.upsert_file_meta(share_row_id, &meta);
+                change.meta = Some(meta);
             }
             let expected_hash = change.meta.as_ref().map(|m| m.hash);
 

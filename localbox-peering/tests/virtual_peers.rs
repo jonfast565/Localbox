@@ -8,6 +8,7 @@ use db::Db;
 use models::{
     AppConfig, ApplicationState, ChangeKind, FileChange, FileMeta, ShareConfig, ShareContext,
 };
+use localbox_peering as peering;
 use peering::PeerManager;
 use rcgen;
 use sha2::{Digest, Sha256};

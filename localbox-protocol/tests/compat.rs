@@ -1,4 +1,5 @@
 use models::{BatchAck, BatchManifest, HelloMessage, ShareId, WireMessage};
+use localbox_protocol as protocol;
 use protocol::{parse_batch_manifest, parse_wire_message};
 
 #[test]

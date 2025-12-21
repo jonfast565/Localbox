@@ -1,6 +1,5 @@
-use models::{
-    BatchAck, BatchManifest, ChangeKind, FileChange, FileMeta, HelloMessage, ShareId, WireMessage,
-};
+use models::{BatchAck, BatchManifest, ChangeKind, FileChange, FileMeta, HelloMessage, ShareId, WireMessage};
+use localbox_protocol as protocol;
 use protocol::{
     decode_file_chunk_proto, decode_wire_message_proto, encode_file_chunk_proto,
     encode_wire_message_proto, parse_batch_manifest, parse_discovery_message, parse_wire_message,

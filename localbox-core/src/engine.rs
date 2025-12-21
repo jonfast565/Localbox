@@ -235,17 +235,20 @@ async fn persist_incoming_change(
     db: &Arc<Mutex<Db>>,
     mut change: FileChange,
 ) -> Option<FileChange> {
-    let share_row_id = db
-        .lock()
-        .await
+    let db_guard = db.lock().await;
+    let share_row_id = db_guard
         .get_share_row_id_by_share_id(&change.share_id)
         .ok()?;
     let created_at = OffsetDateTime::now_utc().unix_timestamp();
+    let seq = if change.seq > 0 {
+        change.seq
+    } else {
+        db_guard.next_change_seq(share_row_id).ok()?
+    };
+    change.seq = seq;
 
     if change.kind == ChangeKind::Delete && change.meta.is_none() {
-        let existing = db
-            .lock()
-            .await
+        let existing = db_guard
             .get_file_meta(share_row_id, &change.path)
             .ok()
             .flatten();
@@ -257,26 +260,20 @@ async fn persist_incoming_change(
             version: 1,
             deleted: true,
         });
+        deleted_meta.version = seq;
         deleted_meta.deleted = true;
-        if let Err(e) = db
-            .lock()
-            .await
-            .upsert_file_meta(share_row_id, &deleted_meta)
-        {
+        if let Err(e) = db_guard.upsert_file_meta(share_row_id, &deleted_meta) {
             error!("DB upsert_file_meta (delete) error: {e}");
         }
         change.meta = Some(deleted_meta);
-    } else if let Some(meta) = &change.meta {
-        if let Err(e) = db.lock().await.upsert_file_meta(share_row_id, meta) {
+    } else if let Some(meta) = &mut change.meta {
+        meta.version = seq;
+        if let Err(e) = db_guard.upsert_file_meta(share_row_id, meta) {
             error!("DB upsert_file_meta error: {e}");
         }
     }
 
-    let Ok(seq) = db
-        .lock()
-        .await
-        .append_change_log(share_row_id, &change, created_at)
-    else {
+    let Ok(seq) = db_guard.append_change_log(share_row_id, &change, created_at) else {
         error!("Failed to append change log for {}", change.path);
         return None;
     };
@@ -943,12 +940,15 @@ fn seed_change_log_from_index(
     let last_applied = db.get_last_applied_seq(share_row_id)?;
     for meta in share.index.values() {
         let mut meta = meta.clone();
+        let seq = db.next_change_seq(share_row_id)?;
+        meta.version = seq;
         let full_path = share.root_path.join(&meta.path);
         if is_in_workdir(workdir, &full_path) {
             continue;
         }
+        let meta_for_change = meta.clone();
         let change = FileChange {
-            seq: 0,
+            seq,
             share_id: share.share_id,
             path: meta.path.clone(),
             kind: if meta.deleted {
@@ -957,8 +957,9 @@ fn seed_change_log_from_index(
             } else {
                 ChangeKind::Modify
             },
-            meta: Some(meta),
+            meta: Some(meta_for_change),
         };
+        let _ = db.upsert_file_meta(share_row_id, &meta);
         if last_applied == 0 {
             let _ = db.append_change_log(share_row_id, &change, now)?;
         } else {
@@ -1002,16 +1003,17 @@ fn seed_change_log_from_index(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(now);
             let hash = compute_file_hash(fs.as_ref(), &entry_path).unwrap_or_else(|_| [0u8; 32]);
+            let seq = db.next_change_seq(share_row_id)?;
             let meta = FileMeta {
                 path: rel_path.clone(),
                 size,
                 mtime,
                 hash,
-                version: 1,
+                version: seq,
                 deleted: false,
             };
             let change = FileChange {
-                seq: 0,
+                seq,
                 share_id: share.share_id,
                 path: rel_path.clone(),
                 kind: ChangeKind::Modify,

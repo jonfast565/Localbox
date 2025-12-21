@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use localbox_utilities as utilities;
 use utilities::{FileSystem, VirtualFileSystem};
 
 #[test]

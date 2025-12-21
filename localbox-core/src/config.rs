@@ -931,7 +931,7 @@ mod tests {
     use models::{AppConfig, ApplicationState};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use uuid::Uuid;
+    use utilities::test_temp_path;
 
     #[test]
     fn parse_share_arg_basic_and_recursive() {
@@ -957,7 +957,7 @@ mod tests {
 
     #[test]
     fn cli_requires_shares_when_no_config_exists() {
-        let path = std::env::temp_dir().join(format!("localbox-empty-{}.toml", Uuid::new_v4()));
+        let path = test_temp_path("localbox-empty").with_extension("toml");
         std::fs::write(&path, "\n").unwrap();
 
         let path_str = path.to_string_lossy().to_string();
@@ -977,7 +977,7 @@ mod tests {
 
     #[test]
     fn mirror_only_state_does_not_require_share_configs() {
-        let path = std::env::temp_dir().join(format!("localbox-mirror-{}.toml", Uuid::new_v4()));
+        let path = test_temp_path("localbox-mirror").with_extension("toml");
         std::fs::write(&path, "\n").unwrap();
         let path_str = path.to_string_lossy().to_string();
         let cli = Cli::try_parse_from([
@@ -1004,7 +1004,7 @@ mod tests {
 
     #[test]
     fn validate_app_config_checks_share_paths() {
-        let tmp_dir = std::env::temp_dir().join(format!("localbox-test-{}", Uuid::new_v4()));
+        let tmp_dir = test_temp_path("localbox-test");
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let cfg = AppConfig {
             pc_name: "pc".to_string(),

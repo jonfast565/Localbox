@@ -1,13 +1,11 @@
-use std::path::PathBuf;
-
 use localbox_db as db;
 use db::Db;
 use rusqlite::Connection;
-use uuid::Uuid;
+use utilities::test_temp_path;
 
 #[test]
 fn db_sets_user_version_and_is_backward_openable() {
-    let path: PathBuf = std::env::temp_dir().join(format!("localbox-mig-{}.db", Uuid::new_v4()));
+    let path = test_temp_path("localbox-mig").with_extension("db");
 
     // Simulate an "older" DB file: user_version=0 and only a subset of tables.
     {
@@ -40,7 +38,7 @@ fn db_sets_user_version_and_is_backward_openable() {
 
 #[test]
 fn db_migrates_http_port_column_to_plain_port() {
-    let path: PathBuf = std::env::temp_dir().join(format!("localbox-mig-{}.db", Uuid::new_v4()));
+    let path = test_temp_path("localbox-mig").with_extension("db");
     {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(

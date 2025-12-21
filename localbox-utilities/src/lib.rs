@@ -174,6 +174,21 @@ pub fn write_file_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Generate a unique, process-scoped path under the system temp directory for tests.
+pub fn test_temp_path(prefix: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("{prefix}-{pid}-{nonce}"))
+}
+
+/// Atomic write helper for text content.
+pub fn write_str_atomic(path: &Path, data: &str) -> io::Result<()> {
+    write_file_atomic(path, data.as_bytes())
+}
+
 pub fn copy_file_atomic(src: &Path, dst: &Path, overwrite: bool) -> io::Result<()> {
     if dst.exists() && !overwrite {
         return Err(io::Error::new(

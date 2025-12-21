@@ -1,9 +1,9 @@
 use std::fs;
-use uuid::Uuid;
+use utilities::{test_temp_path, write_str_atomic};
 
 #[test]
 fn export_ca_from_chain_and_import_dedupes() {
-    let tmp = std::env::temp_dir().join(format!("localbox-tls-{}", Uuid::new_v4()));
+    let tmp = test_temp_path("localbox-tls");
     fs::create_dir_all(&tmp).unwrap();
 
     let materials = tls::generate_tls_materials("pc-test").unwrap();
@@ -12,8 +12,8 @@ fn export_ca_from_chain_and_import_dedupes() {
     let trust_path = tmp.join("trust.pem");
     let exported_ca = tmp.join("ca-export.pem");
 
-    fs::write(&chain_path, &materials.cert_chain_pem).unwrap();
-    fs::write(&trust_path, "").unwrap();
+    write_str_atomic(&chain_path, &materials.cert_chain_pem).unwrap();
+    write_str_atomic(&trust_path, "").unwrap();
 
     tls::workflow::export_ca_from_chain_pem(&chain_path, &exported_ca).unwrap();
     let exported_text = fs::read_to_string(&exported_ca).unwrap();

@@ -697,11 +697,11 @@ name = "localbox-db"
 version = "0.1.0"
 dependencies = [
  "localbox-models",
+ "localbox-utilities",
  "rusqlite",
  "serde",
  "serde_json",
  "time",
- "uuid",
 ]
 
 [[package]]

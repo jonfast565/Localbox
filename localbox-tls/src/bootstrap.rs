@@ -245,36 +245,53 @@ mod tests {
     use models::{ApplicationState, ShareConfig};
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use tempfile::tempdir;
+    use tempfile::Builder;
+    fn workspace_tempdir() -> tempfile::TempDir {
+        Builder::new()
+            .prefix("localbox-tls-test")
+            .tempdir_in(".")
+            .expect("create workspace-scoped tempdir")
+    }
 
     #[test]
     fn invite_issue_and_accept_round_trip_updates_trust_and_config() {
-        let tmp = tempdir().unwrap();
+        let tmp = workspace_tempdir();
         let host_cfg = sample_config(tmp.path(), "pc-host");
         let join_cfg = sample_config(tmp.path(), "pc-join");
         let invite_path = tmp.path().join("invite.json");
         let join_config_path = tmp.path().join("join-config.toml");
 
-        issue_invite(&host_cfg, "pc-join", &invite_path, false).unwrap();
+        issue_invite(&host_cfg, "pc-join", &invite_path, false)
+            .expect("issue invite for round-trip test");
         assert!(invite_path.exists());
 
         // Basic sanity check on invite contents.
-        let raw_invite = std::fs::read(&invite_path).unwrap();
-        let signed: SignedInvite = serde_json::from_slice(&raw_invite).unwrap();
+        let raw_invite =
+            std::fs::read(&invite_path).expect("read invite file after issuing invite");
+        let signed: SignedInvite =
+            serde_json::from_slice(&raw_invite).expect("parse signed invite json");
         assert_eq!(signed.payload.peer_name, "pc-join");
         assert_eq!(signed.payload.issuer_pc_name, "pc-host");
         assert_eq!(signed.payload.share_names, vec!["docs".to_string()]);
 
-        let payload_bytes = serde_json::to_vec(&signed.payload).unwrap();
-        let signature = BASE64.decode(signed.signature.as_bytes()).unwrap();
+        let payload_bytes =
+            serde_json::to_vec(&signed.payload).expect("serialize invite payload for signature");
+        let signature = BASE64
+            .decode(signed.signature.as_bytes())
+            .expect("decode invite signature");
         let mut reader = std::io::BufReader::new(signed.payload.leaf_cert_pem.as_bytes());
-        let mut certs = rustls_pemfile::certs(&mut reader).unwrap();
+        let mut certs = rustls_pemfile::certs(&mut reader)
+            .map_err(|_| "parse leaf certs from invite")
+            .unwrap();
         assert!(!certs.is_empty(), "invite should contain a certificate");
         let leaf_der = certs.remove(0);
         let host_leaf = {
-            let bytes = std::fs::read(&host_cfg.tls_cert_path).unwrap();
+            let bytes = std::fs::read(&host_cfg.tls_cert_path)
+                .expect("read host TLS cert for fingerprint comparison");
             let mut r = std::io::BufReader::new(bytes.as_slice());
-            rustls_pemfile::certs(&mut r).unwrap().remove(0)
+            rustls_pemfile::certs(&mut r)
+                .expect("parse host TLS cert chain")
+                .remove(0)
         };
         assert_eq!(
             fingerprint_hex(&leaf_der),
@@ -288,38 +305,47 @@ mod tests {
             .expect("invite signature must verify");
 
         // Accept invite (creating config.toml with --force semantics).
-        let result = accept_invite(&join_cfg, &join_config_path, &invite_path, true).unwrap();
+        let result = accept_invite(&join_cfg, &join_config_path, &invite_path, true)
+            .expect("accept invite for join config");
         assert_eq!(result.peer_name, "pc-host");
         assert!(result.config_updated);
         assert!(result.ca_certs_added >= 1);
         assert!(!result.token.is_empty());
 
-        let config_contents = std::fs::read_to_string(&join_config_path).unwrap();
+        let config_contents =
+            std::fs::read_to_string(&join_config_path).expect("read generated join config");
         assert!(
             config_contents.contains(&result.fingerprint),
             "peer fingerprint must be written to config"
         );
 
         // Second acceptance should be a no-op for config/trust store.
-        let second = accept_invite(&join_cfg, &join_config_path, &invite_path, false).unwrap();
+        let second = accept_invite(&join_cfg, &join_config_path, &invite_path, false)
+            .expect("re-accept invite should succeed");
         assert_eq!(second.ca_certs_added, 0);
         assert!(!second.config_updated);
     }
 
     #[test]
     fn accept_invite_rejects_tampered_payload() {
-        let tmp = tempdir().unwrap();
+        let tmp = workspace_tempdir();
         let host_cfg = sample_config(tmp.path(), "pc-host");
         let join_cfg = sample_config(tmp.path(), "pc-join");
         let invite_path = tmp.path().join("invite.json");
         let join_config_path = tmp.path().join("join-config.toml");
 
-        issue_invite(&host_cfg, "pc-join", &invite_path, false).unwrap();
-        let raw = std::fs::read(&invite_path).unwrap();
-        let mut signed: SignedInvite = serde_json::from_slice(&raw).unwrap();
+        issue_invite(&host_cfg, "pc-join", &invite_path, false)
+            .expect("issue invite for tampering test");
+        let raw = std::fs::read(&invite_path).expect("read issued invite for tampering");
+        let mut signed: SignedInvite =
+            serde_json::from_slice(&raw).expect("parse invite json before tampering");
         signed.payload.peer_name = "pc-tampered".to_string();
         let tampered_path = tmp.path().join("invite-tampered.json");
-        std::fs::write(&tampered_path, serde_json::to_vec(&signed).unwrap()).unwrap();
+        std::fs::write(
+            &tampered_path,
+            serde_json::to_vec(&signed).expect("serialize tampered invite"),
+        )
+        .expect("write tampered invite to disk");
 
         let err = accept_invite(&join_cfg, &join_config_path, &tampered_path, true).unwrap_err();
         assert!(
@@ -330,15 +356,16 @@ mod tests {
 
     #[test]
     fn accept_invite_requires_existing_config_or_force() {
-        let tmp = tempdir().unwrap();
+        let tmp = workspace_tempdir();
         let host_cfg = sample_config(tmp.path(), "pc-host");
         let join_cfg = sample_config(tmp.path(), "pc-join");
         let invite_path = tmp.path().join("invite.json");
         let missing_config_path = tmp.path().join("missing-config.toml");
 
-        issue_invite(&host_cfg, "pc-join", &invite_path, false).unwrap();
-        let err =
-            accept_invite(&join_cfg, &missing_config_path, &invite_path, false).unwrap_err();
+        issue_invite(&host_cfg, "pc-join", &invite_path, false)
+            .expect("issue invite for missing-config test");
+        let err = accept_invite(&join_cfg, &missing_config_path, &invite_path, false)
+            .expect_err("accept_invite should fail when config is missing without --force");
         assert!(
             err.to_string().contains("does not exist"),
             "missing config should require --force"
@@ -347,15 +374,17 @@ mod tests {
 
     #[test]
     fn sign_payload_round_trip_matches_leaf_certificate() {
-        let tmp = tempdir().unwrap();
+        let tmp = workspace_tempdir();
         let cfg = sample_config(tmp.path(), "pc-roundtrip");
         let payload = b"payload-bytes";
-        let sig = sign_payload(&cfg.tls_key_path, payload).unwrap();
-        let cert_bytes = std::fs::read(&cfg.tls_cert_path).unwrap();
+        let sig =
+            sign_payload(&cfg.tls_key_path, payload).expect("sign payload with generated key");
+        let cert_bytes =
+            std::fs::read(&cfg.tls_cert_path).expect("read generated leaf certificate");
         let mut reader = std::io::BufReader::new(cert_bytes.as_slice());
-        let certs = rustls_pemfile::certs(&mut reader).unwrap();
+        let certs = rustls_pemfile::certs(&mut reader).expect("parse cert chain");
         assert!(!certs.is_empty(), "cert chain should not be empty");
-        let leaf = certs.into_iter().next().unwrap();
+        let leaf = certs.into_iter().next().expect("leaf cert present");
         let leaf_cert =
             EndEntityCert::try_from(leaf.as_slice()).expect("leaf certificate must parse");
         leaf_cert
@@ -371,8 +400,10 @@ mod tests {
         let ca_path = root.join(format!("{node}.ca.pem"));
         let share_root = root.join(format!("{node}-share"));
         let remote_root = root.join(format!("{node}-remote"));
-        std::fs::create_dir_all(&share_root).unwrap();
-        std::fs::create_dir_all(&remote_root).unwrap();
+        std::fs::create_dir_all(&share_root)
+            .expect("create share root for sample config");
+        std::fs::create_dir_all(&remote_root)
+            .expect("create remote root for sample config");
 
         let cfg = AppConfig {
             pc_name: node.to_string(),
@@ -400,8 +431,10 @@ mod tests {
             app_state: ApplicationState::MirrorHost,
         };
 
-        let materials = generate_tls_materials(node).unwrap();
-        persist_tls_materials(&cfg, &materials, &RealFileSystem::new()).unwrap();
+        let materials =
+            generate_tls_materials(node).expect("generate TLS materials for sample config");
+        persist_tls_materials(&cfg, &materials, &RealFileSystem::new())
+            .expect("persist TLS materials for sample config");
 
         cfg
     }

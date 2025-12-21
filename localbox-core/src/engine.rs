@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -45,6 +46,7 @@ pub struct Engine {
     change_rx: Option<mpsc::Receiver<FileChange>>,
     net_tx: mpsc::Sender<String>,
     net_rx: Option<mpsc::Receiver<String>>,
+    workdir: Option<PathBuf>,
 }
 
 impl Engine {
@@ -75,10 +77,11 @@ impl Engine {
         db_raw: Db,
     ) -> Result<Self> {
         init_logging(&cfg.log_path, fs.as_ref())?;
+        let workdir = std::env::current_dir().ok();
         let mut db_raw = db_raw;
         let shares = db_raw.load_shares(&cfg)?;
         for sc in &shares {
-            seed_change_log_from_index(&mut db_raw, sc, &fs)?;
+            seed_change_log_from_index(&mut db_raw, sc, &fs, workdir.as_deref())?;
         }
         let db = Arc::new(Mutex::new(db_raw));
         info!("Engine starting up");
@@ -104,6 +107,7 @@ impl Engine {
             change_rx: Some(change_rx),
             net_tx,
             net_rx: Some(net_rx),
+            workdir,
         };
         Ok(engine)
     }
@@ -141,7 +145,14 @@ impl Engine {
             let share = sc.clone();
             let tx = self.change_tx.clone();
             let fs = Arc::clone(&self.fs);
-            tokio::spawn(start_single_watcher(share, tx, fs, token.clone()));
+            let workdir = self.workdir.clone();
+            tokio::spawn(start_single_watcher(
+                share,
+                tx,
+                fs,
+                workdir,
+                token.clone(),
+            ));
         }
     }
 
@@ -417,7 +428,10 @@ fn format_share_label(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_share_label, group_pending_by_share, handle_rename_event, map_event_kind};
+    use super::{
+        format_share_label, group_pending_by_share, handle_path_event, handle_rename_event,
+        map_event_kind,
+    };
     use models::ShareContext;
     use models::{ChangeKind, FileChange, ShareId};
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
@@ -526,6 +540,7 @@ mod tests {
             &[root.join("old.txt"), root.join("new.txt")],
             &notify::event::RenameMode::Both,
             &tx,
+            None,
             1,
             0,
         );
@@ -537,6 +552,41 @@ mod tests {
         assert_eq!(second.kind, ChangeKind::Modify);
         assert_eq!(second.path, "new.txt");
         assert!(second.meta.is_some());
+    }
+
+    #[test]
+    fn ignores_paths_under_workdir() {
+        let fs: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+        let root = PathBuf::from("/share");
+        let workdir = root.join(".localbox");
+        fs.create_dir_all(&workdir).unwrap();
+        fs.write(&workdir.join("state.db"), b"data").unwrap();
+
+        let share = ShareContext {
+            id: 1,
+            share_name: "s".to_string(),
+            pc_name: "pc".to_string(),
+            share_id: ShareId::new("s", "pc"),
+            root_path: root.clone(),
+            recursive: true,
+            ignore_patterns: Vec::new(),
+            max_file_size_bytes: None,
+            index: HashMap::new(),
+        };
+
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_path_event(
+            &fs,
+            &share,
+            &EventKind::Create(CreateKind::File),
+            workdir.join("state.db"),
+            &tx,
+            Some(workdir.as_path()),
+            1,
+            0,
+        );
+
+        assert!(rx.try_recv().is_err());
     }
 }
 
@@ -558,6 +608,7 @@ fn watch_share_blocking(
     share: ShareContext,
     change_tx: mpsc::Sender<FileChange>,
     fs: Arc<dyn FileSystem>,
+    workdir: Option<PathBuf>,
     token: CancellationToken,
 ) {
     use std::sync::mpsc as std_mpsc;
@@ -622,6 +673,7 @@ fn watch_share_blocking(
             &share,
             &event,
             &change_tx,
+            workdir.as_deref(),
             RETRY_ATTEMPTS,
             RETRY_DELAY_MS,
         ) {
@@ -629,12 +681,16 @@ fn watch_share_blocking(
         }
 
         for path in event.paths {
+            if is_in_workdir(workdir.as_deref(), &path) {
+                continue;
+            }
             handle_path_event(
                 &fs,
                 &share,
                 &event.kind,
                 path,
                 &change_tx,
+                workdir.as_deref(),
                 RETRY_ATTEMPTS,
                 RETRY_DELAY_MS,
             );
@@ -711,10 +767,11 @@ async fn start_single_watcher(
     share: ShareContext,
     tx: mpsc::Sender<FileChange>,
     fs: Arc<dyn FileSystem>,
+    workdir: Option<PathBuf>,
     token: CancellationToken,
 ) {
     let _ = tokio::task::spawn_blocking(move || {
-        watch_share_blocking(share, tx, fs, token);
+        watch_share_blocking(share, tx, fs, workdir, token);
     })
     .await;
 }
@@ -745,11 +802,16 @@ async fn run_peering(
     }
 }
 
+fn is_in_workdir(workdir: Option<&Path>, path: &Path) -> bool {
+    workdir.map(|wd| path.starts_with(wd)).unwrap_or(false)
+}
+
 fn handle_rename_if_needed(
     fs: &Arc<dyn FileSystem>,
     share: &ShareContext,
     event: &notify::Event,
     change_tx: &mpsc::Sender<FileChange>,
+    workdir: Option<&Path>,
     attempts: usize,
     delay_ms: u64,
 ) -> bool {
@@ -764,6 +826,7 @@ fn handle_rename_if_needed(
                 &event.paths,
                 rename_mode,
                 change_tx,
+                workdir,
                 attempts,
                 delay_ms,
             );
@@ -779,9 +842,14 @@ fn handle_path_event(
     event_kind: &EventKind,
     path: std::path::PathBuf,
     change_tx: &mpsc::Sender<FileChange>,
+    workdir: Option<&Path>,
     attempts: usize,
     delay_ms: u64,
 ) {
+    if is_in_workdir(workdir, &path) {
+        return;
+    }
+
     let Some(change_kind) = map_event_kind(event_kind) else {
         return;
     };
@@ -866,6 +934,7 @@ fn seed_change_log_from_index(
     db: &mut db::Db,
     share: &ShareContext,
     fs: &Arc<dyn FileSystem>,
+    workdir: Option<&Path>,
 ) -> Result<()> {
     let share_row_id = share.id;
     let now = OffsetDateTime::now_utc().unix_timestamp();
@@ -874,6 +943,10 @@ fn seed_change_log_from_index(
     let last_applied = db.get_last_applied_seq(share_row_id)?;
     for meta in share.index.values() {
         let mut meta = meta.clone();
+        let full_path = share.root_path.join(&meta.path);
+        if is_in_workdir(workdir, &full_path) {
+            continue;
+        }
         let change = FileChange {
             seq: 0,
             share_id: share.share_id,
@@ -898,6 +971,9 @@ fn seed_change_log_from_index(
     if let Ok(fs_entries) = fs.read_dir(&share.root_path) {
         for entry in fs_entries {
             if !entry.metadata.is_file {
+                continue;
+            }
+            if is_in_workdir(workdir, &entry.path) {
                 continue;
             }
             let entry_path = entry.path;
@@ -954,9 +1030,13 @@ fn handle_rename_event(
     paths: &[std::path::PathBuf],
     rename_mode: &RenameMode,
     change_tx: &mpsc::Sender<FileChange>,
+    workdir: Option<&Path>,
     attempts: usize,
     delay_ms: u64,
 ) {
+    if paths.iter().any(|p| is_in_workdir(workdir, p)) {
+        return;
+    }
     let (from_opt, to_opt) = match rename_mode {
         RenameMode::Both => (paths.get(0), paths.get(1)),
         RenameMode::From => (paths.get(0), None),

@@ -29,6 +29,7 @@ struct InboundFileState {
     target_path: PathBuf,
     buffer: Vec<u8>,
     expected_offset: u64,
+    expected_hash: Option<[u8; 32]>,
 }
 
 pub struct PeerManager {
@@ -457,7 +458,7 @@ async fn read_file_async(fs: Arc<dyn FileSystem>, path: PathBuf) -> std::io::Res
         })
 }
 
-fn hash_bytes(data: &[u8]) -> [u8; 32] {
+pub(crate) fn hash_bytes(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
     let digest = hasher.finalize();

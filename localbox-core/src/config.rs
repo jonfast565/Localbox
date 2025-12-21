@@ -40,6 +40,8 @@ pub enum Command {
     Init(InitArgs),
     /// Validate merged configuration (config.toml + CLI overrides)
     Validate(ValidateArgs),
+    /// Re-hash files on disk and compare to the stored metadata
+    Audit(AuditArgs),
     /// Watch metrics and emit alerts
     Monitor(MonitorArgs),
     /// TLS trust store operations (CA import/export/fingerprints/rotation)
@@ -59,6 +61,13 @@ pub struct InitArgs {
 
 #[derive(Debug, Args)]
 pub struct ValidateArgs {}
+
+#[derive(Debug, Args)]
+pub struct AuditArgs {
+    /// Limit verification to a single share name
+    #[arg(long, value_name = "NAME")]
+    pub share: Option<String>,
+}
 
 #[derive(Debug, Args)]
 pub struct MonitorArgs {

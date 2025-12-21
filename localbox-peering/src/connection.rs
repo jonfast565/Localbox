@@ -20,7 +20,7 @@ use utilities::disk_utilities::build_remote_share_root;
 use utilities::{write_atomic, DynStream, FileSystem, Net};
 
 use crate::writer::{recv_framed_message, send_framed_message, PeerWriter};
-use crate::{DbHandle, InboundFileState, PendingFiles, SharedWriters};
+use crate::{hash_bytes, DbHandle, InboundFileState, PendingFiles, SharedWriters};
 use tls::{fingerprint_from_certificates, normalize_fingerprint};
 
 pub async fn handle_tls_connection(
@@ -437,6 +437,7 @@ async fn handle_batch_message(
             if let Some(meta) = &change.meta {
                 let _ = db.lock().await.upsert_file_meta(share_row_id, meta);
             }
+            let expected_hash = change.meta.as_ref().map(|m| m.hash);
 
             match change.kind {
                 ChangeKind::Delete => {
@@ -445,14 +446,15 @@ async fn handle_batch_message(
                 }
                 _ => {
                     prepare_pending_file(
-                        pending_files,
-                        change.share_id,
-                        &change.path,
-                        &share_root,
-                        fs.as_ref(),
-                    )
-                    .await;
-                }
+                    pending_files,
+                    change.share_id,
+                    &change.path,
+                    &share_root,
+                    fs.as_ref(),
+                    expected_hash,
+                )
+                .await;
+            }
             }
 
             if let Some(seq) =
@@ -477,6 +479,7 @@ async fn prepare_pending_file(
     rel_path: &str,
     share_root: &Path,
     fs: &dyn FileSystem,
+    expected_hash: Option<[u8; 32]>,
 ) {
     let target = share_root.join(rel_path);
     if let Some(parent) = target.parent() {
@@ -496,6 +499,7 @@ async fn prepare_pending_file(
             target_path: target,
             buffer: Vec::new(),
             expected_offset: 0,
+            expected_hash,
         },
     );
 }
@@ -524,7 +528,7 @@ async fn handle_file_chunk_message(
     fs: Arc<dyn FileSystem>,
 ) {
     let key = (chunk.share_id, chunk.path.clone());
-    let mut completed: Option<(PathBuf, Vec<u8>)> = None;
+    let mut completed: Option<(PathBuf, Vec<u8>, Option<[u8; 32]>)> = None;
     {
         let mut guard = pending_files.lock().await;
         if let Some(state) = guard.get_mut(&key) {
@@ -547,8 +551,9 @@ async fn handle_file_chunk_message(
             if chunk.eof {
                 let target = state.target_path.clone();
                 let data = mem::take(&mut state.buffer);
+                let expected_hash = state.expected_hash;
                 guard.remove(&key);
-                completed = Some((target, data));
+                completed = Some((target, data, expected_hash));
             }
         } else {
             warn!(
@@ -559,7 +564,21 @@ async fn handle_file_chunk_message(
         }
     }
 
-    if let Some((target, data)) = completed {
+    if let Some((target, data, expected_hash)) = completed {
+        let incoming_hash = hash_bytes(&data);
+        if let Some(expected) = expected_hash {
+            if incoming_hash != expected {
+                error!(
+                    path = %target.display(),
+                    share_id = ?chunk.share_id.0,
+                    expected = ?expected,
+                    got = ?incoming_hash,
+                    "Inbound file hash mismatch; discarding file"
+                );
+                return;
+            }
+        }
+
         if let Err(e) = write_atomic(fs.as_ref(), &target, &data) {
             error!(
                 path = %target.display(),
@@ -567,6 +586,29 @@ async fn handle_file_chunk_message(
                 "Failed to materialize inbound file"
             );
         } else {
+            if let Some(expected) = expected_hash {
+                match utilities::compute_file_hash(fs.as_ref(), &target) {
+                    Ok(on_disk) if on_disk != expected => {
+                        error!(
+                            path = %target.display(),
+                            expected = ?expected,
+                            got = ?on_disk,
+                            "Post-write hash verification failed; removing corrupted file"
+                        );
+                        let _ = fs.remove_file(&target);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(
+                            path = %target.display(),
+                            error = %e,
+                            "Failed to verify hash on disk after write"
+                        );
+                        return;
+                    }
+                }
+            }
             info!(path = %target.display(), "Wrote inbound file");
         }
     }

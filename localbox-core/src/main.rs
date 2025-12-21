@@ -5,6 +5,7 @@ use localbox_core::config::{
     DEFAULT_CONFIG_PATH,
 };
 use localbox_core::monitoring;
+use localbox_core::integrity;
 use localbox_core::Engine;
 use serde_json::json;
 use std::path::PathBuf;
@@ -34,6 +35,42 @@ async fn main() -> anyhow::Result<()> {
             let cfg = cli.resolve_app_config()?;
             validate_app_config(&cfg)?;
             println!("OK");
+            Ok(())
+        }
+        Command::Audit(args) => {
+            let cfg = cli.resolve_app_config_allow_empty_shares()?;
+            let db = db::Db::open(&cfg.db_path)?;
+            let fs = RealFileSystem::new();
+            let report = integrity::audit_disk(&db, &fs, args.share.as_deref())?;
+            if report.checked == 0 {
+                println!("No files to verify");
+                return Ok(());
+            }
+            if report.issues.is_empty() {
+                println!("Verified {} file(s); no issues found", report.checked);
+            } else {
+                println!(
+                    "Verified {} file(s); {} issue(s) detected:",
+                    report.checked,
+                    report.issues.len()
+                );
+                for issue in &report.issues {
+                    match &issue.kind {
+                        integrity::IntegrityIssueKind::Missing => {
+                            println!(" - [{}] {} (missing)", issue.share, issue.path);
+                        }
+                        integrity::IntegrityIssueKind::HashMismatch { expected, actual } => {
+                            println!(
+                                " - [{}] {} (hash mismatch expected {}, got {})",
+                                issue.share, issue.path, expected, actual
+                            );
+                        }
+                        integrity::IntegrityIssueKind::IoError(e) => {
+                            println!(" - [{}] {} (io error: {})", issue.share, issue.path, e);
+                        }
+                    }
+                }
+            }
             Ok(())
         }
         Command::Monitor(args) => {

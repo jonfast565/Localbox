@@ -28,7 +28,7 @@ Localbox is a peer-to-peer file replication engine for small networks. Each node
 2. **Generate a starter config:**
    ```bash
    cargo run -p localbox-core -- init --force
-   # edit config.toml to add your shares, ports, TLS paths, etc.
+   # edit config.toml for ports/TLS (shares are optional at startup; add later via CLI/REPL/GUI)
    ```
 
 3. **Set up trust.** Pick one of the two models below — the shared network CA is
@@ -84,7 +84,13 @@ Localbox is a peer-to-peer file replication engine for small networks. Each node
    cargo run -p localbox-core -- run --interactive --instance-id node-a ... --share docs=/tmp/docs-a
    ```
 
-7. **Manual transfers / chat (daemon must be running, or use the REPL):**
+7. **Add shares dynamically** (daemon running; also via REPL `share add` or the GUI Status tab). The DB is the live share registry; `config.toml` is updated for restarts:
+   ```bash
+   cargo run -p localbox-core -- share add --name docs --path /tmp/docs
+   cargo run -p localbox-core -- share list
+   ```
+
+8. **Manual transfers / chat (daemon must be running, or use the REPL):**
    ```bash
    cargo run -p localbox-core -- push --share docs --peer workstation-b
    cargo run -p localbox-core -- pull --share docs --peer workstation-b
@@ -93,7 +99,7 @@ Localbox is a peer-to-peer file replication engine for small networks. Each node
    cargo run -p localbox-core -- chat inbox
    ```
 
-8. **Monitor / inspect:**
+9. **Monitor / inspect:**
    ```bash
    cargo run -p localbox-core -- monitor --queue-threshold 50 --stale-peer-seconds 120
    cargo run -p localbox-core -- status --json

@@ -16,7 +16,6 @@ use tls::ManagedTls;
 pub fn spawn_discovery(
     cfg: AppConfig,
     db: DbHandle,
-    shares: Arc<Vec<ShareContext>>,
     tls: Arc<ManagedTls>,
     connections: SharedWriters,
     net_tx: tokio::sync::mpsc::Sender<String>,
@@ -26,14 +25,10 @@ pub fn spawn_discovery(
     progress: Arc<TransferProgressRegistry>,
     token: CancellationToken,
 ) -> JoinHandle<()> {
-    let share_names: Vec<String> = shares.iter().map(|s| s.share_name.clone()).collect();
-    let share_lookup = shares;
     let net_tx = Arc::new(net_tx);
     tokio::spawn(discovery_loop(
         cfg,
         db,
-        share_names,
-        share_lookup,
         tls,
         connections,
         net_tx,
@@ -48,8 +43,6 @@ pub fn spawn_discovery(
 async fn discovery_loop(
     cfg: AppConfig,
     db: DbHandle,
-    share_names: Vec<String>,
-    share_lookup: Arc<Vec<ShareContext>>,
     tls: Arc<ManagedTls>,
     connections: SharedWriters,
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
@@ -78,7 +71,7 @@ async fn discovery_loop(
     let socket_send = Arc::clone(&socket);
     let _broadcaster = tokio::spawn(discovery_broadcast_loop(
         cfg.clone(),
-        share_names.clone(),
+        Arc::clone(&db),
         socket_send,
         token.clone(),
     ));
@@ -92,11 +85,11 @@ async fn discovery_loop(
                 match res {
                     Ok((n, src)) => {
                         let msg = String::from_utf8_lossy(&buf[..n]);
+                        let share_names = local_share_names(&db, &cfg.pc_name).await;
                         handle_discovery_message(
                             &cfg,
                             &db,
                             &share_names,
-                            &share_lookup,
                             msg.as_ref(),
                             src,
                             &socket,
@@ -123,7 +116,7 @@ async fn discovery_loop(
 
 async fn discovery_broadcast_loop(
     cfg: AppConfig,
-    share_names: Vec<String>,
+    db: DbHandle,
     socket: Arc<dyn UdpSocketLike>,
     token: CancellationToken,
 ) {
@@ -133,6 +126,7 @@ async fn discovery_broadcast_loop(
             _ = token.cancelled() => break,
             _ = interval.tick() => {}
         }
+        let share_names = local_share_names(&db, &cfg.pc_name).await;
         let msg = format!(
             "DISCOVER v1 pc_name={} instance_id={} tls_port={} plain_port={} use_tls={} accepts_remote={} shares={}",
             cfg.pc_name,
@@ -157,7 +151,6 @@ async fn handle_discovery_message(
     cfg: &AppConfig,
     db: &DbHandle,
     share_names: &[String],
-    share_lookup: &Arc<Vec<ShareContext>>,
     msg: &str,
     src: SocketAddr,
     socket: &Arc<dyn UdpSocketLike>,
@@ -192,7 +185,6 @@ async fn handle_discovery_message(
                 cfg,
                 db,
                 share_names,
-                share_lookup,
                 &pc_name,
                 &instance_id,
                 tls_port,
@@ -226,7 +218,6 @@ async fn handle_discovery_message(
                 cfg,
                 db,
                 share_names,
-                share_lookup,
                 &pc_name,
                 &instance_id,
                 tls_port,
@@ -253,7 +244,6 @@ async fn handle_discover(
     cfg: &AppConfig,
     db: &DbHandle,
     share_names: &[String],
-    share_lookup: &Arc<Vec<ShareContext>>,
     pc_name: &str,
     instance_id: &str,
     tls_port: u16,
@@ -315,7 +305,6 @@ async fn handle_discover(
         maybe_enqueue_auto_sync(
             cfg,
             db,
-            share_lookup,
             &shares,
             peer_id,
             pc_name,
@@ -365,7 +354,6 @@ async fn handle_here(
     cfg: &AppConfig,
     db: &DbHandle,
     share_names: &[String],
-    share_lookup: &Arc<Vec<ShareContext>>,
     pc_name: &str,
     instance_id: &str,
     tls_port: u16,
@@ -429,7 +417,6 @@ async fn handle_here(
             maybe_enqueue_auto_sync(
                 cfg,
                 db,
-                share_lookup,
                 &shares,
                 peer_id,
                 pc_name,
@@ -590,7 +577,6 @@ fn is_self_peer(cfg: &AppConfig, pc_name: &str, _instance_id: &str) -> bool {
 async fn maybe_enqueue_auto_sync(
     cfg: &AppConfig,
     db: &DbHandle,
-    share_lookup: &Arc<Vec<ShareContext>>,
     remote_shares: &[String],
     peer_id: i64,
     peer_pc: &str,
@@ -598,10 +584,10 @@ async fn maybe_enqueue_auto_sync(
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
 ) {
     let peer_key = format!("{peer_pc}@{peer_instance}");
-    let auto_shares: Vec<ShareContext> = share_lookup
-        .iter()
+    let local = local_share_contexts(db, &cfg.pc_name).await;
+    let auto_shares: Vec<ShareContext> = local
+        .into_iter()
         .filter(|s| cfg.resolve_sync_mode(&s.share_name, Some(&peer_key)).is_auto())
-        .cloned()
         .collect();
     if auto_shares.is_empty() {
         info!(
@@ -610,10 +596,9 @@ async fn maybe_enqueue_auto_sync(
         );
         return;
     }
-    let filtered = Arc::new(auto_shares);
     enqueue_bootstrap_if_needed(
         db,
-        &filtered,
+        &auto_shares,
         remote_shares,
         peer_id,
         &cfg.pc_name,
@@ -623,7 +608,7 @@ async fn maybe_enqueue_auto_sync(
     .await;
     enqueue_catchup_if_needed(
         db,
-        &filtered,
+        &auto_shares,
         remote_shares,
         peer_id,
         &cfg.pc_name,
@@ -634,14 +619,14 @@ async fn maybe_enqueue_auto_sync(
 
 async fn enqueue_catchup_if_needed(
     db: &DbHandle,
-    share_lookup: &Arc<Vec<ShareContext>>,
+    share_lookup: &[ShareContext],
     remote_shares: &[String],
     peer_id: i64,
     local_name: &str,
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
 ) {
     let remote: HashSet<&str> = remote_shares.iter().map(|s| s.as_str()).collect();
-    for share in share_lookup.iter() {
+    for share in share_lookup {
         if !remote.contains(share.share_name.as_str()) {
             continue;
         }
@@ -709,7 +694,7 @@ async fn enqueue_catchup_if_needed(
 
 async fn enqueue_bootstrap_if_needed(
     db: &DbHandle,
-    share_lookup: &Arc<Vec<ShareContext>>,
+    share_lookup: &[ShareContext],
     remote_shares: &[String],
     peer_id: i64,
     local_name: &str,
@@ -717,7 +702,7 @@ async fn enqueue_bootstrap_if_needed(
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
 ) {
     let remote: HashSet<&str> = remote_shares.iter().map(|s| s.as_str()).collect();
-    for share in share_lookup.iter() {
+    for share in share_lookup {
         if remote.contains(share.share_name.as_str()) {
             continue;
         }
@@ -768,6 +753,29 @@ async fn enqueue_bootstrap_if_needed(
                 error = %e,
                 "Failed to enqueue SyncCatchup bootstrap intent"
             ),
+        }
+    }
+}
+
+async fn local_share_names(db: &DbHandle, pc_name: &str) -> Vec<String> {
+    match db.lock().await.list_shares_for_pc(pc_name) {
+        Ok(rows) => rows.into_iter().map(|r| r.share_name).collect(),
+        Err(e) => {
+            warn!("Failed to list local shares: {e}");
+            Vec::new()
+        }
+    }
+}
+
+async fn local_share_contexts(db: &DbHandle, pc_name: &str) -> Vec<ShareContext> {
+    match db.lock().await.list_shares_for_pc(pc_name) {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| crate::share_context_from_row(&r))
+            .collect(),
+        Err(e) => {
+            warn!("Failed to list local shares: {e}");
+            Vec::new()
         }
     }
 }

@@ -30,3 +30,25 @@ fn parses_push_and_chat() {
 fn push_requires_a_share() {
     assert!(parse_repl_to_request("push --peer bob").is_err());
 }
+
+#[test]
+fn parses_share_add_and_list() {
+    let req = parse_repl_to_request("share add --name docs --path /tmp/docs").unwrap();
+    match req {
+        ControlRequest::ShareAdd {
+            name,
+            path,
+            recursive,
+        } => {
+            assert_eq!(name, "docs");
+            assert_eq!(path, "/tmp/docs");
+            assert!(recursive);
+        }
+        _ => panic!("expected share add"),
+    }
+
+    let req = parse_repl_to_request("shares").unwrap();
+    assert!(matches!(req, ControlRequest::ShareList));
+    let req = parse_repl_to_request("share list").unwrap();
+    assert!(matches!(req, ControlRequest::ShareList));
+}

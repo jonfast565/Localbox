@@ -2,17 +2,23 @@ use anyhow::{anyhow, bail, Context, Result};
 use db::{Db, PendingTransferRequest};
 use models::{
     peer_key, peer_thread_id, share_thread_id, AppConfig, ChatAttachment, ChatMessage,
-    ChatMessageRecord, IntentBasis, IntentKind, IntentOrigin, IntentStatus, ShareId, ThreadKind,
-    ThreadSummary, TransferProgressRegistry, TransferReply, TransferReplyStatus, TransferRequest,
-    WireMessage, WIRE_PROTOCOL_VERSION,
+    ChatMessageRecord, FileChange, IntentBasis, IntentKind, IntentOrigin, IntentStatus, ShareConfig,
+    ShareContext, ShareId, ThreadKind, ThreadSummary, TransferProgressRegistry, TransferReply,
+    TransferReplyStatus, TransferRequest, WireMessage, WIRE_PROTOCOL_VERSION,
 };
 use peering::PeerCommand;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
+use utilities::{FileSystem, RealFileSystem};
 use uuid::Uuid;
 
+use crate::config::{add_share_to_config, DEFAULT_CONFIG_PATH};
+use crate::engine::{seed_journal_from_index, start_single_watcher};
 use crate::intent_ops;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,7 +82,20 @@ pub enum ControlRequest {
     PeerUnquarantine {
         peer: String,
     },
+    /// List local shares from the DB registry.
+    ShareList,
+    /// Add (or update) a local share in the DB registry and start watching it.
+    ShareAdd {
+        name: String,
+        path: String,
+        #[serde(default = "default_true")]
+        recursive: bool,
+    },
     Quit,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +132,15 @@ impl ControlResponse {
     }
 }
 
+/// Runtime hooks so the control plane can register shares into the live engine.
+#[derive(Clone)]
+pub struct ShareHooks {
+    pub change_tx: mpsc::Sender<FileChange>,
+    pub fs: Arc<dyn FileSystem>,
+    pub workdir: Option<PathBuf>,
+    pub token: CancellationToken,
+}
+
 #[derive(Clone)]
 pub struct ControlService {
     pub cfg: AppConfig,
@@ -120,6 +148,7 @@ pub struct ControlService {
     pub net_tx: mpsc::Sender<String>,
     pub peer_cmd_tx: mpsc::Sender<PeerCommand>,
     pub progress: Arc<TransferProgressRegistry>,
+    pub share_hooks: Option<ShareHooks>,
 }
 
 impl ControlService {
@@ -315,7 +344,132 @@ impl ControlService {
                     )))
                 }
             }
+            ControlRequest::ShareList => {
+                let shares = self
+                    .db
+                    .lock()
+                    .await
+                    .list_shares_for_pc(&self.cfg.pc_name)?;
+                Ok(ControlResponse::ok_data(
+                    "shares",
+                    serde_json::to_value(shares)?,
+                ))
+            }
+            ControlRequest::ShareAdd {
+                name,
+                path,
+                recursive,
+            } => {
+                let ctx = self.add_share(&name, Path::new(&path), recursive).await?;
+                Ok(ControlResponse::ok_data(
+                    format!(
+                        "added share '{}' -> {}",
+                        ctx.share_name,
+                        ctx.root_path.display()
+                    ),
+                    serde_json::json!({
+                        "id": ctx.id,
+                        "share_name": ctx.share_name,
+                        "pc_name": ctx.pc_name,
+                        "root_path": ctx.root_path,
+                        "recursive": ctx.recursive,
+                    }),
+                ))
+            }
         }
+    }
+
+    async fn add_share(
+        &self,
+        name: &str,
+        root_path: &Path,
+        recursive: bool,
+    ) -> Result<ShareContext> {
+        if !self.cfg.app_state.can_share() {
+            bail!(
+                "app_state {:?} cannot host local shares",
+                self.cfg.app_state
+            );
+        }
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("share name cannot be empty");
+        }
+        let root_path = if root_path.is_absolute() {
+            root_path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join(root_path)
+        };
+        let md = std::fs::metadata(&root_path).with_context(|| {
+            format!("share root '{}' is not accessible", root_path.display())
+        })?;
+        if !md.is_dir() {
+            bail!("share root '{}' is not a directory", root_path.display());
+        }
+
+        let sc = ShareConfig {
+            name: name.to_string(),
+            root_path: root_path.clone(),
+            recursive,
+            ignore_patterns: Vec::new(),
+            sync_allow: Vec::new(),
+            max_file_size_bytes: None,
+            sync: Default::default(),
+            pull: Default::default(),
+            request_handling: None,
+            conflict: Default::default(),
+        };
+        let share_id = ShareId::new(&sc.name, &self.cfg.pc_name);
+        let fs: Arc<dyn FileSystem> = self
+            .share_hooks
+            .as_ref()
+            .map(|h| h.fs.clone())
+            .unwrap_or_else(|| Arc::new(RealFileSystem::new()));
+        let workdir = self
+            .share_hooks
+            .as_ref()
+            .and_then(|h| h.workdir.clone())
+            .or_else(|| std::env::current_dir().ok());
+
+        let ctx = {
+            let mut db = self.db.lock().await;
+            let id = db.upsert_share(&self.cfg.pc_name, &sc, &share_id)?;
+            let ctx = ShareContext {
+                id,
+                share_name: sc.name.clone(),
+                pc_name: self.cfg.pc_name.clone(),
+                share_id,
+                root_path: sc.root_path.clone(),
+                recursive: sc.recursive,
+                ignore_patterns: sc.ignore_patterns.clone(),
+                sync_allow: sc.sync_allow.clone(),
+                conflict: sc.conflict,
+                max_file_size_bytes: sc.max_file_size_bytes,
+                index: HashMap::new(),
+            };
+            seed_journal_from_index(&mut db, &ctx, &fs, workdir.as_deref())?;
+            ctx
+        };
+
+        let cfg_path = std::env::current_dir()
+            .unwrap_or_default()
+            .join(DEFAULT_CONFIG_PATH);
+        let _ = add_share_to_config(&cfg_path, &sc.name, &sc.root_path, sc.recursive);
+
+        if let Some(hooks) = &self.share_hooks {
+            let share = ctx.clone();
+            let tx = hooks.change_tx.clone();
+            let fs = hooks.fs.clone();
+            let workdir = hooks.workdir.clone();
+            let token = hooks.token.clone();
+            tokio::spawn(async move {
+                start_single_watcher(share, tx, fs, workdir, token).await;
+            });
+        }
+
+        Ok(ctx)
     }
 
     async fn enqueue_push(

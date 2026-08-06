@@ -1,6 +1,6 @@
 use crate::engine::log_banner;
 use anyhow::{anyhow, Context, Result};
-use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use models::{
     AppConfig, ApplicationState, ConflictPolicy, PeerPolicy, ShareConfig, TransferMode,
 };
@@ -78,6 +78,39 @@ pub enum Command {
     Status(StatusArgs),
     /// List / quarantine / unquarantine peers
     Peer(PeerArgs),
+    /// List / add local shares on a running node (control plane)
+    Share(ShareArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ShareArgs {
+    #[command(subcommand)]
+    pub command: ShareCliCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ShareCliCommand {
+    /// List local shares from the running node's DB registry
+    List {
+        /// Control socket path (defaults to config / localbox.sock)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Add a local share to a running node (DB + watcher + config.toml)
+    Add {
+        /// Share name
+        #[arg(long)]
+        name: String,
+        /// Directory to share
+        #[arg(long, value_name = "DIR")]
+        path: PathBuf,
+        /// Watch recursively (default: true)
+        #[arg(long, default_value_t = true)]
+        recursive: bool,
+        /// Control socket path (defaults to config / localbox.sock)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -726,29 +759,27 @@ impl From<AppStateArg> for ApplicationState {
 
 impl Cli {
     pub fn resolve_app_config(&self) -> Result<AppConfig> {
-        self.resolve_app_config_inner(None, true)
+        self.resolve_app_config_inner(None)
     }
 
+    /// Shares are optional at startup; kept as an alias of [`Self::resolve_app_config`].
     pub fn resolve_app_config_allow_empty_shares(&self) -> Result<AppConfig> {
-        self.resolve_app_config_inner(None, false)
+        self.resolve_app_config()
     }
 
     pub fn resolve_app_config_with_overrides(&self, overrides: &RunArgs) -> Result<AppConfig> {
-        self.resolve_app_config_inner(Some(overrides), true)
+        self.resolve_app_config_inner(Some(overrides))
     }
 
+    /// Shares are optional at startup; kept as an alias of [`Self::resolve_app_config_with_overrides`].
     pub fn resolve_app_config_allow_empty_shares_with_overrides(
         &self,
         overrides: &RunArgs,
     ) -> Result<AppConfig> {
-        self.resolve_app_config_inner(Some(overrides), false)
+        self.resolve_app_config_with_overrides(overrides)
     }
 
-    fn resolve_app_config_inner(
-        &self,
-        overrides: Option<&RunArgs>,
-        require_shares: bool,
-    ) -> Result<AppConfig> {
+    fn resolve_app_config_inner(&self, overrides: Option<&RunArgs>) -> Result<AppConfig> {
         let file_cfg = load_optional_file_config(self.config.as_deref())?;
         let default_run = RunArgs::default();
         let cli_run = match &self.command {
@@ -833,7 +864,6 @@ impl Cli {
             .map(ApplicationState::from)
             .or_else(|| file_cfg.as_ref().and_then(|c| c.app_state))
             .unwrap_or_default();
-        let must_require_shares = require_shares && app_state.can_share();
 
         let tls_pinned_ca_fingerprints = file_cfg
             .as_ref()
@@ -855,19 +885,6 @@ impl Cli {
                 .unwrap_or_default(),
             run.shares.clone(),
         )?;
-
-        if must_require_shares && shares.is_empty() {
-            let config_hint = match &self.config {
-                Some(p) => format!("or add shares to {}", p.display()),
-                None => format!("or create {} with `localbox init`", DEFAULT_CONFIG_PATH),
-            };
-            let message = format!(
-                "no shares configured; pass `--share NAME=PATH[,recursive=true|false]` {}",
-                config_hint
-            );
-            let clap_error = Cli::command().error(ErrorKind::ValueValidation, message);
-            return Err(clap_error.into());
-        }
 
         let request_handling = file_cfg
             .as_ref()
@@ -934,6 +951,79 @@ pub fn init_config_template(path: &Path, force: bool) -> Result<()> {
     std::fs::write(path, default_config_template())
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+/// Upsert a `[[shares]]` entry in a TOML config file.
+/// Returns `true` if the file was modified.
+pub fn add_share_to_config(
+    config_path: &Path,
+    name: &str,
+    root_path: &Path,
+    recursive: bool,
+) -> Result<bool> {
+    let mut doc: toml::Value = if config_path.exists() {
+        toml::from_str(
+            &std::fs::read_to_string(config_path)
+                .with_context(|| format!("failed to read {}", config_path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", config_path.display()))?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let table = doc
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("config {} is not a table", config_path.display()))?;
+    let entry = table
+        .entry("shares")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let arr = entry
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("shares must be an array of tables"))?;
+
+    let root_s = root_path.to_string_lossy().to_string();
+    let mut changed = false;
+    let mut found = false;
+    for item in arr.iter_mut() {
+        let Some(t) = item.as_table_mut() else {
+            continue;
+        };
+        if t.get("name").and_then(|v| v.as_str()) != Some(name) {
+            continue;
+        }
+        found = true;
+        if t.get("root_path").and_then(|v| v.as_str()) != Some(root_s.as_str()) {
+            t.insert("root_path".into(), toml::Value::String(root_s.clone()));
+            changed = true;
+        }
+        let prev_rec = t.get("recursive").and_then(|v| v.as_bool()).unwrap_or(true);
+        if prev_rec != recursive {
+            t.insert("recursive".into(), toml::Value::Boolean(recursive));
+            changed = true;
+        }
+        break;
+    }
+    if !found {
+        let mut share = toml::map::Map::new();
+        share.insert("name".into(), toml::Value::String(name.to_string()));
+        share.insert("root_path".into(), toml::Value::String(root_s));
+        share.insert("recursive".into(), toml::Value::Boolean(recursive));
+        arr.push(toml::Value::Table(share));
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+    if let Some(parent) = config_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+    }
+    let updated = toml::to_string_pretty(&doc)?;
+    write_file_atomic(config_path, updated.as_bytes())
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    Ok(true)
 }
 
 /// Add or remove a peer string in `quarantined_peers` in a TOML config file.
@@ -1478,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_requires_shares_when_no_config_exists() {
+    fn cli_allows_empty_shares_when_no_config_exists() {
         let path = test_temp_path("localbox-empty").with_extension("toml");
         std::fs::write(&path, "\n").unwrap();
 
@@ -1490,9 +1580,8 @@ mod tests {
             path_str,
         ])
         .unwrap();
-        let err = cli.resolve_app_config().unwrap_err().to_string();
-        assert!(err.contains("no shares configured"));
-        assert!(err.contains("--share"));
+        let cfg = cli.resolve_app_config().unwrap();
+        assert!(cfg.shares.is_empty());
 
         std::fs::remove_file(&path).unwrap();
     }

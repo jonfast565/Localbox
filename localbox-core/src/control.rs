@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::service::{ControlRequest, ControlResponse, ControlService};
+use crate::service::{ControlRequest, ControlResponse, ControlService, ShareHooks};
 
 pub async fn run_control_server(
     cfg: AppConfig,
@@ -19,6 +19,7 @@ pub async fn run_control_server(
     net_tx: mpsc::Sender<String>,
     cmd_tx: mpsc::Sender<PeerCommand>,
     progress: Arc<TransferProgressRegistry>,
+    share_hooks: Option<ShareHooks>,
     token: CancellationToken,
 ) -> Result<()> {
     let path = cfg.control_socket.clone();
@@ -28,6 +29,7 @@ pub async fn run_control_server(
         net_tx,
         peer_cmd_tx: cmd_tx,
         progress,
+        share_hooks,
     };
 
     #[cfg(unix)]

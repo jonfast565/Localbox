@@ -28,9 +28,13 @@ pub enum Message {
     PendingLoaded(Result<ControlResponse, String>),
     IntentsLoaded(Result<ControlResponse, String>),
     PeersLoaded(Result<ControlResponse, String>),
+    SharesLoaded(Result<ControlResponse, String>),
     ThreadLoaded(Result<ControlResponse, String>),
     ActionDone(Result<ControlResponse, String>),
     ShareInput(String),
+    NewShareNameInput(String),
+    NewSharePathInput(String),
+    AddShare,
     PeerInput(String),
     PathInput(String),
     Push,
@@ -55,8 +59,23 @@ struct StatusSnapshot {
     peers: u64,
     shares: u64,
     queue_depth: u64,
+    #[allow(dead_code)]
     pending_requests: u64,
+    #[allow(dead_code)]
     active_intents: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShareInfo {
+    #[allow(dead_code)]
+    id: i64,
+    share_name: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pc_name: String,
+    root_path: String,
+    #[serde(default)]
+    recursive: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -140,6 +159,9 @@ pub struct App {
     flash: Option<(bool, String)>,
     status: Option<StatusSnapshot>,
     peers: Vec<PeerInfo>,
+    local_shares: Vec<ShareInfo>,
+    new_share_name: String,
+    new_share_path: String,
     pending: Vec<PendingRequest>,
     intents: Vec<IntentRow>,
     threads: Vec<ThreadInfo>,
@@ -165,6 +187,9 @@ impl App {
             flash: None,
             status: None,
             peers: Vec::new(),
+            local_shares: Vec::new(),
+            new_share_name: String::new(),
+            new_share_path: String::new(),
             pending: Vec::new(),
             intents: Vec::new(),
             threads: Vec::new(),
@@ -221,6 +246,12 @@ impl App {
                 });
                 Task::none()
             }
+            Message::SharesLoaded(res) => {
+                self.apply_result(res, |app, resp| {
+                    app.local_shares = parse_vec(&resp);
+                });
+                Task::none()
+            }
             Message::ThreadLoaded(res) => {
                 self.apply_result(res, |app, resp| {
                     app.messages = parse_vec(&resp);
@@ -231,18 +262,43 @@ impl App {
                 match res {
                     Ok(resp) => {
                         self.connected = true;
+                        if resp.ok && resp.message.starts_with("added share") {
+                            self.new_share_name.clear();
+                            self.new_share_path.clear();
+                        }
                         self.flash = Some((resp.ok, resp.message));
                     }
-            Err(e) => {
-                self.connected = false;
-                self.flash = Some((false, disconnect_message(&e, self.managed_runtime)));
-            }
+                    Err(e) => {
+                        self.connected = false;
+                        self.flash = Some((false, disconnect_message(&e, self.managed_runtime)));
+                    }
                 }
                 Task::done(Message::Refresh)
             }
             Message::ShareInput(s) => {
                 self.share = s;
                 Task::none()
+            }
+            Message::NewShareNameInput(s) => {
+                self.new_share_name = s;
+                Task::none()
+            }
+            Message::NewSharePathInput(s) => {
+                self.new_share_path = s;
+                Task::none()
+            }
+            Message::AddShare => {
+                let name = self.new_share_name.trim().to_string();
+                let path = self.new_share_path.trim().to_string();
+                if name.is_empty() || path.is_empty() {
+                    self.flash = Some((false, "share name and path are required".into()));
+                    return Task::none();
+                }
+                self.transfer_action(ControlRequest::ShareAdd {
+                    name,
+                    path,
+                    recursive: true,
+                })
             }
             Message::PeerInput(s) => {
                 self.peer = s;
@@ -354,6 +410,7 @@ impl App {
         match self.tab {
             Tab::Status => {
                 let sock2 = self.socket.clone();
+                let sock3 = self.socket.clone();
                 Task::batch([
                     Task::perform(
                         async move {
@@ -370,6 +427,14 @@ impl App {
                                 .map_err(|e| e.to_string())
                         },
                         Message::PeersLoaded,
+                    ),
+                    Task::perform(
+                        async move {
+                            client::send_request(&sock3, &ControlRequest::ShareList)
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::SharesLoaded,
                     ),
                 ])
             }
@@ -559,14 +624,50 @@ fn status_view(app: &App) -> Element<'_, Message> {
             metric_card("Peers", s.peers.to_string(), c),
             metric_card("Shares", s.shares.to_string(), c),
             metric_card("Queue", s.queue_depth.to_string(), c),
-            metric_card("Pending", s.pending_requests.to_string(), c),
-            metric_card("Intents", s.active_intents.to_string(), c),
         ]
-        .spacing(12)
+        .spacing(8)
         .width(Length::Fill)
     } else {
         row![text("Waiting for status…").size(14).color(c.muted)].width(Length::Fill)
     };
+
+    let add_share = panel_sized(
+        column![
+            section_title("Add share", c),
+            labeled_input("Name", &app.new_share_name, Message::NewShareNameInput, c),
+            labeled_input("Path", &app.new_share_path, Message::NewSharePathInput, c),
+            styled_button("Add share", Message::AddShare, theme::btn_primary),
+        ]
+        .spacing(8),
+        Length::Fill,
+        Length::Shrink,
+    );
+
+    let mut shares_col: Column<'_, Message> = column![section_title("Shares", c)].spacing(6);
+    if app.local_shares.is_empty() {
+        shares_col = shares_col.push(empty_state("No local shares yet.", c));
+    } else {
+        for share in &app.local_shares {
+            shares_col = shares_col.push(
+                container(
+                    column![
+                        text(&share.share_name).size(14).color(c.text),
+                        text(format!(
+                            "{}{}",
+                            share.root_path,
+                            if share.recursive { " · recursive" } else { "" }
+                        ))
+                        .size(11)
+                        .color(c.muted),
+                    ]
+                    .spacing(2),
+                )
+                .padding(10)
+                .width(Length::Fill)
+                .style(theme::card_style),
+            );
+        }
+    }
 
     let mut peers_col: Column<'_, Message> = column![section_title("Peers", c)].spacing(8);
     if app.peers.is_empty() {
@@ -580,10 +681,11 @@ fn status_view(app: &App) -> Element<'_, Message> {
     column![
         section_title("Overview", c),
         metrics,
-        Space::with_height(8),
-        panel(scrollable(peers_col).height(Length::Fill), Length::Fill),
+        add_share,
+        panel(scrollable(shares_col).height(Length::FillPortion(1)), Length::Fill),
+        panel(scrollable(peers_col).height(Length::FillPortion(1)), Length::Fill),
     ]
-    .spacing(12)
+    .spacing(10)
     .height(Length::Fill)
     .into()
 }

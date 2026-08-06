@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use anyhow::Result;
-use db::Db;
+use db::{Db, ShareRow};
 use models::{AppConfig, ShareContext, ShareId, TransferProgressRegistry, WireMessage};
 use time::OffsetDateTime;
 use tls::ManagedTls;
@@ -24,6 +24,23 @@ mod writer;
 
 pub use commands::PeerCommand;
 
+/// Build a [`ShareContext`] from a DB share row (runtime share registry).
+pub fn share_context_from_row(row: &ShareRow) -> ShareContext {
+    ShareContext {
+        id: row.id,
+        share_name: row.share_name.clone(),
+        pc_name: row.pc_name.clone(),
+        share_id: ShareId::new(&row.share_name, &row.pc_name),
+        root_path: PathBuf::from(&row.root_path),
+        recursive: row.recursive,
+        ignore_patterns: Vec::new(),
+        sync_allow: Vec::new(),
+        conflict: Default::default(),
+        max_file_size_bytes: None,
+        index: HashMap::new(),
+    }
+}
+
 type DbHandle = Arc<Mutex<Db>>;
 type SharedWriters = Arc<Mutex<Vec<(i64, Arc<tokio::sync::Mutex<writer::PeerWriter>>)>>>;
 type PendingFiles = Arc<Mutex<HashMap<(ShareId, String), InboundFileState>>>;
@@ -45,8 +62,6 @@ pub struct PeerManager {
     net_tx: mpsc::Sender<String>,
     fs: Arc<dyn FileSystem>,
     net: Arc<dyn Net>,
-    shares: Arc<Vec<ShareContext>>,
-    share_map: Arc<HashMap<[u8; 16], ShareContext>>,
     progress: Arc<TransferProgressRegistry>,
 }
 
@@ -71,9 +86,8 @@ impl PeerManager {
         net: Arc<dyn Net>,
         progress: Arc<TransferProgressRegistry>,
     ) -> Result<Self> {
+        let _ = shares; // callers still pass shares loaded into the DB registry
         let tls = Arc::new(ManagedTls::new(&cfg, fs.clone())?);
-        let shares_arc = Arc::new(shares);
-        let share_map = Arc::new(map_shares_by_id(shares_arc.as_ref()));
         Ok(Self {
             cfg,
             db,
@@ -81,8 +95,6 @@ impl PeerManager {
             net_tx,
             fs,
             net,
-            shares: shares_arc,
-            share_map,
             progress,
         })
     }
@@ -115,7 +127,6 @@ impl PeerManager {
         let discovery = discovery::spawn_discovery(
             self.cfg.clone(),
             Arc::clone(&self.db),
-            self.shares.clone(),
             tls.clone(),
             connections.clone(),
             self.net_tx.clone(),
@@ -140,7 +151,6 @@ impl PeerManager {
         );
         let sender = self.spawn_outbox_worker(
             connections.clone(),
-            self.share_map.clone(),
             self.fs.clone(),
             Arc::clone(&self.progress),
             net_rx,
@@ -185,7 +195,6 @@ impl PeerManager {
     ) -> JoinHandle<()> {
         let cfg = self.cfg.clone();
         let db = Arc::clone(&self.db);
-        let share_names: Vec<String> = self.shares.iter().map(|s| s.share_name.clone()).collect();
         let fs = self.fs.clone();
         let net = self.net.clone();
 
@@ -208,7 +217,7 @@ impl PeerManager {
                                 info!("Incoming connection from {addr}");
                                 let db = Arc::clone(&db);
                                 let cfg = cfg.clone();
-                                let share_names = share_names.clone();
+                                let share_names = local_share_names(&db, &cfg.pc_name).await;
                                 let connections = connections.clone();
                                 let pending_files = pending_files.clone();
                                 let tls = tls.clone();
@@ -257,7 +266,6 @@ impl PeerManager {
     ) -> JoinHandle<()> {
         let cfg = self.cfg.clone();
         let db = Arc::clone(&self.db);
-        let share_names: Vec<String> = self.shares.iter().map(|s| s.share_name.clone()).collect();
         let fs = self.fs.clone();
         let net = self.net.clone();
 
@@ -280,7 +288,7 @@ impl PeerManager {
                                 warn!("Incoming plaintext connection from {addr}");
                                 let db = Arc::clone(&db);
                                 let cfg = cfg.clone();
-                                let share_names = share_names.clone();
+                                let share_names = local_share_names(&db, &cfg.pc_name).await;
                                 let connections = connections.clone();
                                 let pending_files = pending_files.clone();
                                 let fs = fs.clone();
@@ -319,7 +327,6 @@ impl PeerManager {
     fn spawn_outbox_worker(
         &self,
         connections: SharedWriters,
-        share_map: Arc<HashMap<[u8; 16], ShareContext>>,
         fs: Arc<dyn FileSystem>,
         progress: Arc<TransferProgressRegistry>,
         mut net_rx: mpsc::Receiver<String>,
@@ -391,9 +398,13 @@ impl PeerManager {
                             );
                             continue;
                         }
-                        let share_name = share_map
-                            .get(&item.manifest.share_id.0)
-                            .map(|s| s.share_name.clone())
+                        let share_name = db
+                            .lock()
+                            .await
+                            .get_share_by_share_id(&item.manifest.share_id)
+                            .ok()
+                            .flatten()
+                            .map(|r| r.share_name)
                             .unwrap_or_else(|| "unknown".into());
                         let bytes_total: u64 = item
                             .manifest
@@ -423,7 +434,7 @@ impl PeerManager {
                         if let Err(e) = send_file_chunks(
                             &mut guard,
                             &item.manifest,
-                            &share_map,
+                            &db,
                             fs.clone(),
                             Arc::clone(&progress),
                             item.intent_id.as_deref(),
@@ -481,12 +492,14 @@ fn compute_backoff_secs(attempts: i64) -> i64 {
     (base * 5).min(300)
 }
 
-fn map_shares_by_id(shares: &[ShareContext]) -> HashMap<[u8; 16], ShareContext> {
-    let mut map = HashMap::new();
-    for share in shares {
-        map.insert(share.share_id.0, share.clone());
+async fn local_share_names(db: &DbHandle, pc_name: &str) -> Vec<String> {
+    match db.lock().await.list_shares_for_pc(pc_name) {
+        Ok(rows) => rows.into_iter().map(|r| r.share_name).collect(),
+        Err(e) => {
+            warn!("Failed to list local shares: {e}");
+            Vec::new()
+        }
     }
-    map
 }
 
 const FILE_CHUNK_SIZE: usize = 128 * 1024;
@@ -510,17 +523,28 @@ fn finalize_hasher(hasher: Sha256) -> [u8; 32] {
 async fn send_file_chunks(
     writer: &mut writer::PeerWriter,
     manifest: &models::BatchManifest,
-    share_map: &HashMap<[u8; 16], ShareContext>,
+    db: &DbHandle,
     fs: Arc<dyn FileSystem>,
     progress: Arc<TransferProgressRegistry>,
     intent_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let Some(share_ctx) = share_map.get(&manifest.share_id.0) else {
-        warn!(
-            share_id = ?manifest.share_id.0,
-            "Share not registered locally; cannot stream file contents"
-        );
-        return Ok(());
+    let share_ctx = match db.lock().await.get_share_by_share_id(&manifest.share_id) {
+        Ok(Some(row)) => share_context_from_row(&row),
+        Ok(None) => {
+            warn!(
+                share_id = ?manifest.share_id.0,
+                "Share not registered locally; cannot stream file contents"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            warn!(
+                share_id = ?manifest.share_id.0,
+                error = %e,
+                "Failed to look up share for outbound file stream"
+            );
+            return Ok(());
+        }
     };
 
     for change in &manifest.changes {

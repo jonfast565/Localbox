@@ -239,16 +239,30 @@ impl Engine {
             })
         };
 
+        let share_hooks = crate::service::ShareHooks {
+            change_tx: self.change_tx.clone(),
+            fs: Arc::clone(&self.fs),
+            workdir: self.workdir.clone(),
+            token: token.clone(),
+        };
+
         let control_task = if start_control {
             if let Some(cmd_tx) = cmd_tx.clone() {
                 let cfg = self.cfg.clone();
                 let db = Arc::clone(&self.db);
                 let net_tx = self.net_tx.clone();
                 let progress = Arc::clone(&progress);
+                let share_hooks = share_hooks.clone();
                 let token = token.clone();
                 Some(tokio::spawn(async move {
                     if let Err(e) = crate::control::run_control_server(
-                        cfg, db, net_tx, cmd_tx, progress, token,
+                        cfg,
+                        db,
+                        net_tx,
+                        cmd_tx,
+                        progress,
+                        Some(share_hooks),
+                        token,
                     )
                     .await
                     {
@@ -268,10 +282,17 @@ impl Engine {
                 let db = Arc::clone(&self.db);
                 let net_tx = self.net_tx.clone();
                 let progress = Arc::clone(&progress);
+                let share_hooks = share_hooks.clone();
                 let token = token.clone();
                 Some(tokio::spawn(async move {
                     if let Err(e) = crate::shell::run_inprocess_shell(
-                        cfg, db, net_tx, cmd_tx, progress, token,
+                        cfg,
+                        db,
+                        net_tx,
+                        cmd_tx,
+                        progress,
+                        Some(share_hooks),
+                        token,
                     )
                     .await
                     {
@@ -939,7 +960,7 @@ async fn change_aggregator_task(
     }
 }
 
-async fn start_single_watcher(
+pub(crate) async fn start_single_watcher(
     share: ShareContext,
     tx: mpsc::Sender<FileChange>,
     fs: Arc<dyn FileSystem>,
@@ -1118,7 +1139,7 @@ fn map_event_kind(event_kind: &EventKind) -> Option<ChangeKind> {
     None
 }
 
-fn seed_journal_from_index(
+pub(crate) fn seed_journal_from_index(
     db: &mut db::Db,
     share: &ShareContext,
     fs: &Arc<dyn FileSystem>,

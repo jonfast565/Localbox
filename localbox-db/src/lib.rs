@@ -1391,6 +1391,87 @@ impl Db {
         Ok(out)
     }
 
+    /// Local shares owned by this PC (the runtime share registry).
+    pub fn list_shares_for_pc(&self, pc_name: &str) -> Result<Vec<ShareRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, share_name, pc_name, root_path, recursive
+            FROM shares
+            WHERE pc_name = ?1
+            ORDER BY share_name ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![pc_name], |row| {
+            Ok(ShareRow {
+                id: row.get(0)?,
+                share_name: row.get(1)?,
+                pc_name: row.get(2)?,
+                root_path: row.get(3)?,
+                recursive: {
+                    let v: i64 = row.get(4)?;
+                    v != 0
+                },
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_share_by_share_id(&self, share_id: &ShareId) -> Result<Option<ShareRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, share_name, pc_name, root_path, recursive
+            FROM shares
+            WHERE share_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query_map(params![&share_id.0[..]], |row| {
+            Ok(ShareRow {
+                id: row.get(0)?,
+                share_name: row.get(1)?,
+                pc_name: row.get(2)?,
+                root_path: row.get(3)?,
+                recursive: {
+                    let v: i64 = row.get(4)?;
+                    v != 0
+                },
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_share_by_name(&self, pc_name: &str, share_name: &str) -> Result<Option<ShareRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, share_name, pc_name, root_path, recursive
+            FROM shares
+            WHERE pc_name = ?1 AND share_name = ?2
+            "#,
+        )?;
+        let mut rows = stmt.query_map(params![pc_name, share_name], |row| {
+            Ok(ShareRow {
+                id: row.get(0)?,
+                share_name: row.get(1)?,
+                pc_name: row.get(2)?,
+                root_path: row.get(3)?,
+                recursive: {
+                    let v: i64 = row.get(4)?;
+                    v != 0
+                },
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn list_peer_progress_table(&self) -> Result<Vec<PeerProgressRow>> {
         let mut stmt = self.conn.prepare(
             r#"

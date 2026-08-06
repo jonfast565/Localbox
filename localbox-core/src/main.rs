@@ -2,7 +2,7 @@ use clap::Parser;
 use comfy_table::{presets::ASCII_FULL_CONDENSED, Table};
 use localbox_core::config::{
     init_config_template, set_quarantined_peer_in_config, validate_app_config, BootstrapCommand,
-    ChatCommand, Cli, Command, PeerCliCommand, StatusSection, DEFAULT_CONFIG_PATH,
+    ChatCommand, Cli, Command, PeerCliCommand, ShareCliCommand, StatusSection, DEFAULT_CONFIG_PATH,
 };
 use localbox_core::control::send_control_request;
 use localbox_core::integrity;
@@ -474,6 +474,41 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Share(args) => match &args.command {
+            ShareCliCommand::List { socket } => {
+                let sock = resolve_control_socket(&cli, socket.clone())?;
+                let resp = send_control_request(&sock, &ControlRequest::ShareList).await?;
+                print_control_resp(&resp);
+                if resp.ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(resp.message))
+                }
+            }
+            ShareCliCommand::Add {
+                name,
+                path,
+                recursive,
+                socket,
+            } => {
+                let sock = resolve_control_socket(&cli, socket.clone())?;
+                let resp = send_control_request(
+                    &sock,
+                    &ControlRequest::ShareAdd {
+                        name: name.clone(),
+                        path: path.display().to_string(),
+                        recursive: *recursive,
+                    },
+                )
+                .await?;
+                print_control_resp(&resp);
+                if resp.ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(resp.message))
+                }
+            }
+        },
         Command::Peer(args) => {
             let cfg = cli.resolve_app_config_allow_empty_shares()?;
             let db = db::Db::open(&cfg.db_path)?;

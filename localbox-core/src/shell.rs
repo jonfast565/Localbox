@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::control::send_control_request;
-use crate::service::{ControlRequest, ControlResponse, ControlService};
+use crate::service::{ControlRequest, ControlResponse, ControlService, ShareHooks};
 
 pub async fn run_inprocess_shell(
     cfg: AppConfig,
@@ -19,6 +19,7 @@ pub async fn run_inprocess_shell(
     net_tx: mpsc::Sender<String>,
     cmd_tx: mpsc::Sender<PeerCommand>,
     progress: Arc<TransferProgressRegistry>,
+    share_hooks: Option<ShareHooks>,
     token: CancellationToken,
 ) -> Result<()> {
     info!("Interactive shell (in-process). Type 'help' or 'quit'.");
@@ -29,6 +30,7 @@ pub async fn run_inprocess_shell(
         net_tx,
         peer_cmd_tx: cmd_tx,
         progress,
+        share_hooks,
     };
     let stdin = std::io::stdin();
     loop {
@@ -111,6 +113,7 @@ fn print_help() {
     println!(
         "Commands:\n\
          \x20 status | peers | shares | pending | intents [--all] [--limit N]\n\
+         \x20 share list | share add --name NAME --path DIR [--recursive true|false]\n\
          \x20 intent show --id ID\n\
          \x20 push --share NAME [--peer KEY] [--path REL]\n\
          \x20 pull|request --share NAME --peer KEY [--path REL]\n\
@@ -141,7 +144,33 @@ pub fn parse_repl_to_request(line: &str) -> Result<ControlRequest> {
     match parts[0].as_str() {
         "status" | "ping" => Ok(ControlRequest::Status),
         "peers" => Ok(ControlRequest::Status), // status includes peer count; use Pending for lists via inbox-like
-        "shares" => Ok(ControlRequest::Status),
+        "shares" => Ok(ControlRequest::ShareList),
+        "share" => {
+            let sub = parts
+                .get(1)
+                .map(|s| s.as_str())
+                .ok_or_else(|| anyhow!("usage: share list | share add --name NAME --path DIR"))?;
+            match sub {
+                "list" | "ls" => Ok(ControlRequest::ShareList),
+                "add" => {
+                    let args = parse_flags(&parts[2..])?;
+                    let name = required(&args, "name")
+                        .or_else(|_| required(&args, "share"))?;
+                    let path = required(&args, "path")
+                        .or_else(|_| required(&args, "root"))?;
+                    let recursive = args
+                        .get("recursive")
+                        .map(|v| v != "false" && v != "0")
+                        .unwrap_or(true);
+                    Ok(ControlRequest::ShareAdd {
+                        name,
+                        path,
+                        recursive,
+                    })
+                }
+                other => Err(anyhow!("unknown share subcommand '{other}'")),
+            }
+        }
         "pending" | "pending_requests" => Ok(ControlRequest::PendingRequests),
         "intents" => {
             let args = parse_flags(&parts[1..])?;

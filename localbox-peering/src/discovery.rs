@@ -1,3 +1,4 @@
+use irontide_utp::UtpSocket;
 use models::{AppConfig, ShareContext, TransferProgressRegistry};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -23,6 +24,7 @@ pub fn spawn_discovery(
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
     progress: Arc<TransferProgressRegistry>,
+    utp: Option<UtpSocket>,
     token: CancellationToken,
 ) -> JoinHandle<()> {
     let net_tx = Arc::new(net_tx);
@@ -36,6 +38,7 @@ pub fn spawn_discovery(
         net,
         pending_files,
         progress,
+        utp,
         token,
     ))
 }
@@ -50,6 +53,7 @@ async fn discovery_loop(
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
     progress: Arc<TransferProgressRegistry>,
+    utp: Option<UtpSocket>,
     token: CancellationToken,
 ) {
     let addr: SocketAddr = format!("0.0.0.0:{}", cfg.discovery_port)
@@ -100,6 +104,7 @@ async fn discovery_loop(
                             net.clone(),
                             pending_files.clone(),
                             Arc::clone(&progress),
+                            utp.clone(),
                             token.clone(),
                         )
                         .await;
@@ -128,11 +133,12 @@ async fn discovery_broadcast_loop(
         }
         let share_names = local_share_names(&db, &cfg.pc_name).await;
         let msg = format!(
-            "DISCOVER v1 pc_name={} instance_id={} tls_port={} plain_port={} use_tls={} accepts_remote={} shares={}",
+            "DISCOVER v1 pc_name={} instance_id={} tls_port={} plain_port={} utp_port={} use_tls={} accepts_remote={} shares={}",
             cfg.pc_name,
             cfg.instance_id,
             cfg.listen_addr.port(),
             cfg.plain_listen_addr.port(),
+            cfg.utp_port,
             cfg.use_tls_for_peers,
             cfg.app_state.can_host_remote(),
             share_names.join(","),
@@ -161,6 +167,7 @@ async fn handle_discovery_message(
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
     progress: Arc<TransferProgressRegistry>,
+    utp: Option<UtpSocket>,
     token: CancellationToken,
 ) {
     let parsed = match parse_discovery_message(msg) {
@@ -177,6 +184,7 @@ async fn handle_discovery_message(
             instance_id,
             tls_port,
             plain_port,
+            utp_port,
             use_tls_for_peers,
             shares,
             accepts_remote_shares,
@@ -189,6 +197,7 @@ async fn handle_discovery_message(
                 &instance_id,
                 tls_port,
                 plain_port,
+                utp_port,
                 use_tls_for_peers,
                 shares,
                 accepts_remote_shares,
@@ -201,6 +210,7 @@ async fn handle_discovery_message(
                 net.clone(),
                 pending_files.clone(),
                 progress,
+                utp.clone(),
                 token.clone(),
             )
             .await;
@@ -210,6 +220,7 @@ async fn handle_discovery_message(
             instance_id,
             tls_port,
             plain_port,
+            utp_port,
             use_tls_for_peers,
             shares,
             accepts_remote_shares,
@@ -222,6 +233,7 @@ async fn handle_discovery_message(
                 &instance_id,
                 tls_port,
                 plain_port,
+                utp_port,
                 use_tls_for_peers,
                 shares,
                 accepts_remote_shares,
@@ -233,6 +245,7 @@ async fn handle_discovery_message(
                 net.clone(),
                 pending_files.clone(),
                 progress,
+                utp.clone(),
                 token.clone(),
             )
             .await;
@@ -248,6 +261,7 @@ async fn handle_discover(
     instance_id: &str,
     tls_port: u16,
     plain_port: u16,
+    utp_port: u16,
     prefer_tls: bool,
     shares: Vec<String>,
     accepts_remote_shares: bool,
@@ -260,6 +274,7 @@ async fn handle_discover(
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
     progress: Arc<TransferProgressRegistry>,
+    utp: Option<UtpSocket>,
     token: CancellationToken,
 ) {
     if is_self_peer(cfg, pc_name, instance_id) {
@@ -320,11 +335,12 @@ async fn handle_discover(
     }
 
     let reply = format!(
-        "HERE v1 pc_name={} instance_id={} tls_port={} plain_port={} use_tls={} accepts_remote={} shares={}",
+        "HERE v1 pc_name={} instance_id={} tls_port={} plain_port={} utp_port={} use_tls={} accepts_remote={} shares={}",
         cfg.pc_name,
         cfg.instance_id,
         cfg.listen_addr.port(),
         cfg.plain_listen_addr.port(),
+        cfg.utp_port,
         cfg.use_tls_for_peers,
         cfg.app_state.can_host_remote(),
         share_names.join(","),
@@ -333,9 +349,15 @@ async fn handle_discover(
         warn!("Failed to send HERE to {src}: {e}");
     }
 
+    let peer_utp_addr = if utp_port != 0 {
+        Some(SocketAddr::new(peer_ip, utp_port))
+    } else {
+        None
+    };
     spawn_connect_task(
         peer_tls_addr,
         peer_plain_addr,
+        peer_utp_addr,
         pc_name,
         cfg,
         db,
@@ -346,6 +368,7 @@ async fn handle_discover(
         net.clone(),
         pending_files,
         progress,
+        utp,
         token,
     );
 }
@@ -358,6 +381,7 @@ async fn handle_here(
     instance_id: &str,
     tls_port: u16,
     plain_port: u16,
+    utp_port: u16,
     prefer_tls: bool,
     shares: Vec<String>,
     accepts_remote_shares: bool,
@@ -369,6 +393,7 @@ async fn handle_here(
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
     progress: Arc<TransferProgressRegistry>,
+    utp: Option<UtpSocket>,
     token: CancellationToken,
 ) {
     if is_self_peer(cfg, pc_name, instance_id) {
@@ -432,9 +457,15 @@ async fn handle_here(
         }
     }
 
+    let peer_utp_addr = if utp_port != 0 {
+        Some(SocketAddr::new(peer_ip, utp_port))
+    } else {
+        None
+    };
     spawn_connect_task(
         peer_tls_addr,
         peer_plain_addr,
+        peer_utp_addr,
         pc_name,
         cfg,
         db,
@@ -445,13 +476,15 @@ async fn handle_here(
         net.clone(),
         pending_files,
         progress,
+        utp,
         token,
     );
 }
 
-fn spawn_connect_task(
+pub(crate) fn spawn_connect_task(
     peer_tls_addr: SocketAddr,
     peer_plain_addr: SocketAddr,
+    peer_utp_addr: Option<SocketAddr>,
     pc_name: &str,
     cfg: &AppConfig,
     db: &DbHandle,
@@ -462,6 +495,7 @@ fn spawn_connect_task(
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
     progress: Arc<TransferProgressRegistry>,
+    utp: Option<UtpSocket>,
     token: CancellationToken,
 ) {
     if cfg.is_peer_quarantined(pc_name) {
@@ -477,6 +511,7 @@ fn spawn_connect_task(
     tokio::spawn(run_connect_task(
         peer_tls_addr,
         peer_plain_addr,
+        peer_utp_addr,
         pc_name_connect,
         cfg_clone,
         db,
@@ -487,6 +522,7 @@ fn spawn_connect_task(
         net,
         pending_files,
         progress,
+        utp,
         token,
     ));
 }
@@ -494,6 +530,7 @@ fn spawn_connect_task(
 async fn run_connect_task(
     peer_tls_addr: SocketAddr,
     peer_plain_addr: SocketAddr,
+    peer_utp_addr: Option<SocketAddr>,
     pc_name: String,
     cfg: AppConfig,
     db: DbHandle,
@@ -504,6 +541,7 @@ async fn run_connect_task(
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
     progress: Arc<TransferProgressRegistry>,
+    utp: Option<UtpSocket>,
     token: CancellationToken,
 ) {
     tokio::select! {
@@ -513,6 +551,7 @@ async fn run_connect_task(
             connect_to_peer(
                 peer_tls_addr,
                 peer_plain_addr,
+                peer_utp_addr,
                 &pc_name,
                 &cfg,
                 &db,
@@ -522,6 +561,7 @@ async fn run_connect_task(
                 connector,
                 fs,
                 net,
+                utp,
                 progress,
             ).await
         } => {

@@ -2,7 +2,8 @@ use crate::engine::log_banner;
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use models::{
-    AppConfig, ApplicationState, ConflictPolicy, PeerPolicy, ShareConfig, TransferMode,
+    AppConfig, ApplicationState, BootstrapPeer, ConflictPolicy, PeerPolicy, ShareConfig,
+    TransferMode,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -15,6 +16,8 @@ const DEFAULT_INSTANCE_ID: &str = "instance-1";
 const DEFAULT_LISTEN_PORT: u16 = 5000;
 const DEFAULT_PLAIN_LISTEN_PORT: u16 = 5002;
 const DEFAULT_DISCOVERY_PORT: u16 = 5001;
+const DEFAULT_DHT_PORT: u16 = 5003;
+const DEFAULT_UTP_PORT: u16 = 5004;
 const DEFAULT_AGG_WINDOW_MS: u64 = 2000;
 const DEFAULT_DB_PATH: &str = "sync.db";
 const DEFAULT_LOG_PATH: &str = "sync.log";
@@ -690,6 +693,18 @@ pub struct RunArgs {
     #[arg(long)]
     pub discovery_port: Option<u16>,
 
+    /// UDP port for private BEP5 DHT
+    #[arg(long)]
+    pub dht_port: Option<u16>,
+
+    /// UDP port for uTP peer sessions
+    #[arg(long)]
+    pub utp_port: Option<u16>,
+
+    /// Enable private BEP5 DHT (implied when bootstrap_peers are configured)
+    #[arg(long)]
+    pub enable_dht: Option<bool>,
+
     /// Aggregation window in milliseconds
     #[arg(long)]
     pub aggregation_window_ms: Option<u64>,
@@ -822,6 +837,23 @@ impl Cli {
             .or_else(|| file_cfg.as_ref().and_then(|c| c.discovery_port))
             .unwrap_or(DEFAULT_DISCOVERY_PORT);
 
+        let dht_port = run
+            .dht_port
+            .or_else(|| file_cfg.as_ref().and_then(|c| c.dht_port))
+            .unwrap_or(DEFAULT_DHT_PORT);
+        let utp_port = run
+            .utp_port
+            .or_else(|| file_cfg.as_ref().and_then(|c| c.utp_port))
+            .unwrap_or(DEFAULT_UTP_PORT);
+        let bootstrap_peers = file_cfg
+            .as_ref()
+            .and_then(|c| c.bootstrap_peers.clone())
+            .unwrap_or_default();
+        let enable_dht = run
+            .enable_dht
+            .or_else(|| file_cfg.as_ref().and_then(|c| c.enable_dht))
+            .unwrap_or(!bootstrap_peers.is_empty());
+
         let aggregation_window_ms = run
             .aggregation_window_ms
             .or_else(|| file_cfg.as_ref().and_then(|c| c.aggregation_window_ms))
@@ -923,6 +955,10 @@ impl Cli {
             ),
             use_tls_for_peers,
             discovery_port,
+            dht_port,
+            utp_port,
+            enable_dht,
+            bootstrap_peers,
             aggregation_window_ms,
             db_path,
             log_path,
@@ -1178,6 +1214,11 @@ struct FileConfig {
     listen_port: Option<u16>,
     plain_listen_port: Option<u16>,
     discovery_port: Option<u16>,
+    dht_port: Option<u16>,
+    utp_port: Option<u16>,
+    enable_dht: Option<bool>,
+    #[serde(default)]
+    bootstrap_peers: Option<Vec<BootstrapPeer>>,
     aggregation_window_ms: Option<u64>,
     db_path: Option<PathBuf>,
     log_path: Option<PathBuf>,
@@ -1463,6 +1504,17 @@ instance_id = "{instance_id}"
 listen_port = {listen_port}
 plain_listen_port = {plain_listen_port}
 discovery_port = {discovery_port}
+dht_port = {dht_port}
+utp_port = {utp_port}
+# Private BEP5 DHT (irontide). Off unless enable_dht or bootstrap_peers is set.
+enable_dht = false
+
+# WAN bootstrap for the private DHT mesh (do not list public Mainline routers):
+# [[bootstrap_peers]]
+# addr = "bootstrap.example.com:5003"
+# session_addr = "bootstrap.example.com:5000"
+# pc_name = "home-server"
+
 aggregation_window_ms = {agg_ms}
 
 # Application state: mirror_only, host_only, mirrorhost, zombie
@@ -1536,6 +1588,8 @@ control_socket = "{control_socket}"
         listen_port = DEFAULT_LISTEN_PORT,
         plain_listen_port = DEFAULT_PLAIN_LISTEN_PORT,
         discovery_port = DEFAULT_DISCOVERY_PORT,
+        dht_port = DEFAULT_DHT_PORT,
+        utp_port = DEFAULT_UTP_PORT,
         agg_ms = DEFAULT_AGG_WINDOW_MS,
         db_path = DEFAULT_DB_PATH,
         log_path = DEFAULT_LOG_PATH,
@@ -1660,6 +1714,10 @@ mod tests {
             plain_listen_addr: "0.0.0.0:5002".parse().unwrap(),
             use_tls_for_peers: true,
             discovery_port: 5001,
+            dht_port: 5003,
+            utp_port: 5004,
+            enable_dht: false,
+            bootstrap_peers: Vec::new(),
             aggregation_window_ms: 10,
             db_path: PathBuf::from("db"),
             log_path: PathBuf::from("log"),
@@ -1701,6 +1759,10 @@ mod tests {
             plain_listen_addr: "0.0.0.0:5002".parse().unwrap(),
             use_tls_for_peers: true,
             discovery_port: 5001,
+            dht_port: 5003,
+            utp_port: 5004,
+            enable_dht: false,
+            bootstrap_peers: Vec::new(),
             aggregation_window_ms: 10,
             db_path: PathBuf::from("db"),
             log_path: PathBuf::from("log"),

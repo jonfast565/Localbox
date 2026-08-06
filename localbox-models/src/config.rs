@@ -26,6 +26,19 @@ pub enum ConflictPolicy {
     OwnerWins,
 }
 
+/// Seed node for the private BEP5 DHT mesh (and optional direct session dial).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BootstrapPeer {
+    /// DHT UDP endpoint as `host:port`.
+    pub addr: String,
+    /// Optional TCP/TLS session endpoint as `host:port` for an immediate dial.
+    #[serde(default)]
+    pub session_addr: Option<String>,
+    /// Optional peer name used for DHT lookup / dial ServerName.
+    #[serde(default)]
+    pub pc_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub pc_name: String,
@@ -37,6 +50,18 @@ pub struct AppConfig {
     #[serde(default = "default_use_tls_for_peers")]
     pub use_tls_for_peers: bool,
     pub discovery_port: u16,
+    /// UDP port for private BEP5 DHT (irontide). Default 5003.
+    #[serde(default = "default_dht_port")]
+    pub dht_port: u16,
+    /// UDP port for uTP peer sessions (irontide). Default 5004.
+    #[serde(default = "default_utp_port")]
+    pub utp_port: u16,
+    /// Run the private DHT node (also implied when `bootstrap_peers` is non-empty).
+    #[serde(default)]
+    pub enable_dht: bool,
+    /// Private-mesh DHT bootstrap peers (no public Mainline routers).
+    #[serde(default)]
+    pub bootstrap_peers: Vec<BootstrapPeer>,
     pub aggregation_window_ms: u64,
     pub db_path: PathBuf,
     pub log_path: PathBuf,
@@ -150,6 +175,11 @@ pub struct PeerPolicy {
 }
 
 impl AppConfig {
+    /// Whether the private BEP5 DHT should run.
+    pub fn wan_discovery_enabled(&self) -> bool {
+        self.enable_dht || !self.bootstrap_peers.is_empty()
+    }
+
     /// Whether journal sync (SyncCatchup) runs automatically for this share/peer.
     /// Does not gate manual `IntentKind::SnapshotPush`.
     pub fn resolve_sync_mode(&self, share_name: &str, peer_key: Option<&str>) -> TransferMode {
@@ -384,6 +414,33 @@ impl Default for ApplicationState {
 
 fn default_use_tls_for_peers() -> bool {
     true
+}
+
+fn default_dht_port() -> u16 {
+    5003
+}
+
+fn default_utp_port() -> u16 {
+    5004
+}
+
+/// Infohash for announcing/looking up a Localbox peer on the private DHT.
+pub fn peer_dht_infohash(pc_name: &str) -> [u8; 20] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("localbox-peer-v1:{pc_name}").as_bytes());
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&digest[..20]);
+    out
+}
+
+/// Deterministic ed25519 seed for BEP44 mutable endpoint records (location only;
+/// session trust remains mTLS).
+pub fn peer_dht_mutable_seed(pc_name: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("localbox-dht-seed-v1:{pc_name}").as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 fn default_app_state() -> ApplicationState {

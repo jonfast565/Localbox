@@ -32,8 +32,8 @@ pub use chat::{
     ChatMessageRecord, ThreadKind, ThreadSummary,
 };
 pub use config::{
-    peer_keys_match, AppConfig, ApplicationState, ConflictPolicy, PeerPolicy, ShareConfig,
-    TransferMode,
+    peer_dht_infohash, peer_dht_mutable_seed, peer_keys_match, AppConfig, ApplicationState,
+    BootstrapPeer, ConflictPolicy, PeerPolicy, ShareConfig, TransferMode,
 };
 pub use intent::{
     IntentBasis, IntentKind, IntentOrigin, IntentStatus, TransferIntent,

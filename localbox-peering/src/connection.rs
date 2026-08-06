@@ -6,10 +6,11 @@ use models::{
     TransferProgressRegistry, TransferReply, TransferReplyStatus, TransferRequest, WireMessage,
 };
 use uuid::Uuid;
+use irontide_utp::UtpSocket;
 use rustls::ServerName;
 use std::collections::HashSet;
 use std::io::ErrorKind;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -137,9 +138,17 @@ pub async fn handle_plain_connection(
     Ok(())
 }
 
+fn is_likely_lan(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
 pub async fn connect_to_peer(
     peer_tls_addr: SocketAddr,
     peer_plain_addr: SocketAddr,
+    peer_utp_addr: Option<SocketAddr>,
     server_name: &str,
     cfg: &AppConfig,
     db: &DbHandle,
@@ -149,6 +158,7 @@ pub async fn connect_to_peer(
     connector: TlsConnector,
     fs: Arc<dyn FileSystem>,
     net: Arc<dyn Net>,
+    utp: Option<UtpSocket>,
     progress: Arc<TransferProgressRegistry>,
 ) -> Result<()> {
     let use_tls = if cfg.use_tls_for_peers && peer_tls_addr.port() != 0 {
@@ -167,6 +177,40 @@ pub async fn connect_to_peer(
         peer_tls_addr
     };
 
+    let prefer_utp = peer_utp_addr
+        .map(|a| !is_likely_lan(a.ip()))
+        .unwrap_or(false)
+        && utp.is_some()
+        && use_tls;
+
+    if prefer_utp {
+        if let (Some(utp_sock), Some(utp_addr)) = (utp.as_ref(), peer_utp_addr) {
+            match connect_tls_over_utp(
+                utp_sock,
+                utp_addr,
+                server_name,
+                cfg,
+                db,
+                share_names,
+                connections.clone(),
+                pending_files.clone(),
+                connector.clone(),
+                fs.clone(),
+                Arc::clone(&progress),
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!(
+                        "uTP dial to {} failed ({e:#}); falling back to TCP",
+                        utp_addr
+                    );
+                }
+            }
+        }
+    }
+
     if !use_tls {
         warn!(
             "Connecting to peer {} at {} without TLS",
@@ -174,7 +218,32 @@ pub async fn connect_to_peer(
         );
     }
 
-    let tcp = net.connect_tcp(target_addr).await?;
+    let tcp = match net.connect_tcp(target_addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            // Coordinated dial: try uTP when TCP fails (typical WAN / NAT case).
+            if use_tls {
+                if let (Some(utp_sock), Some(utp_addr)) = (utp.as_ref(), peer_utp_addr) {
+                    return connect_tls_over_utp(
+                        utp_sock,
+                        utp_addr,
+                        server_name,
+                        cfg,
+                        db,
+                        share_names,
+                        connections,
+                        pending_files,
+                        connector,
+                        fs,
+                        progress,
+                    )
+                    .await
+                    .with_context(|| format!("TCP to {target_addr} failed ({e}); uTP also failed"));
+                }
+            }
+            return Err(e.into());
+        }
+    };
     if use_tls {
         let name = ServerName::try_from(server_name)
             .or_else(|_| ServerName::try_from(target_addr.ip().to_string().as_str()))
@@ -269,6 +338,67 @@ pub async fn connect_to_peer(
     Ok(())
 }
 
+async fn connect_tls_over_utp(
+    utp: &UtpSocket,
+    utp_addr: SocketAddr,
+    server_name: &str,
+    cfg: &AppConfig,
+    db: &DbHandle,
+    share_names: &[String],
+    connections: SharedWriters,
+    pending_files: PendingFiles,
+    connector: TlsConnector,
+    fs: Arc<dyn FileSystem>,
+    progress: Arc<TransferProgressRegistry>,
+) -> Result<()> {
+    let stream = utp.connect(utp_addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let stream: DynStream = Box::new(stream);
+    let name = ServerName::try_from(server_name)
+        .or_else(|_| ServerName::try_from(utp_addr.ip().to_string().as_str()))
+        .context("server name for TLS")?;
+    let mut tls_stream = connector.connect(name, stream).await?;
+    let peer_certs: Option<Vec<_>> = tls_stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .map(|chain| chain.to_vec());
+    let peer_fp = fingerprint_from_certificates(peer_certs.as_deref());
+    let (remote, peer_id) = perform_handshake(
+        &mut tls_stream,
+        cfg,
+        db,
+        share_names,
+        utp_addr,
+        fs.clone(),
+    )
+    .await?;
+    refuse_if_quarantined(cfg, db, &remote).await?;
+    check_peer_identity(cfg, db, peer_id, &remote.pc_name, peer_certs.as_deref()).await?;
+    ensure_peer_fingerprint(cfg, &remote.pc_name, peer_fp.as_deref())?;
+    let (reader, writer) = split(tls_stream);
+    {
+        let mut guard = connections.lock().await;
+        guard.push((
+            peer_id,
+            Arc::new(AsyncMutex::new(PeerWriter::Client(writer))),
+        ));
+    }
+    maybe_auto_pull(cfg, db, &connections, peer_id, &remote).await;
+    let _reader_task = spawn_incoming_reader(
+        reader,
+        cfg.clone(),
+        db.clone(),
+        remote,
+        peer_id,
+        connections,
+        pending_files,
+        fs,
+        progress,
+    );
+    info!("Established outbound TLS-over-uTP to {}", utp_addr);
+    Ok(())
+}
+
 async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     cfg: &AppConfig,
@@ -284,6 +414,7 @@ async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         listen_port: cfg.listen_addr.port(),
         plain_port: cfg.plain_listen_addr.port(),
         use_tls_for_peers: cfg.use_tls_for_peers,
+        utp_port: cfg.utp_port,
         shares: share_names.to_vec(),
         accepts_remote_shares: cfg.app_state.can_host_remote(),
     };

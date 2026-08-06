@@ -70,6 +70,7 @@ mod tests {
             listen_port: 5000,
             plain_port: 0,
             use_tls_for_peers: true,
+            utp_port: 5004,
             shares: vec!["shareA".to_string()],
             accepts_remote_shares: true,
         });

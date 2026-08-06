@@ -22,6 +22,7 @@ pub enum DiscoveryMessage {
         instance_id: String,
         tls_port: u16,
         plain_port: u16,
+        utp_port: u16,
         use_tls_for_peers: bool,
         shares: Vec<String>,
         accepts_remote_shares: bool,
@@ -31,6 +32,7 @@ pub enum DiscoveryMessage {
         instance_id: String,
         tls_port: u16,
         plain_port: u16,
+        utp_port: u16,
         use_tls_for_peers: bool,
         shares: Vec<String>,
         accepts_remote_shares: bool,
@@ -49,6 +51,10 @@ pub fn parse_discovery_message(msg: &str) -> Option<DiscoveryMessage> {
                 .unwrap_or(0);
             let plain_port = kv
                 .get("plain_port")
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(0);
+            let utp_port = kv
+                .get("utp_port")
                 .and_then(|p| p.parse::<u16>().ok())
                 .unwrap_or(0);
             let use_tls_for_peers = kv
@@ -70,6 +76,7 @@ pub fn parse_discovery_message(msg: &str) -> Option<DiscoveryMessage> {
                 instance_id,
                 tls_port,
                 plain_port,
+                utp_port,
                 use_tls_for_peers,
                 shares,
                 accepts_remote_shares,
@@ -86,6 +93,10 @@ pub fn parse_discovery_message(msg: &str) -> Option<DiscoveryMessage> {
                 .unwrap_or(0);
             let plain_port = kv
                 .get("plain_port")
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(0);
+            let utp_port = kv
+                .get("utp_port")
                 .and_then(|p| p.parse::<u16>().ok())
                 .unwrap_or(0);
             let use_tls_for_peers = kv
@@ -107,6 +118,7 @@ pub fn parse_discovery_message(msg: &str) -> Option<DiscoveryMessage> {
                 instance_id,
                 tls_port,
                 plain_port,
+                utp_port,
                 use_tls_for_peers,
                 shares,
                 accepts_remote_shares,
@@ -250,6 +262,7 @@ pub fn decode_wire_message_proto(bytes: &[u8]) -> Result<WireMessage> {
                 // Default to true if sender never set the field (http_port=0 is a hint).
                 h.plain_port == 0
             },
+            utp_port: 0,
             shares: h.shares,
             accepts_remote_shares: !h.decline_remote_shares,
         })),

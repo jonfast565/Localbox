@@ -43,6 +43,7 @@ fn serde_round_trip_includes_protocol_version() {
         listen_port: 1,
         plain_port: 0,
         use_tls_for_peers: true,
+        utp_port: 0,
         shares: vec!["s".to_string()],
         accepts_remote_shares: true,
     });

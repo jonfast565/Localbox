@@ -19,6 +19,7 @@ fn parse_discovery_messages() {
             instance_id: "i1".to_string(),
             tls_port: 5000,
             plain_port: 0,
+            utp_port: 0,
             use_tls_for_peers: true,
             shares: vec!["a".to_string(), "b".to_string(), "c".to_string()],
             accepts_remote_shares: true,
@@ -34,6 +35,7 @@ fn parse_discovery_messages() {
             instance_id: "i2".to_string(),
             tls_port: 6000,
             plain_port: 0,
+            utp_port: 0,
             use_tls_for_peers: true,
             shares: vec![],
             accepts_remote_shares: true,
@@ -52,6 +54,7 @@ fn wire_message_json_parse_round_trip() {
         listen_port: 1,
         plain_port: 2,
         use_tls_for_peers: true,
+        utp_port: 0,
         shares: vec!["s".to_string()],
         accepts_remote_shares: true,
     });
@@ -107,6 +110,7 @@ fn proto_wire_message_round_trip() {
         listen_port: 5000,
         plain_port: 4000,
         use_tls_for_peers: false,
+        utp_port: 0,
         shares: vec!["a".to_string()],
         accepts_remote_shares: true,
     });

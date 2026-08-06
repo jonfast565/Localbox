@@ -31,6 +31,7 @@ fn wire_message_json_round_trip() {
         listen_port: 5000,
         plain_port: 5002,
         use_tls_for_peers: true,
+        utp_port: 5004,
         shares: vec!["shareA".to_string(), "shareB".to_string()],
         accepts_remote_shares: true,
     });
@@ -64,6 +65,10 @@ fn app_config_json_round_trip() {
         plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5002),
         use_tls_for_peers: true,
         discovery_port: 5001,
+        dht_port: 5003,
+        utp_port: 5004,
+        enable_dht: false,
+        bootstrap_peers: Vec::new(),
         aggregation_window_ms: 200,
         db_path: PathBuf::from("db.sqlite"),
         log_path: PathBuf::from("app.log"),

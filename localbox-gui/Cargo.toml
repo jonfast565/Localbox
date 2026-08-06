@@ -2,6 +2,7 @@
 name = "localbox-gui"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 authors = ["jfast"]
 description = "Iced desktop GUI for Localbox control plane"
 

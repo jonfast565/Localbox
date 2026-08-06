@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use db::{Db, ShareRow};
+use irontide_utp::{UtpConfig, UtpListener, UtpSocket};
 use models::{AppConfig, ShareContext, ShareId, TransferProgressRegistry, WireMessage};
 use time::OffsetDateTime;
 use tls::ManagedTls;
@@ -9,16 +10,100 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::{self, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use utilities::{FileSystem, Net, SyncWrite};
+use utilities::{DynStream, FileSystem, Net, SyncWrite};
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+async fn bind_utp_endpoint(
+    utp_port: u16,
+) -> Result<(Option<UtpSocket>, Option<UtpListener>)> {
+    if utp_port == 0 {
+        return Ok((None, None));
+    }
+    let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), utp_port);
+    let (sock, listener) = UtpSocket::bind(UtpConfig {
+        bind_addr,
+        ..UtpConfig::default()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("utp bind: {e}"))?;
+    info!("uTP listening on {}", bind_addr);
+    Ok((Some(sock), Some(listener)))
+}
+
+fn spawn_utp_listener(
+    listener: Option<UtpListener>,
+    cfg: AppConfig,
+    db: DbHandle,
+    connections: SharedWriters,
+    pending_files: PendingFiles,
+    tls: Arc<ManagedTls>,
+    fs: Arc<dyn FileSystem>,
+    net: Arc<dyn Net>,
+    progress: Arc<TransferProgressRegistry>,
+    token: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(mut listener) = listener else {
+            return;
+        };
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                res = listener.accept() => {
+                    match res {
+                        Ok((stream, addr)) => {
+                            info!("Incoming uTP connection from {addr}");
+                            let db = Arc::clone(&db);
+                            let cfg = cfg.clone();
+                            let share_names = local_share_names(&db, &cfg.pc_name).await;
+                            let connections = connections.clone();
+                            let pending_files = pending_files.clone();
+                            let tls = tls.clone();
+                            let fs = fs.clone();
+                            let net = net.clone();
+                            let progress = Arc::clone(&progress);
+                            tokio::spawn(async move {
+                                let tls_acceptor = tls.acceptor().await;
+                                let dyn_stream: DynStream = Box::new(stream);
+                                if let Err(e) = connection::handle_tls_connection(
+                                    dyn_stream,
+                                    &cfg,
+                                    &db,
+                                    &share_names,
+                                    addr,
+                                    connections,
+                                    pending_files,
+                                    tls_acceptor,
+                                    fs,
+                                    net,
+                                    progress,
+                                )
+                                .await
+                                {
+                                    error!("uTP connection error from {addr}: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("uTP accept error: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
 mod commands;
 mod connection;
+mod dht;
 mod discovery;
 mod writer;
 
@@ -124,6 +209,14 @@ impl PeerManager {
         let tls = self.tls.clone();
         let tls_watch = tls.clone().spawn_watcher(token.clone());
 
+        let (utp_socket, utp_listener) = match bind_utp_endpoint(self.cfg.utp_port).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!("uTP bind failed on port {}: {e:#}", self.cfg.utp_port);
+                (None, None)
+            }
+        };
+
         let discovery = discovery::spawn_discovery(
             self.cfg.clone(),
             Arc::clone(&self.db),
@@ -134,6 +227,7 @@ impl PeerManager {
             self.net.clone(),
             pending_files.clone(),
             Arc::clone(&self.progress),
+            utp_socket.clone(),
             token.clone(),
         );
         let listener = self.spawn_tcp_listener(
@@ -149,6 +243,34 @@ impl PeerManager {
             Arc::clone(&self.progress),
             token.clone(),
         );
+        let utp_accept = spawn_utp_listener(
+            utp_listener,
+            self.cfg.clone(),
+            Arc::clone(&self.db),
+            connections.clone(),
+            pending_files.clone(),
+            tls.clone(),
+            self.fs.clone(),
+            self.net.clone(),
+            Arc::clone(&self.progress),
+            token.clone(),
+        );
+        let dht_task = if self.cfg.wan_discovery_enabled() {
+            dht::spawn_dht(
+                self.cfg.clone(),
+                Arc::clone(&self.db),
+                tls.clone(),
+                connections.clone(),
+                self.fs.clone(),
+                self.net.clone(),
+                pending_files.clone(),
+                Arc::clone(&self.progress),
+                utp_socket.clone(),
+                token.clone(),
+            )
+        } else {
+            tokio::spawn(async {})
+        };
         let sender = self.spawn_outbox_worker(
             connections.clone(),
             self.fs.clone(),
@@ -179,8 +301,20 @@ impl PeerManager {
                 info!("PeerManager cancellation requested");
             }
             _ = async {
-                let _ = tokio::join!(discovery, listener, plain_listener, sender, tls_watch, cmd_loop);
+                let _ = tokio::join!(
+                    discovery,
+                    listener,
+                    plain_listener,
+                    utp_accept,
+                    dht_task,
+                    sender,
+                    tls_watch,
+                    cmd_loop
+                );
             } => {}
+        }
+        if let Some(sock) = utp_socket {
+            let _ = sock.shutdown().await;
         }
         Ok(())
     }

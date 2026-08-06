@@ -20,6 +20,9 @@ pub struct HelloMessage {
     /// Whether the sender prefers TLS when connecting to peers.
     #[serde(default = "default_use_tls_for_peers")]
     pub use_tls_for_peers: bool,
+    /// uTP listen port (0 = not advertised / unknown).
+    #[serde(default)]
+    pub utp_port: u16,
     pub shares: Vec<String>,
     #[serde(default = "default_accepts_remote_shares")]
     pub accepts_remote_shares: bool,

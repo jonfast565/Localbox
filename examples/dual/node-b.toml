@@ -1,0 +1,34 @@
+# Same-host dual-instance test node B.
+# Pair with examples/dual/node-a.toml — see README "Run two nodes" / GUI dual recipe.
+
+pc_name = "bob"
+instance_id = "node-b"
+display_name = "Bob (local test)"
+
+listen_port = 6000
+plain_listen_port = 6002
+discovery_port = 6001
+# Fan out so node-a (bound on 5001) receives DISCOVER packets.
+discovery_send_ports = [5001, 6001]
+
+enable_dht = false
+enable_utp = false
+
+app_state = "mirrorhost"
+# Plaintext keeps local dual testing free of invite/CA bootstrap.
+use_tls_for_peers = false
+request_handling = "manual"
+
+db_path = "examples/dual/data/node-b.db"
+log_path = "examples/dual/data/node-b.log"
+control_socket = "examples/dual/data/node-b.sock"
+remote_share_root = "examples/dual/data/remote-b"
+
+tls_cert_path = "certs/localbox.cert.pem"
+tls_key_path = "certs/localbox.key.pem"
+tls_ca_cert_path = "certs/ca.cert.pem"
+
+[[shares]]
+name = "docs"
+root_path = "examples/dual/data/docs-b"
+recursive = true

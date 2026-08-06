@@ -729,6 +729,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub discovery_port: Option<u16>,
 
+    /// Node name override (defaults to hostname)
+    #[arg(long)]
+    pub pc_name: Option<String>,
+
     /// UDP port for private BEP5 DHT
     #[arg(long)]
     pub dht_port: Option<u16>,
@@ -861,10 +865,17 @@ impl Cli {
         };
         let run = overrides.or(cli_run).unwrap_or(&default_run);
 
-        let pc_name = hostname::get()
-            .unwrap_or_else(|_| "unknown-pc".into())
-            .to_string_lossy()
-            .into_owned();
+        let pc_name = run
+            .pc_name
+            .clone()
+            .or_else(|| file_cfg.as_ref().and_then(|c| c.pc_name.clone()))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                hostname::get()
+                    .unwrap_or_else(|_| "unknown-pc".into())
+                    .to_string_lossy()
+                    .into_owned()
+            });
 
         let instance_id = run
             .instance_id
@@ -890,6 +901,10 @@ impl Cli {
             .discovery_port
             .or_else(|| file_cfg.as_ref().and_then(|c| c.discovery_port))
             .unwrap_or(DEFAULT_DISCOVERY_PORT);
+        let discovery_send_ports = file_cfg
+            .as_ref()
+            .and_then(|c| c.discovery_send_ports.clone())
+            .unwrap_or_default();
 
         let dht_port = run
             .dht_port
@@ -1014,6 +1029,7 @@ impl Cli {
             ),
             use_tls_for_peers,
             discovery_port,
+            discovery_send_ports,
             dht_port,
             utp_port,
             enable_dht,
@@ -1063,6 +1079,8 @@ fn cli_overrides_key(run: &RunArgs, key: &str) -> bool {
         "listen_port" => run.listen_port.is_some(),
         "plain_listen_port" => run.plain_listen_port.is_some(),
         "discovery_port" => run.discovery_port.is_some(),
+        "pc_name" => run.pc_name.is_some(),
+        "discovery_send_ports" => false,
         "dht_port" => run.dht_port.is_some(),
         "utp_port" => run.utp_port.is_some(),
         "enable_dht" => run.enable_dht.is_some(),
@@ -1319,12 +1337,17 @@ fn parse_share_arg(raw: &str) -> Result<ShareCli, String> {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
+    /// Optional override for the node name (defaults to hostname).
+    pc_name: Option<String>,
     instance_id: Option<String>,
     /// Optional human-facing label advertised to peers.
     display_name: Option<String>,
     listen_port: Option<u16>,
     plain_listen_port: Option<u16>,
     discovery_port: Option<u16>,
+    /// Extra discovery UDP ports to fan out DISCOVER packets to.
+    #[serde(default)]
+    discovery_send_ports: Option<Vec<u16>>,
     dht_port: Option<u16>,
     utp_port: Option<u16>,
     enable_dht: Option<bool>,
@@ -1610,7 +1633,8 @@ fn default_config_template() -> String {
         r#"# Localbox configuration (TOML)
 #
 # This file is intentionally checked into .gitignore.
-# `pc_name` is derived from your hostname at runtime.
+# `pc_name` defaults to your hostname; override for dual local instances.
+# pc_name = "alice"
 
 instance_id = "{instance_id}"
 # Optional label advertised to peers (defaults to hostname / pc_name).
@@ -1618,6 +1642,8 @@ instance_id = "{instance_id}"
 listen_port = {listen_port}
 plain_listen_port = {plain_listen_port}
 discovery_port = {discovery_port}
+# Extra ports to fan out DISCOVER packets to (same-host dual instances).
+# discovery_send_ports = [5001, 6001]
 # LAN UDP discovery (discovery_port) always runs.
 # Optional WAN stack — both default off; enable independently as needed.
 dht_port = {dht_port}
@@ -1832,6 +1858,7 @@ mod tests {
             plain_listen_addr: "0.0.0.0:5002".parse().unwrap(),
             use_tls_for_peers: true,
             discovery_port: 5001,
+        discovery_send_ports: Vec::new(),
             dht_port: 5003,
             utp_port: 5004,
             enable_dht: false,
@@ -1879,6 +1906,7 @@ mod tests {
             plain_listen_addr: "0.0.0.0:5002".parse().unwrap(),
             use_tls_for_peers: true,
             discovery_port: 5001,
+        discovery_send_ports: Vec::new(),
             dht_port: 5003,
             utp_port: 5004,
             enable_dht: false,

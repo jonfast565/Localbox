@@ -367,6 +367,7 @@ fn test_config(
         plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port + 1000),
         use_tls_for_peers: true,
         discovery_port,
+        discovery_send_ports: Vec::new(),
         dht_port: 5003,
         utp_port: 5004,
         enable_dht: false,

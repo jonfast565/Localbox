@@ -18,6 +18,7 @@ fn test_config(pc_name: &str, share_name: &str) -> AppConfig {
         plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         use_tls_for_peers: true,
         discovery_port: 0,
+        discovery_send_ports: Vec::new(),
             dht_port: 5003,
             utp_port: 5004,
             enable_dht: false,

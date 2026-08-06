@@ -12,11 +12,13 @@ use std::path::PathBuf;
 
 /// Keys that may be stored in the DB `settings` table / set via control plane.
 pub const SETTABLE_KEYS: &[&str] = &[
+    "pc_name",
     "instance_id",
     "display_name",
     "listen_port",
     "plain_listen_port",
     "discovery_port",
+    "discovery_send_ports",
     "dht_port",
     "utp_port",
     "enable_dht",
@@ -43,10 +45,12 @@ pub const SETTABLE_KEYS: &[&str] = &[
 pub fn requires_restart(key: &str) -> bool {
     matches!(
         key,
-        "instance_id"
+        "pc_name"
+            | "instance_id"
             | "listen_port"
             | "plain_listen_port"
             | "discovery_port"
+            | "discovery_send_ports"
             | "dht_port"
             | "utp_port"
             | "enable_dht"
@@ -90,6 +94,7 @@ pub fn apply_setting(cfg: &mut AppConfig, key: &str, value: &Value) -> Result<()
         bail!("unknown or unsettable setting key '{key}'");
     }
     match key {
+        "pc_name" => cfg.pc_name = json_string(value, key)?,
         "instance_id" => cfg.instance_id = json_string(value, key)?,
         "display_name" => cfg.display_name = json_string(value, key)?,
         "listen_port" => {
@@ -101,6 +106,10 @@ pub fn apply_setting(cfg: &mut AppConfig, key: &str, value: &Value) -> Result<()
             cfg.plain_listen_addr = SocketAddr::new(cfg.plain_listen_addr.ip(), port);
         }
         "discovery_port" => cfg.discovery_port = json_u16(value, key)?,
+        "discovery_send_ports" => {
+            cfg.discovery_send_ports = serde_json::from_value(value.clone())
+                .map_err(|e| anyhow!("{key}: {e}"))?;
+        }
         "dht_port" => cfg.dht_port = json_u16(value, key)?,
         "utp_port" => cfg.utp_port = json_u16(value, key)?,
         "enable_dht" => cfg.enable_dht = json_bool(value, key)?,
@@ -157,11 +166,13 @@ pub fn read_setting(cfg: &AppConfig, key: &str) -> Result<Value> {
         bail!("unknown or unsettable setting key '{key}'");
     }
     let v = match key {
+        "pc_name" => Value::String(cfg.pc_name.clone()),
         "instance_id" => Value::String(cfg.instance_id.clone()),
         "display_name" => Value::String(cfg.display_name.clone()),
         "listen_port" => Value::from(cfg.listen_addr.port()),
         "plain_listen_port" => Value::from(cfg.plain_listen_addr.port()),
         "discovery_port" => Value::from(cfg.discovery_port),
+        "discovery_send_ports" => serde_json::to_value(&cfg.discovery_send_ports)?,
         "dht_port" => Value::from(cfg.dht_port),
         "utp_port" => Value::from(cfg.utp_port),
         "enable_dht" => Value::Bool(cfg.enable_dht),
@@ -356,6 +367,7 @@ mod tests {
             plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5002),
             use_tls_for_peers: true,
             discovery_port: 5001,
+        discovery_send_ports: Vec::new(),
             dht_port: 5003,
             utp_port: 5004,
             enable_dht: false,

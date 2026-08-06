@@ -145,12 +145,16 @@ async fn discovery_broadcast_loop(
             cfg.app_state.can_host_remote(),
             encode_discovery_shares(&shares),
         );
-        let broadcast_addr = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
-            cfg.discovery_port,
-        );
-        if let Err(e) = socket.send_to(msg.as_bytes(), &broadcast_addr).await {
-            warn!("Failed to send DISCOVER: {e}");
+        for port in cfg.discovery_fanout_ports() {
+            let broadcast_addr =
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)), port);
+            if let Err(e) = socket.send_to(msg.as_bytes(), &broadcast_addr).await {
+                warn!("Failed to send DISCOVER to {broadcast_addr}: {e}");
+            }
+            let loopback_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+            if let Err(e) = socket.send_to(msg.as_bytes(), &loopback_addr).await {
+                warn!("Failed to send DISCOVER to {loopback_addr}: {e}");
+            }
         }
     }
 }
@@ -642,10 +646,8 @@ async fn upsert_peer_with_state(
     }
 }
 
-fn is_self_peer(cfg: &AppConfig, pc_name: &str, _instance_id: &str) -> bool {
-    // Treat any peer reporting the same PC name as self to avoid two local
-    // instances chatting with each other.
-    pc_name == cfg.pc_name
+fn is_self_peer(cfg: &AppConfig, pc_name: &str, instance_id: &str) -> bool {
+    pc_name == cfg.pc_name && instance_id == cfg.instance_id
 }
 
 async fn maybe_enqueue_auto_sync(

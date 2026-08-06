@@ -280,6 +280,8 @@ pub struct App {
     status_panes: pane_grid::State<StatusPane>,
     transfers_panes: pane_grid::State<TransfersPane>,
     split_prefs_dirty: bool,
+    /// When true, load errors from periodic polls do not spam the flash banner.
+    background_refresh: bool,
 }
 
 impl App {
@@ -295,7 +297,7 @@ impl App {
                 None => ("stopped".into(), false),
             }
         };
-        let prefs_path = prefs::default_prefs_path();
+        let prefs_path = prefs::prefs_path_for_socket(&socket);
         let prefs = GuiPrefs::load(&prefs_path);
         let log_tail_lines = GuiPrefs::clamp_log_tail_lines(prefs.log_tail_lines);
         let chat_split_ratio = GuiPrefs::clamp_split_ratio(prefs.chat_split_ratio);
@@ -360,6 +362,7 @@ impl App {
                 TransfersPane::Intents,
             ),
             split_prefs_dirty: false,
+            background_refresh: false,
         };
         (app, Task::done(Message::Refresh))
     }
@@ -372,9 +375,13 @@ impl App {
         match message {
             Message::Tab(t) => {
                 self.tab = t;
+                self.background_refresh = false;
                 Task::done(Message::Refresh)
             }
-            Message::Refresh => self.refresh_tasks(),
+            Message::Refresh => {
+                self.background_refresh = false;
+                self.refresh_tasks()
+            }
             Message::StatusLoaded(res) => {
                 self.apply_result(res, |app, resp| {
                     app.status = parse_status(&resp);
@@ -425,17 +432,21 @@ impl App {
                             && resp.message.contains("logs") =>
                     {
                         self.connected = true;
-                        self.flash = Some((
-                            false,
-                            "Runtime is too old for Logs — Stop, then Start (or restart `localbox run`) to load the new binary.".into(),
-                        ));
+                        if !self.background_refresh {
+                            self.flash = Some((
+                                false,
+                                "Runtime is too old for Logs — Stop, then Start (or restart `localbox run`) to load the new binary.".into(),
+                            ));
+                        }
                         return Task::none();
                     }
                     Err(e) if e.contains("unknown variant") && e.contains("logs") => {
-                        self.flash = Some((
-                            false,
-                            "Runtime is too old for Logs — Stop, then Start (or restart `localbox run`) to load the new binary.".into(),
-                        ));
+                        if !self.background_refresh {
+                            self.flash = Some((
+                                false,
+                                "Runtime is too old for Logs — Stop, then Start (or restart `localbox run`) to load the new binary.".into(),
+                            ));
+                        }
                         return Task::none();
                     }
                     _ => {}
@@ -819,10 +830,13 @@ impl App {
                         self.split_prefs_dirty = false;
                     }
                 }
-                if self.tab == Tab::Logs && self.connected {
-                    Task::done(Message::Refresh)
-                } else {
+                // Keep live tabs fresh (peers, transfers, chat, logs). Skip Settings
+                // so editing config fields is not disrupted by list reloads.
+                if self.runtime_busy || matches!(self.tab, Tab::Settings) {
                     Task::none()
+                } else {
+                    self.background_refresh = true;
+                    self.refresh_tasks()
                 }
             }
             Message::SyncSystemTheme => {
@@ -892,6 +906,7 @@ impl App {
             Tab::Transfers => {
                 let sock2 = self.socket.clone();
                 let sock3 = self.socket.clone();
+                let sock4 = self.socket.clone();
                 Task::batch([
                     Task::perform(
                         async move {
@@ -923,19 +938,47 @@ impl App {
                         },
                         Message::StatusLoaded,
                     ),
+                    Task::perform(
+                        async move {
+                            client::send_request(&sock4, &ControlRequest::PeerList)
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::PeersLoaded,
+                    ),
                 ])
             }
             Tab::Chat => {
                 let sock2 = self.socket.clone();
+                let sock3 = self.socket.clone();
+                let sock4 = self.socket.clone();
                 let thread = self.selected_thread.clone();
-                let mut tasks = vec![Task::perform(
-                    async move {
-                        client::send_request(&sock, &ControlRequest::ChatInbox)
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    Message::InboxLoaded,
-                )];
+                let mut tasks = vec![
+                    Task::perform(
+                        async move {
+                            client::send_request(&sock, &ControlRequest::ChatInbox)
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::InboxLoaded,
+                    ),
+                    Task::perform(
+                        async move {
+                            client::send_request(&sock3, &ControlRequest::PeerList)
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::PeersLoaded,
+                    ),
+                    Task::perform(
+                        async move {
+                            client::send_request(&sock4, &ControlRequest::ShareList)
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        Message::SharesLoaded,
+                    ),
+                ];
                 if let Some(tid) = thread {
                     tasks.push(Task::perform(
                         async move {
@@ -993,18 +1036,22 @@ impl App {
         res: Result<ControlResponse, String>,
         on_ok: impl FnOnce(&mut Self, ControlResponse),
     ) {
+        let quiet = self.background_refresh;
         match res {
             Ok(resp) => {
                 self.connected = true;
                 if resp.ok {
                     on_ok(self, resp);
-                } else {
+                } else if !quiet {
                     self.flash = Some((false, resp.message));
                 }
             }
             Err(e) => {
+                let was_connected = self.connected;
                 self.connected = false;
-                self.flash = Some((false, disconnect_message(&e, self.managed_runtime)));
+                if !quiet || was_connected {
+                    self.flash = Some((false, disconnect_message(&e, self.managed_runtime)));
+                }
             }
         }
     }

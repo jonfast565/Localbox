@@ -98,3 +98,41 @@ impl GuiPrefs {
 pub fn default_prefs_path() -> PathBuf {
     PathBuf::from("localbox-gui.toml")
 }
+
+/// Per-instance prefs file derived from the control socket stem.
+///
+/// `localbox.sock` / `\\.\pipe\localbox` → `localbox-gui.toml`
+/// `node-a.sock` → `localbox-gui-node-a.toml`
+pub fn prefs_path_for_socket(socket: &Path) -> PathBuf {
+    let stem = socket
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("localbox");
+    let stem = stem.strip_suffix(".sock").unwrap_or(stem);
+    if stem == "localbox" || stem.is_empty() {
+        default_prefs_path()
+    } else {
+        PathBuf::from(format!("localbox-gui-{stem}.toml"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefs_path_default_socket() {
+        assert_eq!(
+            prefs_path_for_socket(Path::new("localbox.sock")),
+            PathBuf::from("localbox-gui.toml")
+        );
+    }
+
+    #[test]
+    fn prefs_path_named_socket() {
+        assert_eq!(
+            prefs_path_for_socket(Path::new("examples/dual/data/node-a.sock")),
+            PathBuf::from("localbox-gui-node-a.toml")
+        );
+    }
+}

@@ -51,29 +51,21 @@ Localbox is a peer-to-peer file replication engine for small networks (and optio
    Copy the response invite back to node A to finish the round trip, ensuring both sides import each other’s CA and fingerprint data.
 
 5. **Run two nodes (example on one host):**
+
+   Each instance needs its own listen ports, DB/log/socket paths, and `pc_name` (or at least `instance_id`). Discovery binds are exclusive, so use different `discovery_port` values and the same `discovery_send_ports` fanout so they can find each other. Ready-made configs live in `examples/dual/`.
+
    ```bash
+   ```bash
+   mkdir -p examples/dual/data/docs-a examples/dual/data/docs-b
+
    # Terminal 1
-   cargo run -p localbox-core -- run \
-     --instance-id node-a \
-     --listen-port 5000 \
-     --plain-listen-port 5002 \
-     --discovery-port 5001 \
-     --remote-share-root remote-a \
-     --db-path node-a.db \
-     --log-path node-a.log \
-     --share docs=/tmp/docs-a,recursive=true
+   cargo run -p localbox-core -- --config examples/dual/node-a.toml run
 
    # Terminal 2
-   cargo run -p localbox-core -- run \
-     --instance-id node-b \
-     --listen-port 6000 \
-     --plain-listen-port 6002 \
-     --discovery-port 6001 \
-     --remote-share-root remote-b \
-     --db-path node-b.db \
-     --log-path node-b.log \
-     --share docs=/tmp/docs-b,recursive=true
+   cargo run -p localbox-core -- --config examples/dual/node-b.toml run
    ```
+
+   Both example configs set distinct `pc_name` / ports / sockets / DB paths, `use_tls_for_peers = false`, and shared `discovery_send_ports = [5001, 6001]` so each node’s DISCOVER packets reach the other’s bind port (including via `127.0.0.1`). Run from the workspace root so the relative paths resolve.
 
 6. **Run daemon (control socket on by default) or ephemeral interactive host:**
    ```bash
@@ -261,11 +253,16 @@ cargo run -p localbox-gui
 # Use a config.toml (passed to a spawned runtime; also sets control_socket if --socket is default)
 cargo run -p localbox-gui -- --config config.toml
 
+# Two GUI + daemon pairs on one machine (separate sockets/ports/db):
+mkdir -p examples/dual/data/docs-a examples/dual/data/docs-b
+cargo run -p localbox-gui -- --config examples/dual/node-a.toml
+cargo run -p localbox-gui -- --config examples/dual/node-b.toml
+
 # Client-only: never spawn
 cargo run -p localbox-gui -- --no-runtime --socket localbox.sock
 ```
 
-Binary resolution for a spawned runtime: `--core PATH`, then `$LOCALBOX_CORE`, then a `localbox-core` sibling of the GUI binary, then `PATH`. The Status tab shows peers with display names, app state, and advertised shares. Transfers and Chat pick peers/shares from that metadata (path remains typed). Selecting an inbox thread prefills the composer. The Logs tab tails the engine `log_path` (rolling window, default 100 lines; change under Settings → UI preferences or on the Logs tab; stored in `localbox-gui.toml`). Set optional `display_name` in `config.toml` or via Settings (`display_name`) to control the label peers see. The Transfers tab also lists pending requests and active TransferIntents with byte/batch progress bars.
+Binary resolution for a spawned runtime: `--core PATH`, then `$LOCALBOX_CORE`, then a `localbox-core` sibling of the GUI binary, then `PATH`. The Status tab shows peers with display names, app state, and advertised shares. Transfers and Chat pick peers/shares from that metadata (path remains typed). Selecting an inbox thread prefills the composer. The Logs tab tails the engine `log_path` (rolling window, default 100 lines; change under Settings → UI preferences or on the Logs tab; stored in `localbox-gui.toml`, or `localbox-gui-<socket-stem>.toml` when using a non-default control socket). Set optional `display_name` / `pc_name` in `config.toml` or via Settings to control the label peers see. The Transfers tab also lists pending requests and active TransferIntents with byte/batch progress bars.
 
 ## Repository Layout
 

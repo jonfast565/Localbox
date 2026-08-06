@@ -720,6 +720,7 @@ mod tests {
             plain_listen_addr: "127.0.0.1:0".parse().unwrap(),
             use_tls_for_peers: false,
             discovery_port: 0,
+        discovery_send_ports: Vec::new(),
             dht_port: 5003,
             utp_port: 5004,
             enable_dht: false,

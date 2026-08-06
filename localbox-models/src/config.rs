@@ -50,6 +50,10 @@ pub struct AppConfig {
     #[serde(default = "default_use_tls_for_peers")]
     pub use_tls_for_peers: bool,
     pub discovery_port: u16,
+    /// Extra UDP ports to fan out DISCOVER packets to (in addition to `discovery_port`).
+    /// Used so two same-host instances on different bind ports can still find each other.
+    #[serde(default)]
+    pub discovery_send_ports: Vec<u16>,
     /// UDP port for private BEP5 DHT (irontide). Default 5003.
     #[serde(default = "default_dht_port")]
     pub dht_port: u16,
@@ -183,6 +187,18 @@ pub struct PeerPolicy {
 }
 
 impl AppConfig {
+    /// Ports to send DISCOVER packets to: listen port plus any fanout ports (deduped).
+    pub fn discovery_fanout_ports(&self) -> Vec<u16> {
+        let mut ports = Vec::with_capacity(1 + self.discovery_send_ports.len());
+        ports.push(self.discovery_port);
+        for port in &self.discovery_send_ports {
+            if *port != 0 && !ports.contains(port) {
+                ports.push(*port);
+            }
+        }
+        ports
+    }
+
     /// Whether the private BEP5 DHT should run.
     /// LAN UDP discovery always runs; this only gates the DHT mesh.
     /// (`enable_dht` defaults to true at config resolve when `bootstrap_peers` is set.)

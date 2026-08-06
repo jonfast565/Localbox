@@ -1,5 +1,5 @@
 use irontide_utp::UtpSocket;
-use models::{AppConfig, ShareContext, TransferProgressRegistry};
+use models::{encode_discovery_shares, escape_discovery_value, AdvertisedShare, AppConfig, ShareContext, TransferProgressRegistry};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -89,11 +89,11 @@ async fn discovery_loop(
                 match res {
                     Ok((n, src)) => {
                         let msg = String::from_utf8_lossy(&buf[..n]);
-                        let share_names = local_share_names(&db, &cfg.pc_name).await;
+                        let shares = crate::local_advertised_shares(&db, &cfg).await;
                         handle_discovery_message(
                             &cfg,
                             &db,
-                            &share_names,
+                            &shares,
                             msg.as_ref(),
                             src,
                             &socket,
@@ -131,17 +131,19 @@ async fn discovery_broadcast_loop(
             _ = token.cancelled() => break,
             _ = interval.tick() => {}
         }
-        let share_names = local_share_names(&db, &cfg.pc_name).await;
+        let shares = crate::local_advertised_shares(&db, &cfg).await;
         let msg = format!(
-            "DISCOVER v1 pc_name={} instance_id={} tls_port={} plain_port={} utp_port={} use_tls={} accepts_remote={} shares={}",
+            "DISCOVER v1 pc_name={} instance_id={} display_name={} app_state={} tls_port={} plain_port={} utp_port={} use_tls={} accepts_remote={} shares={}",
             cfg.pc_name,
             cfg.instance_id,
+            escape_discovery_value(cfg.effective_display_name()),
+            cfg.app_state.as_str(),
             cfg.listen_addr.port(),
             cfg.plain_listen_addr.port(),
             cfg.advertised_utp_port(),
             cfg.use_tls_for_peers,
             cfg.app_state.can_host_remote(),
-            share_names.join(","),
+            encode_discovery_shares(&shares),
         );
         let broadcast_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
@@ -156,7 +158,7 @@ async fn discovery_broadcast_loop(
 async fn handle_discovery_message(
     cfg: &AppConfig,
     db: &DbHandle,
-    share_names: &[String],
+    local_shares: &[AdvertisedShare],
     msg: &str,
     src: SocketAddr,
     socket: &Arc<dyn UdpSocketLike>,
@@ -182,6 +184,8 @@ async fn handle_discovery_message(
         DiscoveryMessage::Discover {
             pc_name,
             instance_id,
+            display_name,
+            app_state,
             tls_port,
             plain_port,
             utp_port,
@@ -192,9 +196,11 @@ async fn handle_discovery_message(
             handle_discover(
                 cfg,
                 db,
-                share_names,
+                local_shares,
                 &pc_name,
                 &instance_id,
+                &display_name,
+                &app_state,
                 tls_port,
                 plain_port,
                 utp_port,
@@ -218,6 +224,8 @@ async fn handle_discovery_message(
         DiscoveryMessage::Here {
             pc_name,
             instance_id,
+            display_name,
+            app_state,
             tls_port,
             plain_port,
             utp_port,
@@ -228,9 +236,11 @@ async fn handle_discovery_message(
             handle_here(
                 cfg,
                 db,
-                share_names,
+                local_shares,
                 &pc_name,
                 &instance_id,
+                &display_name,
+                &app_state,
                 tls_port,
                 plain_port,
                 utp_port,
@@ -256,14 +266,16 @@ async fn handle_discovery_message(
 async fn handle_discover(
     cfg: &AppConfig,
     db: &DbHandle,
-    share_names: &[String],
+    local_shares: &[AdvertisedShare],
     pc_name: &str,
     instance_id: &str,
+    display_name: &str,
+    app_state: &str,
     tls_port: u16,
     plain_port: u16,
     utp_port: u16,
     prefer_tls: bool,
-    shares: Vec<String>,
+    remote_shares: Vec<AdvertisedShare>,
     accepts_remote_shares: bool,
     src: SocketAddr,
     socket: &Arc<dyn UdpSocketLike>,
@@ -305,6 +317,8 @@ async fn handle_discover(
         peer_plain_addr,
         prefer_tls,
         "discovered",
+        display_name,
+        app_state,
     )
     .await
     else {
@@ -320,7 +334,7 @@ async fn handle_discover(
         maybe_enqueue_auto_sync(
             cfg,
             db,
-            &shares,
+            &remote_shares,
             peer_id,
             pc_name,
             instance_id,
@@ -335,15 +349,17 @@ async fn handle_discover(
     }
 
     let reply = format!(
-        "HERE v1 pc_name={} instance_id={} tls_port={} plain_port={} utp_port={} use_tls={} accepts_remote={} shares={}",
+        "HERE v1 pc_name={} instance_id={} display_name={} app_state={} tls_port={} plain_port={} utp_port={} use_tls={} accepts_remote={} shares={}",
         cfg.pc_name,
         cfg.instance_id,
+        escape_discovery_value(cfg.effective_display_name()),
+        cfg.app_state.as_str(),
         cfg.listen_addr.port(),
         cfg.plain_listen_addr.port(),
         cfg.advertised_utp_port(),
         cfg.use_tls_for_peers,
         cfg.app_state.can_host_remote(),
-        share_names.join(","),
+        encode_discovery_shares(local_shares),
     );
     if let Err(e) = socket.send_to(reply.as_bytes(), &src).await {
         warn!("Failed to send HERE to {src}: {e}");
@@ -361,7 +377,7 @@ async fn handle_discover(
         pc_name,
         cfg,
         db,
-        share_names,
+        local_shares,
         connections,
         tls.clone(),
         fs,
@@ -376,14 +392,16 @@ async fn handle_discover(
 async fn handle_here(
     cfg: &AppConfig,
     db: &DbHandle,
-    share_names: &[String],
+    local_shares: &[AdvertisedShare],
     pc_name: &str,
     instance_id: &str,
+    display_name: &str,
+    app_state: &str,
     tls_port: u16,
     plain_port: u16,
     utp_port: u16,
     prefer_tls: bool,
-    shares: Vec<String>,
+    remote_shares: Vec<AdvertisedShare>,
     accepts_remote_shares: bool,
     src: SocketAddr,
     tls: Arc<ManagedTls>,
@@ -424,25 +442,37 @@ async fn handle_here(
         peer_plain_addr,
         prefer_tls,
         "discovered",
+        display_name,
+        app_state,
     )
     .await
     else {
         return;
     };
 
-    let set_res = { db.lock().await.set_peer_shares(peer_id, &shares) };
+    let set_res = { db.lock().await.set_peer_shares(peer_id, &remote_shares) };
     if let Err(e) = set_res {
         error!("DB set_peer_shares error: {e}");
     } else {
+        let display = if display_name.trim().is_empty() {
+            pc_name.to_string()
+        } else {
+            display_name.to_string()
+        };
+        let peer_key = format!("{pc_name}@{instance_id}");
+        let _ = db
+            .lock()
+            .await
+            .refresh_chat_thread_titles_for_peer(&peer_key, &display);
         info!(
             "HERE from peer {} (instance={}) at {} shares={:?}",
-            pc_name, instance_id, peer_addr, shares
+            pc_name, instance_id, peer_addr, remote_shares
         );
         if accepts_remote_shares {
             maybe_enqueue_auto_sync(
                 cfg,
                 db,
-                &shares,
+                &remote_shares,
                 peer_id,
                 pc_name,
                 instance_id,
@@ -469,7 +499,7 @@ async fn handle_here(
         pc_name,
         cfg,
         db,
-        share_names,
+        local_shares,
         connections,
         tls.clone(),
         fs,
@@ -488,7 +518,7 @@ pub(crate) fn spawn_connect_task(
     pc_name: &str,
     cfg: &AppConfig,
     db: &DbHandle,
-    share_names: &[String],
+    shares: &[AdvertisedShare],
     connections: SharedWriters,
     tls: Arc<ManagedTls>,
     fs: Arc<dyn utilities::FileSystem>,
@@ -505,7 +535,7 @@ pub(crate) fn spawn_connect_task(
 
     let cfg_clone = cfg.clone();
     let db = Arc::clone(db);
-    let share_names = share_names.to_vec();
+    let shares = shares.to_vec();
     let connections = connections.clone();
     let pc_name_connect = pc_name.to_string();
     tokio::spawn(run_connect_task(
@@ -515,7 +545,7 @@ pub(crate) fn spawn_connect_task(
         pc_name_connect,
         cfg_clone,
         db,
-        share_names,
+        shares,
         connections,
         tls,
         fs,
@@ -534,7 +564,7 @@ async fn run_connect_task(
     pc_name: String,
     cfg: AppConfig,
     db: DbHandle,
-    share_names: Vec<String>,
+    shares: Vec<AdvertisedShare>,
     connections: SharedWriters,
     tls: Arc<ManagedTls>,
     fs: Arc<dyn utilities::FileSystem>,
@@ -555,7 +585,7 @@ async fn run_connect_task(
                 &pc_name,
                 &cfg,
                 &db,
-                &share_names,
+                &shares,
                 connections,
                 pending_files.clone(),
                 connector,
@@ -580,6 +610,8 @@ async fn upsert_peer_with_state(
     plain_addr: SocketAddr,
     prefer_tls: bool,
     state: &str,
+    display_name: &str,
+    app_state: &str,
 ) -> Option<i64> {
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let chosen_addr = if tls_addr.port() != 0 {
@@ -588,7 +620,7 @@ async fn upsert_peer_with_state(
         plain_addr
     };
     let res = {
-        db.lock().await.upsert_peer(
+        db.lock().await.upsert_peer_with_meta(
             pc_name,
             instance_id,
             chosen_addr,
@@ -597,6 +629,8 @@ async fn upsert_peer_with_state(
             tls_addr.port(),
             plain_addr.port(),
             prefer_tls,
+            display_name,
+            app_state,
         )
     };
     match res {
@@ -617,7 +651,7 @@ fn is_self_peer(cfg: &AppConfig, pc_name: &str, _instance_id: &str) -> bool {
 async fn maybe_enqueue_auto_sync(
     cfg: &AppConfig,
     db: &DbHandle,
-    remote_shares: &[String],
+    remote_shares: &[AdvertisedShare],
     peer_id: i64,
     peer_pc: &str,
     peer_instance: &str,
@@ -660,12 +694,12 @@ async fn maybe_enqueue_auto_sync(
 async fn enqueue_catchup_if_needed(
     db: &DbHandle,
     share_lookup: &[ShareContext],
-    remote_shares: &[String],
+    remote_shares: &[AdvertisedShare],
     peer_id: i64,
     local_name: &str,
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
 ) {
-    let remote: HashSet<&str> = remote_shares.iter().map(|s| s.as_str()).collect();
+    let remote: HashSet<&str> = remote_shares.iter().map(|s| s.name.as_str()).collect();
     for share in share_lookup {
         if !remote.contains(share.share_name.as_str()) {
             continue;
@@ -735,13 +769,13 @@ async fn enqueue_catchup_if_needed(
 async fn enqueue_bootstrap_if_needed(
     db: &DbHandle,
     share_lookup: &[ShareContext],
-    remote_shares: &[String],
+    remote_shares: &[AdvertisedShare],
     peer_id: i64,
     local_name: &str,
     remote_name: &str,
     net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
 ) {
-    let remote: HashSet<&str> = remote_shares.iter().map(|s| s.as_str()).collect();
+    let remote: HashSet<&str> = remote_shares.iter().map(|s| s.name.as_str()).collect();
     for share in share_lookup {
         if remote.contains(share.share_name.as_str()) {
             continue;
@@ -793,16 +827,6 @@ async fn enqueue_bootstrap_if_needed(
                 error = %e,
                 "Failed to enqueue SyncCatchup bootstrap intent"
             ),
-        }
-    }
-}
-
-async fn local_share_names(db: &DbHandle, pc_name: &str) -> Vec<String> {
-    match db.lock().await.list_shares_for_pc(pc_name) {
-        Ok(rows) => rows.into_iter().map(|r| r.share_name).collect(),
-        Err(e) => {
-            warn!("Failed to list local shares: {e}");
-            Vec::new()
         }
     }
 }

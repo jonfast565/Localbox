@@ -1,5 +1,6 @@
 mod app;
 mod client;
+mod prefs;
 mod runtime;
 mod theme;
 
@@ -73,7 +74,7 @@ fn main() -> iced::Result {
     let result = iced::application(app::App::title, app::App::update, app::App::view)
         .theme(app::App::theme)
         .subscription(app::App::subscription)
-        .window_size(Size::new(420.0, 520.0))
+        .window_size(Size::new(780.0, 620.0))
         .run_with(move || app::App::new(socket, ensure_opts, runtime_for_app));
 
     drop(runtime);

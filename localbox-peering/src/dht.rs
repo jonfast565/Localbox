@@ -121,7 +121,7 @@ async fn dht_loop(
         if let (Some(session), Some(pc_name)) = (&peer.session_addr, &peer.pc_name) {
             if let Ok(addr) = session.parse::<SocketAddr>() {
                 let plain = SocketAddr::new(addr.ip(), 0);
-                let share_names = local_share_names(&db, &cfg.pc_name).await;
+                let shares = crate::local_advertised_shares(&db, &cfg).await;
                 let utp_hint = if cfg.utp_enabled() {
                     Some(SocketAddr::new(addr.ip(), cfg.utp_port))
                 } else {
@@ -134,7 +134,7 @@ async fn dht_loop(
                     pc_name,
                     &cfg,
                     &db,
-                    &share_names,
+                    &shares,
                     connections.clone(),
                     tls.clone(),
                     fs.clone(),
@@ -147,7 +147,7 @@ async fn dht_loop(
             } else if let Ok(addrs) = tokio::net::lookup_host(session).await {
                 if let Some(addr) = addrs.filter(|a| a.is_ipv4()).next() {
                     let plain = SocketAddr::new(addr.ip(), 0);
-                    let share_names = local_share_names(&db, &cfg.pc_name).await;
+                    let shares = crate::local_advertised_shares(&db, &cfg).await;
                     let utp_hint = if cfg.utp_enabled() {
                         Some(SocketAddr::new(addr.ip(), cfg.utp_port))
                     } else {
@@ -160,7 +160,7 @@ async fn dht_loop(
                         pc_name,
                         &cfg,
                         &db,
-                        &share_names,
+                        &shares,
                         connections.clone(),
                         tls.clone(),
                         fs.clone(),
@@ -285,7 +285,7 @@ async fn lookup_and_dial(
         }
     }
 
-    let share_names = local_share_names(db, &cfg.pc_name).await;
+    let shares = crate::local_advertised_shares(db, &cfg).await;
 
     for pc_name in targets {
         // BEP44 mutable record (richer candidates).
@@ -306,7 +306,7 @@ async fn lookup_and_dial(
                     progress,
                     utp.clone(),
                     token,
-                    &share_names,
+                    &shares,
                     &record,
                 );
                 continue;
@@ -341,7 +341,7 @@ async fn lookup_and_dial(
                                 &pc_name,
                                 cfg,
                                 db,
-                                &share_names,
+                                &shares,
                                 connections.clone(),
                                 tls.clone(),
                                 fs.clone(),
@@ -377,7 +377,7 @@ fn dial_from_record(
     progress: &Arc<TransferProgressRegistry>,
     utp: Option<UtpSocket>,
     token: &CancellationToken,
-    share_names: &[String],
+    shares: &[models::AdvertisedShare],
     record: &PeerEndpointRecord,
 ) {
     if record.pc_name == cfg.pc_name {
@@ -412,7 +412,7 @@ fn dial_from_record(
             &record.pc_name,
             cfg,
             db,
-            share_names,
+            shares,
             connections.clone(),
             tls.clone(),
             fs.clone(),
@@ -425,12 +425,6 @@ fn dial_from_record(
     }
 }
 
-async fn local_share_names(db: &DbHandle, pc_name: &str) -> Vec<String> {
-    match db.lock().await.list_shares_for_pc(pc_name) {
-        Ok(rows) => rows.into_iter().map(|r| r.share_name).collect(),
-        Err(_) => Vec::new(),
-    }
-}
 
 #[cfg(test)]
 mod tests {

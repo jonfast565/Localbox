@@ -8,6 +8,7 @@ fn cfg() -> AppConfig {
     AppConfig {
         pc_name: "pc".into(),
         instance_id: "i".into(),
+            display_name: String::new(),
         listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
         plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2),
         use_tls_for_peers: true,

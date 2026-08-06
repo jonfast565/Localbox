@@ -1,14 +1,15 @@
 use anyhow::Result;
 use models::{
-    BatchAck, BatchBasis, BatchManifest, ChangeKind, ChatAck, ChatAttachment, ChatMessage, FileChange,
-    FileChunk, FileMeta, ThreadKind, TransferPushOffer, TransferReply, TransferReplyStatus,
+    decode_discovery_shares, unescape_discovery_value, AdvertisedShare, BatchAck, BatchBasis,
+    BatchManifest, ChangeKind, ChatAck, ChatAttachment, ChatMessage, FileChange, FileChunk,
+    FileMeta, ThreadKind, TransferMode, TransferPushOffer, TransferReply, TransferReplyStatus,
     TransferRequest, WireMessage,
 };
 use prost::Message;
 
 use crate::proto::{
-    wire_envelope::Msg as ProtoMsg, BatchAck as ProtoBatchAck, BatchBasis as ProtoBatchBasis,
-    BatchManifest as ProtoBatch,
+    wire_envelope::Msg as ProtoMsg, AdvertisedShare as ProtoAdvertisedShare,
+    BatchAck as ProtoBatchAck, BatchBasis as ProtoBatchBasis, BatchManifest as ProtoBatch,
     ChangeKind as ProtoChange, ChatAck as ProtoChatAck, ChatMessage as ProtoChatMessage,
     FileChange as ProtoFileChange, FileChunk as ProtoFileChunk, FileMeta as ProtoFileMeta,
     Hello as ProtoHello, TransferPushOffer as ProtoTransferPushOffer,
@@ -20,60 +21,111 @@ pub enum DiscoveryMessage {
     Discover {
         pc_name: String,
         instance_id: String,
+        display_name: String,
+        app_state: String,
         tls_port: u16,
         plain_port: u16,
         utp_port: u16,
         use_tls_for_peers: bool,
-        shares: Vec<String>,
+        shares: Vec<AdvertisedShare>,
         accepts_remote_shares: bool,
     },
     Here {
         pc_name: String,
         instance_id: String,
+        display_name: String,
+        app_state: String,
         tls_port: u16,
         plain_port: u16,
         utp_port: u16,
         use_tls_for_peers: bool,
-        shares: Vec<String>,
+        shares: Vec<AdvertisedShare>,
         accepts_remote_shares: bool,
     },
+}
+
+fn discovery_fields(
+    kv: &std::collections::HashMap<String, String>,
+) -> Option<(
+    String,
+    String,
+    String,
+    String,
+    u16,
+    u16,
+    u16,
+    bool,
+    Vec<AdvertisedShare>,
+    bool,
+)> {
+    let pc_name = kv.get("pc_name")?.to_string();
+    let instance_id = kv.get("instance_id")?.to_string();
+    let display_name = kv
+        .get("display_name")
+        .map(|s| unescape_discovery_value(s))
+        .unwrap_or_default();
+    let app_state = kv.get("app_state").cloned().unwrap_or_default();
+    let tls_port = kv
+        .get("tls_port")
+        .or_else(|| kv.get("tcp_port"))
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(0);
+    let plain_port = kv
+        .get("plain_port")
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(0);
+    let utp_port = kv
+        .get("utp_port")
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(0);
+    let use_tls_for_peers = kv
+        .get("use_tls")
+        .or_else(|| kv.get("use_tls_for_peers"))
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(true);
+    let shares = kv
+        .get("shares")
+        .map(|s| decode_discovery_shares(s))
+        .unwrap_or_default();
+    let accepts_remote_shares = kv
+        .get("accepts_remote")
+        .or_else(|| kv.get("accepts_remote_shares"))
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(true);
+    Some((
+        pc_name,
+        instance_id,
+        display_name,
+        app_state,
+        tls_port,
+        plain_port,
+        utp_port,
+        use_tls_for_peers,
+        shares,
+        accepts_remote_shares,
+    ))
 }
 
 pub fn parse_discovery_message(msg: &str) -> Option<DiscoveryMessage> {
     if msg.starts_with("DISCOVER v1") {
         parse_key_values(msg, 2).and_then(|kv| {
-            let pc_name = kv.get("pc_name")?.to_string();
-            let instance_id = kv.get("instance_id")?.to_string();
-            let tls_port = kv
-                .get("tls_port")
-                .or_else(|| kv.get("tcp_port"))
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(0);
-            let plain_port = kv
-                .get("plain_port")
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(0);
-            let utp_port = kv
-                .get("utp_port")
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(0);
-            let use_tls_for_peers = kv
-                .get("use_tls")
-                .or_else(|| kv.get("use_tls_for_peers"))
-                .and_then(|v| v.parse::<bool>().ok())
-                .unwrap_or(true);
-            let shares = kv
-                .get("shares")
-                .map(|s| split_shares(s))
-                .unwrap_or_default();
-            let accepts_remote_shares = kv
-                .get("accepts_remote")
-                .or_else(|| kv.get("accepts_remote_shares"))
-                .and_then(|v| v.parse::<bool>().ok())
-                .unwrap_or(true);
+            let (
+                pc_name,
+                instance_id,
+                display_name,
+                app_state,
+                tls_port,
+                plain_port,
+                utp_port,
+                use_tls_for_peers,
+                shares,
+                accepts_remote_shares,
+            ) = discovery_fields(&kv)?;
             Some(DiscoveryMessage::Discover {
                 pc_name,
                 instance_id,
+                display_name,
+                app_state,
                 tls_port,
                 plain_port,
                 utp_port,
@@ -84,38 +136,23 @@ pub fn parse_discovery_message(msg: &str) -> Option<DiscoveryMessage> {
         })
     } else if msg.starts_with("HERE v1") {
         parse_key_values(msg, 2).and_then(|kv| {
-            let pc_name = kv.get("pc_name")?.to_string();
-            let instance_id = kv.get("instance_id")?.to_string();
-            let tls_port = kv
-                .get("tls_port")
-                .or_else(|| kv.get("tcp_port"))
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(0);
-            let plain_port = kv
-                .get("plain_port")
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(0);
-            let utp_port = kv
-                .get("utp_port")
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(0);
-            let use_tls_for_peers = kv
-                .get("use_tls")
-                .or_else(|| kv.get("use_tls_for_peers"))
-                .and_then(|v| v.parse::<bool>().ok())
-                .unwrap_or(true);
-            let shares = kv
-                .get("shares")
-                .map(|s| split_shares(s))
-                .unwrap_or_default();
-            let accepts_remote_shares = kv
-                .get("accepts_remote")
-                .or_else(|| kv.get("accepts_remote_shares"))
-                .and_then(|v| v.parse::<bool>().ok())
-                .unwrap_or(true);
+            let (
+                pc_name,
+                instance_id,
+                display_name,
+                app_state,
+                tls_port,
+                plain_port,
+                utp_port,
+                use_tls_for_peers,
+                shares,
+                accepts_remote_shares,
+            ) = discovery_fields(&kv)?;
             Some(DiscoveryMessage::Here {
                 pc_name,
                 instance_id,
+                display_name,
+                app_state,
                 tls_port,
                 plain_port,
                 utp_port,
@@ -163,8 +200,21 @@ pub fn encode_wire_message_proto(msg: &WireMessage) -> Result<Vec<u8>> {
                 listen_port: h.listen_port as u32,
                 plain_port: h.plain_port as u32,
                 use_tls_for_peers: h.use_tls_for_peers,
-                shares: h.shares.clone(),
+                shares: h.shares.iter().map(|s| s.name.clone()).collect(),
                 decline_remote_shares: !h.accepts_remote_shares,
+                display_name: h.display_name.clone(),
+                app_state: h.app_state.clone(),
+                utp_port: h.utp_port as u32,
+                advertised_shares: h
+                    .shares
+                    .iter()
+                    .map(|s| ProtoAdvertisedShare {
+                        name: s.name.clone(),
+                        recursive: s.recursive,
+                        sync: transfer_mode_proto(s.sync).to_string(),
+                        pull: transfer_mode_proto(s.pull).to_string(),
+                    })
+                    .collect(),
             })),
         },
         WireMessage::Batch(b) => WireEnvelope {
@@ -250,22 +300,42 @@ pub fn encode_wire_message_proto(msg: &WireMessage) -> Result<Vec<u8>> {
 pub fn decode_wire_message_proto(bytes: &[u8]) -> Result<WireMessage> {
     let env = WireEnvelope::decode(bytes)?;
     match env.msg {
-        Some(ProtoMsg::Hello(h)) => Ok(WireMessage::Hello(models::HelloMessage {
-            protocol_version: models::WIRE_PROTOCOL_VERSION,
-            pc_name: h.pc_name,
-            instance_id: h.instance_id,
-            listen_port: h.listen_port as u16,
-            plain_port: h.plain_port as u16,
-            use_tls_for_peers: if h.use_tls_for_peers {
-                true
+        Some(ProtoMsg::Hello(h)) => {
+            let shares = if !h.advertised_shares.is_empty() {
+                h.advertised_shares
+                    .into_iter()
+                    .map(|s| AdvertisedShare {
+                        name: s.name,
+                        recursive: s.recursive,
+                        sync: parse_transfer_mode_proto(&s.sync),
+                        pull: parse_transfer_mode_proto(&s.pull),
+                    })
+                    .collect()
             } else {
-                // Default to true if sender never set the field (http_port=0 is a hint).
-                h.plain_port == 0
-            },
-            utp_port: 0,
-            shares: h.shares,
-            accepts_remote_shares: !h.decline_remote_shares,
-        })),
+                h.shares
+                    .into_iter()
+                    .map(AdvertisedShare::new)
+                    .collect()
+            };
+            Ok(WireMessage::Hello(models::HelloMessage {
+                protocol_version: models::WIRE_PROTOCOL_VERSION,
+                pc_name: h.pc_name,
+                instance_id: h.instance_id,
+                display_name: h.display_name,
+                app_state: h.app_state,
+                listen_port: h.listen_port as u16,
+                plain_port: h.plain_port as u16,
+                use_tls_for_peers: if h.use_tls_for_peers {
+                    true
+                } else {
+                    // Default to true if sender never set the field (http_port=0 is a hint).
+                    h.plain_port == 0
+                },
+                utp_port: h.utp_port as u16,
+                shares,
+                accepts_remote_shares: !h.decline_remote_shares,
+            }))
+        }
         Some(ProtoMsg::Batch(b)) => Ok(WireMessage::Batch(batch_from_proto(&b)?)),
         Some(ProtoMsg::BatchAck(a)) => Ok(WireMessage::BatchAck(BatchAck {
             protocol_version: models::WIRE_PROTOCOL_VERSION,
@@ -512,9 +582,16 @@ fn parse_key_values(msg: &str, skip: usize) -> Option<std::collections::HashMap<
     Some(map)
 }
 
-fn split_shares(s: &str) -> Vec<String> {
-    s.split(',')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
+fn transfer_mode_proto(mode: TransferMode) -> &'static str {
+    match mode {
+        TransferMode::Manual => "manual",
+        TransferMode::Auto => "auto",
+    }
+}
+
+fn parse_transfer_mode_proto(s: &str) -> TransferMode {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "auto" => TransferMode::Auto,
+        _ => TransferMode::Manual,
+    }
 }

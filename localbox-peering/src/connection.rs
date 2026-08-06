@@ -1,8 +1,8 @@
 use anyhow::{bail, Context, Result};
 use db::JournalOrigin;
 use models::{
-    AppConfig, ChangeKind, ChatAck, ChatMessage, ChatMessageRecord, ConflictPolicy, FileChange,
-    FileChunk, FileMeta, HelloMessage, ShareConfig, ShareId, ThreadKind, TransferMode,
+    AdvertisedShare, AppConfig, ChangeKind, ChatAck, ChatMessage, ChatMessageRecord, ConflictPolicy,
+    FileChange, FileChunk, FileMeta, HelloMessage, ShareConfig, ShareId, ThreadKind, TransferMode,
     TransferProgressRegistry, TransferReply, TransferReplyStatus, TransferRequest, WireMessage,
 };
 use uuid::Uuid;
@@ -32,7 +32,7 @@ pub async fn handle_tls_connection(
     stream: DynStream,
     cfg: &AppConfig,
     db: &DbHandle,
-    share_names: &[String],
+    shares: &[AdvertisedShare],
     addr: SocketAddr,
     connections: SharedWriters,
     pending_files: PendingFiles,
@@ -50,7 +50,7 @@ pub async fn handle_tls_connection(
         .map(|chain| chain.to_vec());
     let peer_fp = fingerprint_from_certificates(peer_certs.as_deref());
     let (remote, resolved_peer_id) =
-        perform_handshake(&mut tls_stream, cfg, db, share_names, addr, fs.clone()).await?;
+        perform_handshake(&mut tls_stream, cfg, db, shares, addr, fs.clone()).await?;
     refuse_if_quarantined(cfg, db, &remote).await?;
     check_peer_identity(
         cfg,
@@ -98,7 +98,7 @@ pub async fn handle_plain_connection(
     mut stream: DynStream,
     cfg: &AppConfig,
     db: &DbHandle,
-    share_names: &[String],
+    shares: &[AdvertisedShare],
     addr: SocketAddr,
     connections: SharedWriters,
     pending_files: PendingFiles,
@@ -108,7 +108,7 @@ pub async fn handle_plain_connection(
 ) -> Result<()> {
     warn!("Inbound plaintext peer connection from {addr}");
     let (remote, resolved_peer_id) =
-        perform_handshake(&mut stream, cfg, db, share_names, addr, fs.clone()).await?;
+        perform_handshake(&mut stream, cfg, db, shares, addr, fs.clone()).await?;
     refuse_if_quarantined(cfg, db, &remote).await?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
     db.lock().await.mark_peer_insecure(resolved_peer_id, now)?;
@@ -152,7 +152,7 @@ pub async fn connect_to_peer(
     server_name: &str,
     cfg: &AppConfig,
     db: &DbHandle,
-    share_names: &[String],
+    shares: &[AdvertisedShare],
     connections: SharedWriters,
     pending_files: PendingFiles,
     connector: TlsConnector,
@@ -191,7 +191,7 @@ pub async fn connect_to_peer(
                 server_name,
                 cfg,
                 db,
-                share_names,
+                shares,
                 connections.clone(),
                 pending_files.clone(),
                 connector.clone(),
@@ -230,7 +230,7 @@ pub async fn connect_to_peer(
                         server_name,
                         cfg,
                         db,
-                        share_names,
+                        shares,
                         connections,
                         pending_files,
                         connector,
@@ -259,7 +259,7 @@ pub async fn connect_to_peer(
             &mut tls_stream,
             cfg,
             db,
-            share_names,
+            shares,
             target_addr,
             fs.clone(),
         )
@@ -305,7 +305,7 @@ pub async fn connect_to_peer(
             &mut plain_stream,
             cfg,
             db,
-            share_names,
+            shares,
             target_addr,
             fs.clone(),
         )
@@ -344,7 +344,7 @@ async fn connect_tls_over_utp(
     server_name: &str,
     cfg: &AppConfig,
     db: &DbHandle,
-    share_names: &[String],
+    shares: &[AdvertisedShare],
     connections: SharedWriters,
     pending_files: PendingFiles,
     connector: TlsConnector,
@@ -367,7 +367,7 @@ async fn connect_tls_over_utp(
         &mut tls_stream,
         cfg,
         db,
-        share_names,
+        shares,
         utp_addr,
         fs.clone(),
     )
@@ -403,7 +403,7 @@ async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     cfg: &AppConfig,
     db: &DbHandle,
-    share_names: &[String],
+    shares: &[AdvertisedShare],
     addr: SocketAddr,
     fs: Arc<dyn FileSystem>,
 ) -> Result<(HelloMessage, i64)> {
@@ -411,11 +411,13 @@ async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         protocol_version: models::WIRE_PROTOCOL_VERSION,
         pc_name: cfg.pc_name.clone(),
         instance_id: cfg.instance_id.clone(),
+        display_name: cfg.effective_display_name().to_string(),
+        app_state: cfg.app_state.as_str().to_string(),
         listen_port: cfg.listen_addr.port(),
         plain_port: cfg.plain_listen_addr.port(),
         use_tls_for_peers: cfg.use_tls_for_peers,
         utp_port: cfg.advertised_utp_port(),
-        shares: share_names.to_vec(),
+        shares: shares.to_vec(),
         accepts_remote_shares: cfg.app_state.can_host_remote(),
     };
     let msg = WireMessage::Hello(hello);
@@ -436,7 +438,8 @@ async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
                     remote.listen_port
                 },
             );
-            let peer_id = db.lock().await.upsert_peer(
+            let display = remote.effective_display_name().to_string();
+            let peer_id = db.lock().await.upsert_peer_with_meta(
                 &remote.pc_name,
                 &remote.instance_id,
                 peer_addr,
@@ -445,8 +448,12 @@ async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
                 remote.listen_port,
                 remote.plain_port,
                 remote.use_tls_for_peers,
+                &display,
+                &remote.app_state,
             )?;
             db.lock().await.set_peer_shares(peer_id, &remote.shares)?;
+            let peer_key = models::peer_key(&remote.pc_name, &remote.instance_id);
+            let _ = db.lock().await.refresh_chat_thread_titles_for_peer(&peer_key, &display);
             ensure_remote_shares(cfg, db, &remote, fs.as_ref()).await;
             Ok((remote, peer_id))
         }
@@ -577,7 +584,8 @@ async fn maybe_auto_pull(
     remote: &HelloMessage,
 ) {
     let peer_key = format!("{}@{}", remote.pc_name, remote.instance_id);
-    for share_name in &remote.shares {
+    for share in &remote.shares {
+        let share_name = &share.name;
         if !cfg.resolve_allow_request(share_name, &peer_key) {
             continue;
         }
@@ -1608,7 +1616,8 @@ async fn ensure_remote_shares(
         return;
     }
 
-    for share_name in &remote.shares {
+    for share in &remote.shares {
+        let share_name = &share.name;
         let share_root = build_remote_share_root(
             &cfg.remote_share_root,
             &remote.pc_name,
@@ -1623,7 +1632,7 @@ async fn ensure_remote_shares(
             continue;
         }
 
-        let share_cfg = ShareConfig::new(share_name.clone(), share_root, true);
+        let share_cfg = ShareConfig::new(share_name.clone(), share_root, share.recursive);
         let share_id = ShareId::new(share_name, &remote.pc_name);
         if let Err(e) = db
             .lock()

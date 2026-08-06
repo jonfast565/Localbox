@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
 use models::{
-    AppConfig, ChangeKind, ChatMessageRecord, FileChange, FileMeta, IntentBasis, IntentKind,
-    IntentOrigin, IntentStatus, JournalEntry, ShareConfig, ShareContext, ShareId, ThreadKind,
-    ThreadSummary, TransferIntent, TransferRequest,
+    AdvertisedShare, AppConfig, ChangeKind, ChatMessageRecord, FileChange, FileMeta, IntentBasis,
+    IntentKind, IntentOrigin, IntentStatus, JournalEntry, ShareConfig, ShareContext, ShareId,
+    ThreadKind, ThreadSummary, TransferIntent, TransferMode, TransferRequest,
 };
 use rusqlite::{params, types::Type, Connection, Result};
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-const DB_SCHEMA_VERSION: i32 = 9;
+const DB_SCHEMA_VERSION: i32 = 10;
 
 pub struct Db {
     conn: Connection,
@@ -33,6 +33,10 @@ pub struct PeerRow {
     pub id: i64,
     pub pc_name: String,
     pub instance_id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub app_state: String,
     pub last_ip: String,
     pub last_port: i64,
     pub last_tls_port: i64,
@@ -42,6 +46,15 @@ pub struct PeerRow {
     pub prefer_tls: bool,
     pub last_insecure_seen: i64,
     pub quarantined: bool,
+}
+
+/// Peer row plus advertised shares for control-plane / GUI consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    #[serde(flatten)]
+    pub peer: PeerRow,
+    #[serde(default)]
+    pub shares: Vec<AdvertisedShare>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +130,8 @@ impl Db {
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 pc_name      TEXT NOT NULL,
                 instance_id  TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                app_state    TEXT NOT NULL DEFAULT '',
                 last_ip      TEXT NOT NULL,
                 last_port    INTEGER NOT NULL,
                 last_tls_port INTEGER NOT NULL,
@@ -142,6 +157,9 @@ impl Db {
             CREATE TABLE IF NOT EXISTS peer_shares (
                 peer_id      INTEGER NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
                 share_name   TEXT NOT NULL,
+                recursive    INTEGER NOT NULL DEFAULT 1,
+                sync         TEXT NOT NULL DEFAULT 'manual',
+                pull         TEXT NOT NULL DEFAULT 'manual',
                 PRIMARY KEY (peer_id, share_name)
             );
 
@@ -548,6 +566,39 @@ impl Db {
             )?;
         }
 
+        if current < 10 {
+            if !self.has_column("peers", "display_name")? {
+                self.conn.execute(
+                    "ALTER TABLE peers ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+            if !self.has_column("peers", "app_state")? {
+                self.conn.execute(
+                    "ALTER TABLE peers ADD COLUMN app_state TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+            if !self.has_column("peer_shares", "recursive")? {
+                self.conn.execute(
+                    "ALTER TABLE peer_shares ADD COLUMN recursive INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )?;
+            }
+            if !self.has_column("peer_shares", "sync")? {
+                self.conn.execute(
+                    "ALTER TABLE peer_shares ADD COLUMN sync TEXT NOT NULL DEFAULT 'manual'",
+                    [],
+                )?;
+            }
+            if !self.has_column("peer_shares", "pull")? {
+                self.conn.execute(
+                    "ALTER TABLE peer_shares ADD COLUMN pull TEXT NOT NULL DEFAULT 'manual'",
+                    [],
+                )?;
+            }
+        }
+
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {DB_SCHEMA_VERSION};"))?;
 
@@ -870,10 +921,46 @@ impl Db {
         plain_port: u16,
         prefer_tls: bool,
     ) -> Result<i64> {
+        self.upsert_peer_with_meta(
+            pc_name,
+            instance_id,
+            addr,
+            now_ts,
+            state,
+            tls_port,
+            plain_port,
+            prefer_tls,
+            "",
+            "",
+        )
+    }
+
+    pub fn upsert_peer_with_meta(
+        &self,
+        pc_name: &str,
+        instance_id: &str,
+        addr: SocketAddr,
+        now_ts: i64,
+        state: &str,
+        tls_port: u16,
+        plain_port: u16,
+        prefer_tls: bool,
+        display_name: &str,
+        app_state: &str,
+    ) -> Result<i64> {
+        let display = if display_name.trim().is_empty() {
+            pc_name
+        } else {
+            display_name
+        };
         self.conn.execute(
             r#"
-            INSERT INTO peers (pc_name, instance_id, last_ip, last_port, last_tls_port, last_plain_port, last_seen, state, prefer_tls)
-            VALUES (?1, ?2, ?3, ?4, ?7, ?8, ?5, ?6, ?9)
+            INSERT INTO peers (
+                pc_name, instance_id, display_name, app_state,
+                last_ip, last_port, last_tls_port, last_plain_port,
+                last_seen, state, prefer_tls
+            )
+            VALUES (?1, ?2, ?10, ?11, ?3, ?4, ?7, ?8, ?5, ?6, ?9)
             ON CONFLICT(pc_name, instance_id) DO UPDATE SET
                 last_ip = excluded.last_ip,
                 last_port = excluded.last_port,
@@ -881,7 +968,15 @@ impl Db {
                 last_plain_port = excluded.last_plain_port,
                 last_seen = excluded.last_seen,
                 state = excluded.state,
-                prefer_tls = excluded.prefer_tls
+                prefer_tls = excluded.prefer_tls,
+                display_name = CASE
+                    WHEN excluded.display_name = '' THEN peers.display_name
+                    ELSE excluded.display_name
+                END,
+                app_state = CASE
+                    WHEN excluded.app_state = '' THEN peers.app_state
+                    ELSE excluded.app_state
+                END
             "#,
             params![
                 pc_name,
@@ -893,6 +988,8 @@ impl Db {
                 tls_port as i64,
                 plain_port as i64,
                 prefer_tls as i64,
+                display,
+                app_state,
             ],
         )?;
 
@@ -934,17 +1031,70 @@ impl Db {
             .unwrap_or(false))
     }
 
-    pub fn set_peer_shares(&self, peer_id: i64, shares: &[String]) -> Result<()> {
+    pub fn set_peer_shares(&self, peer_id: i64, shares: &[AdvertisedShare]) -> Result<()> {
         // Use autocommit; for the small number of rows here this keeps the signature non-mutable.
         self.conn
             .execute("DELETE FROM peer_shares WHERE peer_id=?1", params![peer_id])?;
         for s in shares {
             self.conn.execute(
-                "INSERT INTO peer_shares (peer_id, share_name) VALUES (?1, ?2)",
-                params![peer_id, s],
+                r#"
+                INSERT INTO peer_shares (peer_id, share_name, recursive, sync, pull)
+                VALUES (?1, ?2, ?3, ?4, ?5)
+                "#,
+                params![
+                    peer_id,
+                    s.name,
+                    s.recursive as i64,
+                    transfer_mode_db(s.sync),
+                    transfer_mode_db(s.pull),
+                ],
             )?;
         }
         Ok(())
+    }
+
+    pub fn list_peer_shares(&self, peer_id: i64) -> Result<Vec<AdvertisedShare>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT share_name, recursive, sync, pull
+            FROM peer_shares
+            WHERE peer_id = ?1
+            ORDER BY share_name
+            "#,
+        )?;
+        let rows = stmt.query_map(params![peer_id], |row| {
+            let recursive: i64 = row.get(1)?;
+            let sync_s: String = row.get(2)?;
+            let pull_s: String = row.get(3)?;
+            Ok(AdvertisedShare {
+                name: row.get(0)?,
+                recursive: recursive != 0,
+                sync: parse_transfer_mode_db(&sync_s),
+                pull: parse_transfer_mode_db(&pull_s),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Refresh peer-DM thread titles to the peer's current display name.
+    pub fn refresh_chat_thread_titles_for_peer(
+        &self,
+        peer_key: &str,
+        title: &str,
+    ) -> Result<usize> {
+        let n = self.conn.execute(
+            r#"
+            UPDATE chat_threads
+            SET title = ?2
+            WHERE kind = 'peer' AND peer_key = ?1
+            "#,
+            params![peer_key, title],
+        )?;
+        Ok(n)
     }
 
     pub fn get_share_row_id_by_share_id(&self, share_id: &ShareId) -> Result<i64> {
@@ -1396,7 +1546,8 @@ impl Db {
     pub fn list_peers(&self) -> Result<Vec<PeerRow>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, pc_name, instance_id, last_ip, last_port, last_tls_port, last_plain_port,
+            SELECT id, pc_name, instance_id, display_name, app_state,
+                   last_ip, last_port, last_tls_port, last_plain_port,
                    last_seen, state, prefer_tls, last_insecure_seen, quarantined
             FROM peers
             ORDER BY last_seen DESC
@@ -1407,19 +1558,21 @@ impl Db {
                 id: row.get(0)?,
                 pc_name: row.get(1)?,
                 instance_id: row.get(2)?,
-                last_ip: row.get(3)?,
-                last_port: row.get(4)?,
-                last_tls_port: row.get(5)?,
-                last_plain_port: row.get(6)?,
-                last_seen: row.get(7)?,
-                state: row.get(8)?,
+                display_name: row.get(3)?,
+                app_state: row.get(4)?,
+                last_ip: row.get(5)?,
+                last_port: row.get(6)?,
+                last_tls_port: row.get(7)?,
+                last_plain_port: row.get(8)?,
+                last_seen: row.get(9)?,
+                state: row.get(10)?,
                 prefer_tls: {
-                    let v: i64 = row.get(9)?;
+                    let v: i64 = row.get(11)?;
                     v != 0
                 },
-                last_insecure_seen: row.get(10)?,
+                last_insecure_seen: row.get(12)?,
                 quarantined: {
-                    let v: i64 = row.get(11)?;
+                    let v: i64 = row.get(13)?;
                     v != 0
                 },
             })
@@ -1427,6 +1580,16 @@ impl Db {
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_peers_info(&self) -> Result<Vec<PeerInfo>> {
+        let peers = self.list_peers()?;
+        let mut out = Vec::with_capacity(peers.len());
+        for peer in peers {
+            let shares = self.list_peer_shares(peer.id)?;
+            out.push(PeerInfo { peer, shares });
         }
         Ok(out)
     }
@@ -2376,7 +2539,8 @@ impl Db {
     pub fn get_peer(&self, peer_id: i64) -> Result<Option<PeerRow>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, pc_name, instance_id, last_ip, last_port, last_tls_port, last_plain_port,
+            SELECT id, pc_name, instance_id, display_name, app_state,
+                   last_ip, last_port, last_tls_port, last_plain_port,
                    last_seen, state, prefer_tls, last_insecure_seen, quarantined
             FROM peers
             WHERE id = ?1
@@ -2388,19 +2552,21 @@ impl Db {
                 id: row.get(0)?,
                 pc_name: row.get(1)?,
                 instance_id: row.get(2)?,
-                last_ip: row.get(3)?,
-                last_port: row.get(4)?,
-                last_tls_port: row.get(5)?,
-                last_plain_port: row.get(6)?,
-                last_seen: row.get(7)?,
-                state: row.get(8)?,
+                display_name: row.get(3)?,
+                app_state: row.get(4)?,
+                last_ip: row.get(5)?,
+                last_port: row.get(6)?,
+                last_tls_port: row.get(7)?,
+                last_plain_port: row.get(8)?,
+                last_seen: row.get(9)?,
+                state: row.get(10)?,
                 prefer_tls: {
-                    let v: i64 = row.get(9)?;
+                    let v: i64 = row.get(11)?;
                     v != 0
                 },
-                last_insecure_seen: row.get(10)?,
+                last_insecure_seen: row.get(12)?,
                 quarantined: {
-                    let v: i64 = row.get(11)?;
+                    let v: i64 = row.get(13)?;
                     v != 0
                 },
             }))
@@ -2460,6 +2626,20 @@ impl Db {
 
     pub fn delete_pending_request(&self, request_id: &str) -> Result<()> {
         self.delete_transfer_request(request_id)
+    }
+}
+
+fn transfer_mode_db(mode: TransferMode) -> &'static str {
+    match mode {
+        TransferMode::Manual => "manual",
+        TransferMode::Auto => "auto",
+    }
+}
+
+fn parse_transfer_mode_db(s: &str) -> TransferMode {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "auto" => TransferMode::Auto,
+        _ => TransferMode::Manual,
     }
 }
 

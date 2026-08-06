@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::advertise::AdvertisedShare;
 use crate::change::{BatchManifest, FileChunk};
 use crate::chat::{ChatAck, ChatMessage};
 use crate::default_wire_protocol_version;
@@ -12,6 +13,12 @@ pub struct HelloMessage {
     pub protocol_version: u16,
     pub pc_name: String,
     pub instance_id: String,
+    /// Human-facing label; defaults to `pc_name` when empty/absent.
+    #[serde(default)]
+    pub display_name: String,
+    /// Application role string (`mirrorhost`, `host_only`, …).
+    #[serde(default)]
+    pub app_state: String,
     /// TLS port
     pub listen_port: u16,
     /// Plain (no TLS) port
@@ -23,9 +30,24 @@ pub struct HelloMessage {
     /// uTP listen port (0 = not advertised / unknown).
     #[serde(default)]
     pub utp_port: u16,
-    pub shares: Vec<String>,
+    pub shares: Vec<AdvertisedShare>,
     #[serde(default = "default_accepts_remote_shares")]
     pub accepts_remote_shares: bool,
+}
+
+impl HelloMessage {
+    pub fn effective_display_name(&self) -> &str {
+        let trimmed = self.display_name.trim();
+        if trimmed.is_empty() {
+            &self.pc_name
+        } else {
+            trimmed
+        }
+    }
+
+    pub fn share_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.shares.iter().map(|s| s.name.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

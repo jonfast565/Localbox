@@ -1,7 +1,7 @@
 use localbox_models as models;
 use models::{
-    peer_key, peer_thread_id, share_thread_id, AppConfig, ApplicationState, BatchAck,
-    ConflictPolicy, HelloMessage, ShareConfig, ShareId, WireMessage,
+    peer_key, peer_thread_id, share_thread_id, AdvertisedShare, AppConfig, ApplicationState,
+    BatchAck, ConflictPolicy, HelloMessage, ShareConfig, ShareId, WireMessage,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -28,11 +28,13 @@ fn wire_message_json_round_trip() {
         protocol_version: models::WIRE_PROTOCOL_VERSION,
         pc_name: "pc-one".to_string(),
         instance_id: "inst".to_string(),
+        display_name: String::new(),
+        app_state: String::new(),
         listen_port: 5000,
         plain_port: 5002,
         use_tls_for_peers: true,
         utp_port: 5004,
-        shares: vec!["shareA".to_string(), "shareB".to_string()],
+        shares: vec![AdvertisedShare::new("shareA"), AdvertisedShare::new("shareB")],
         accepts_remote_shares: true,
     });
     let bytes = serde_json::to_vec(&msg).unwrap();
@@ -61,6 +63,7 @@ fn dht_and_utp_toggles_default_to_lan_only() {
     let mut cfg = AppConfig {
         pc_name: "pc".into(),
         instance_id: "i".into(),
+            display_name: String::new(),
         listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
         plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5002),
         use_tls_for_peers: true,
@@ -104,6 +107,7 @@ fn app_config_json_round_trip() {
     let cfg = AppConfig {
         pc_name: "pc-one".to_string(),
         instance_id: "inst-one".to_string(),
+            display_name: String::new(),
         listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
         plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5002),
         use_tls_for_peers: true,

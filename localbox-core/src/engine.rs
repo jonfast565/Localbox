@@ -715,6 +715,7 @@ mod tests {
         let cfg = AppConfig {
             pc_name: "pc-one".into(),
             instance_id: "inst".into(),
+            display_name: String::new(),
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             plain_listen_addr: "127.0.0.1:0".parse().unwrap(),
             use_tls_for_peers: false,

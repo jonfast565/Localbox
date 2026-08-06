@@ -29,7 +29,7 @@ fn db_sets_user_version_and_is_backward_openable() {
     }
 
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 8);
+    assert_eq!(db.schema_version().unwrap(), 10);
     // Should have created the full schema.
     assert!(db.list_shares_table().unwrap().is_empty());
 
@@ -66,7 +66,7 @@ fn db_migrates_http_port_column_to_plain_port() {
     }
 
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 8);
+    assert_eq!(db.schema_version().unwrap(), 10);
     drop(db);
 
     let conn = Connection::open(&path).unwrap();
@@ -144,7 +144,7 @@ fn db_migrates_v4_to_current_adds_intents_and_share_journal() {
     }
 
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 8);
+    assert_eq!(db.schema_version().unwrap(), 10);
     drop(db);
 
     let conn = Connection::open(&path).unwrap();
@@ -265,7 +265,7 @@ fn db_migrates_v6_to_v7_separates_seq_namespaces() {
     }
 
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 8);
+    assert_eq!(db.schema_version().unwrap(), 10);
     drop(db);
 
     let conn = Connection::open(&path).unwrap();

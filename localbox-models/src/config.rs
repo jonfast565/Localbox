@@ -88,6 +88,9 @@ pub struct AppConfig {
     pub tls_insecure_shared_cert: bool,
     pub remote_share_root: PathBuf,
     pub shares: Vec<ShareConfig>,
+    /// Optional human-facing label advertised to peers (defaults to `pc_name`).
+    #[serde(default)]
+    pub display_name: String,
     #[serde(default = "default_app_state")]
     pub app_state: ApplicationState,
     /// How inbound transfer requests are handled by default.
@@ -408,6 +411,15 @@ pub enum ApplicationState {
 }
 
 impl ApplicationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApplicationState::MirrorOnly => "mirror_only",
+            ApplicationState::HostOnly => "host_only",
+            ApplicationState::MirrorHost => "mirrorhost",
+            ApplicationState::Zombie => "zombie",
+        }
+    }
+
     pub fn can_share(self) -> bool {
         matches!(
             self,
@@ -424,6 +436,39 @@ impl ApplicationState {
 
     pub fn is_zombie(self) -> bool {
         matches!(self, ApplicationState::Zombie)
+    }
+}
+
+impl AppConfig {
+    pub fn effective_display_name(&self) -> &str {
+        let trimmed = self.display_name.trim();
+        if trimmed.is_empty() {
+            &self.pc_name
+        } else {
+            trimmed
+        }
+    }
+
+    /// Build wire ads for the given local share names (DB registry order).
+    pub fn advertised_shares_for(
+        &self,
+        names_and_recursive: &[(String, bool)],
+    ) -> Vec<crate::AdvertisedShare> {
+        if !self.app_state.can_share() {
+            return Vec::new();
+        }
+        names_and_recursive
+            .iter()
+            .map(|(name, recursive)| {
+                let from_cfg = self.shares.iter().find(|s| s.name == *name);
+                crate::AdvertisedShare {
+                    name: name.clone(),
+                    recursive: from_cfg.map(|s| s.recursive).unwrap_or(*recursive),
+                    sync: self.resolve_sync_mode(name, None),
+                    pull: self.resolve_pull_mode(name, None),
+                }
+            })
+            .collect()
     }
 }
 

@@ -408,6 +408,9 @@ async fn main() -> anyhow::Result<()> {
                             peer_table.set_header(vec![
                                 "id",
                                 "peer",
+                                "display",
+                                "app_state",
+                                "shares",
                                 "ip",
                                 "tls_port",
                                 "plain_port",
@@ -418,9 +421,19 @@ async fn main() -> anyhow::Result<()> {
                                 "quarantined",
                             ]);
                             for p in &peers {
+                                let share_names = db
+                                    .list_peer_shares(p.id)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|s| s.name)
+                                    .collect::<Vec<_>>()
+                                    .join(",");
                                 peer_table.add_row(vec![
                                     p.id.to_string(),
                                     format!("{}@{}", p.pc_name, p.instance_id),
+                                    p.display_name.clone(),
+                                    p.app_state.clone(),
+                                    share_names,
                                     p.last_ip.clone(),
                                     p.last_tls_port.to_string(),
                                     p.last_plain_port.to_string(),
@@ -591,7 +604,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
             match &args.command {
                 PeerCliCommand::List => {
-                    let peers = db.list_peers()?;
+                    let peers = db.list_peers_info()?;
                     if peers.is_empty() {
                         println!("(no peers)");
                     } else {
@@ -600,15 +613,28 @@ async fn main() -> anyhow::Result<()> {
                         peer_table.set_header(vec![
                             "id",
                             "peer",
+                            "display",
+                            "app_state",
+                            "shares",
                             "ip",
                             "state",
                             "last_seen",
                             "quarantined",
                         ]);
-                        for p in &peers {
+                        for info in &peers {
+                            let p = &info.peer;
+                            let share_names = info
+                                .shares
+                                .iter()
+                                .map(|s| s.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",");
                             peer_table.add_row(vec![
                                 p.id.to_string(),
                                 format!("{}@{}", p.pc_name, p.instance_id),
+                                p.display_name.clone(),
+                                p.app_state.clone(),
+                                share_names,
                                 p.last_ip.clone(),
                                 p.state.clone(),
                                 p.last_seen.to_string(),

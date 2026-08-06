@@ -362,6 +362,7 @@ fn test_config(
     AppConfig {
         pc_name: pc_name.to_string(),
         instance_id: instance_id.to_string(),
+            display_name: String::new(),
         listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port),
         plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listen_port + 1000),
         use_tls_for_peers: true,

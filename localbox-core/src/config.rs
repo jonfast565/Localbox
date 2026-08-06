@@ -872,6 +872,11 @@ impl Cli {
             .or_else(|| file_cfg.as_ref().and_then(|c| c.instance_id.clone()))
             .unwrap_or_else(|| DEFAULT_INSTANCE_ID.to_string());
 
+        let display_name = file_cfg
+            .as_ref()
+            .and_then(|c| c.display_name.clone())
+            .unwrap_or_default();
+
         let listen_port = run
             .listen_port
             .or_else(|| file_cfg.as_ref().and_then(|c| c.listen_port))
@@ -1001,6 +1006,7 @@ impl Cli {
         let mut cfg = AppConfig {
             pc_name,
             instance_id,
+            display_name,
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
             plain_listen_addr: SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -1314,6 +1320,8 @@ fn parse_share_arg(raw: &str) -> Result<ShareCli, String> {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     instance_id: Option<String>,
+    /// Optional human-facing label advertised to peers.
+    display_name: Option<String>,
     listen_port: Option<u16>,
     plain_listen_port: Option<u16>,
     discovery_port: Option<u16>,
@@ -1605,6 +1613,8 @@ fn default_config_template() -> String {
 # `pc_name` is derived from your hostname at runtime.
 
 instance_id = "{instance_id}"
+# Optional label advertised to peers (defaults to hostname / pc_name).
+# display_name = "Living Room"
 listen_port = {listen_port}
 plain_listen_port = {plain_listen_port}
 discovery_port = {discovery_port}
@@ -1817,6 +1827,7 @@ mod tests {
         let cfg = AppConfig {
             pc_name: "pc".to_string(),
             instance_id: "i".to_string(),
+            display_name: String::new(),
             listen_addr: "0.0.0.0:5000".parse().unwrap(),
             plain_listen_addr: "0.0.0.0:5002".parse().unwrap(),
             use_tls_for_peers: true,
@@ -1863,6 +1874,7 @@ mod tests {
         let cfg = AppConfig {
             pc_name: "pc".to_string(),
             instance_id: "i".to_string(),
+            display_name: String::new(),
             listen_addr: "0.0.0.0:5000".parse().unwrap(),
             plain_listen_addr: "0.0.0.0:5002".parse().unwrap(),
             use_tls_for_peers: true,

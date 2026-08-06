@@ -1,12 +1,11 @@
-use models::{BatchAck, BatchManifest, HelloMessage, ShareId, WireMessage};
+use models::{AdvertisedShare, BatchAck, BatchManifest, HelloMessage, ShareId, WireMessage};
 use localbox_protocol as protocol;
 use protocol::{parse_batch_manifest, parse_wire_message};
 
 #[test]
 fn parses_legacy_wire_message_without_protocol_version() {
     // Legacy JSON shape (before `protocol_version` fields existed).
-    let json =
-        r#"{"Hello":{"pc_name":"pc","instance_id":"inst","listen_port":5000,"shares":["s"]}}"#;
+    let json = r#"{"Hello":{"pc_name":"pc","instance_id":"inst","listen_port":5000,"shares":[{"name":"s"}]}}"#;
     let msg = parse_wire_message(json.as_bytes()).unwrap();
     match msg {
         WireMessage::Hello(h) => assert_eq!(h.protocol_version, models::WIRE_PROTOCOL_VERSION),
@@ -40,11 +39,13 @@ fn serde_round_trip_includes_protocol_version() {
         protocol_version: models::WIRE_PROTOCOL_VERSION,
         pc_name: "pc".to_string(),
         instance_id: "inst".to_string(),
+        display_name: String::new(),
+        app_state: String::new(),
         listen_port: 1,
         plain_port: 0,
         use_tls_for_peers: true,
         utp_port: 0,
-        shares: vec!["s".to_string()],
+        shares: vec![AdvertisedShare::new("s")],
         accepts_remote_shares: true,
     });
     let bytes = serde_json::to_vec(&hello).unwrap();

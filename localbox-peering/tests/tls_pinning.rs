@@ -21,6 +21,7 @@ fn pinning_blocks_auto_generation() {
     let cfg = AppConfig {
         pc_name: "pc".to_string(),
         instance_id: "inst".to_string(),
+            display_name: String::new(),
         listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
         plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5002),
         use_tls_for_peers: true,
@@ -96,6 +97,7 @@ fn pinning_allows_matching_ca() {
     let cfg = AppConfig {
         pc_name: "pc".to_string(),
         instance_id: "inst".to_string(),
+            display_name: String::new(),
         listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
         plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5002),
         use_tls_for_peers: true,

@@ -1,3 +1,4 @@
+use iced::widget::pane_grid::{self, PaneGrid};
 use iced::widget::{
     button, column, container, progress_bar, row, scrollable, text, text_input, Column, Space,
 };
@@ -11,14 +12,34 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::client::{self, ControlRequest, ControlResponse};
+use crate::prefs::{self, GuiPrefs, DEFAULT_LOG_TAIL_LINES};
 use crate::runtime::{ensure_runtime, stop_runtime, EnsureOpts, RuntimeHandle, RuntimeMode};
 use crate::theme;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatPane {
+    Inbox,
+    Thread,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusPane {
+    Shares,
+    Peers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransfersPane {
+    Pending,
+    Intents,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Status,
     Transfers,
     Chat,
+    Logs,
     Settings,
 }
 
@@ -33,9 +54,9 @@ pub enum Message {
     PeersLoaded(Result<ControlResponse, String>),
     SharesLoaded(Result<ControlResponse, String>),
     SettingsLoaded(Result<ControlResponse, String>),
+    LogsLoaded(Result<ControlResponse, String>),
     ThreadLoaded(Result<ControlResponse, String>),
     ActionDone(Result<ControlResponse, String>),
-    ShareInput(String),
     NewShareNameInput(String),
     NewSharePathInput(String),
     AddShare,
@@ -44,27 +65,34 @@ pub enum Message {
     ConfigSet,
     ConfigUnset,
     ConfigRefresh,
-    PeerInput(String),
+    SelectPeer(String),
+    SelectShare(String),
     PathInput(String),
     Push,
     Pull,
     Request,
     ReplyAccept(String),
     ReplyDecline(String),
-    ChatPeerInput(String),
-    ChatShareInput(String),
+    SelectChatPeer(String),
+    SelectChatShare(String),
     ChatBodyInput(String),
     ChatSend,
     SelectThread(String),
     MarkRead,
     QuarantinePeer(String),
     UnquarantinePeer(String),
+    LogTailInput(String),
+    SaveLogTail,
+    ChatPanesResized(pane_grid::ResizeEvent),
+    StatusPanesResized(pane_grid::ResizeEvent),
+    TransfersPanesResized(pane_grid::ResizeEvent),
     StartRuntime,
     StopRuntime,
     RuntimeStarted(Result<(String, bool), String>),
     RuntimeStopped(Result<String, String>),
     ClearFlash,
     SyncSystemTheme,
+    Tick,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,10 +120,30 @@ struct ShareInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct AdvertisedShareInfo {
+    name: String,
+    #[serde(default = "default_true_bool")]
+    #[allow(dead_code)]
+    recursive: bool,
+    #[serde(default)]
+    sync: String,
+    #[serde(default)]
+    pull: String,
+}
+
+fn default_true_bool() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct PeerInfo {
     id: i64,
     pc_name: String,
     instance_id: String,
+    #[serde(default)]
+    display_name: String,
+    #[serde(default)]
+    app_state: String,
     last_ip: String,
     last_port: i64,
     #[serde(default)]
@@ -104,6 +152,23 @@ struct PeerInfo {
     state: String,
     #[serde(default)]
     quarantined: bool,
+    #[serde(default)]
+    shares: Vec<AdvertisedShareInfo>,
+}
+
+impl PeerInfo {
+    fn peer_key(&self) -> String {
+        format!("{}@{}", self.pc_name, self.instance_id)
+    }
+
+    fn label(&self) -> String {
+        let trimmed = self.display_name.trim();
+        if trimmed.is_empty() {
+            self.pc_name.clone()
+        } else {
+            trimmed.to_string()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -201,6 +266,20 @@ pub struct App {
     chat_share: String,
     chat_body: String,
     selected_thread: Option<String>,
+    log_lines: Vec<String>,
+    log_path: String,
+    log_truncated: bool,
+    log_total_lines: usize,
+    log_tail_lines: usize,
+    log_tail_input: String,
+    prefs_path: PathBuf,
+    chat_split_ratio: f32,
+    status_split_ratio: f32,
+    transfers_split_ratio: f32,
+    chat_panes: pane_grid::State<ChatPane>,
+    status_panes: pane_grid::State<StatusPane>,
+    transfers_panes: pane_grid::State<TransfersPane>,
+    split_prefs_dirty: bool,
 }
 
 impl App {
@@ -216,6 +295,12 @@ impl App {
                 None => ("stopped".into(), false),
             }
         };
+        let prefs_path = prefs::default_prefs_path();
+        let prefs = GuiPrefs::load(&prefs_path);
+        let log_tail_lines = GuiPrefs::clamp_log_tail_lines(prefs.log_tail_lines);
+        let chat_split_ratio = GuiPrefs::clamp_split_ratio(prefs.chat_split_ratio);
+        let status_split_ratio = GuiPrefs::clamp_split_ratio(prefs.status_split_ratio);
+        let transfers_split_ratio = GuiPrefs::clamp_split_ratio(prefs.transfers_split_ratio);
         let app = Self {
             socket,
             ensure_opts,
@@ -246,6 +331,35 @@ impl App {
             chat_share: String::new(),
             chat_body: String::new(),
             selected_thread: None,
+            log_lines: Vec::new(),
+            log_path: String::new(),
+            log_truncated: false,
+            log_total_lines: 0,
+            log_tail_lines,
+            log_tail_input: log_tail_lines.to_string(),
+            prefs_path,
+            chat_split_ratio,
+            status_split_ratio,
+            transfers_split_ratio,
+            chat_panes: two_pane_state(
+                pane_grid::Axis::Vertical,
+                chat_split_ratio,
+                ChatPane::Inbox,
+                ChatPane::Thread,
+            ),
+            status_panes: two_pane_state(
+                pane_grid::Axis::Horizontal,
+                status_split_ratio,
+                StatusPane::Shares,
+                StatusPane::Peers,
+            ),
+            transfers_panes: two_pane_state(
+                pane_grid::Axis::Vertical,
+                transfers_split_ratio,
+                TransfersPane::Pending,
+                TransfersPane::Intents,
+            ),
+            split_prefs_dirty: false,
         };
         (app, Task::done(Message::Refresh))
     }
@@ -303,6 +417,57 @@ impl App {
                 });
                 Task::none()
             }
+            Message::LogsLoaded(res) => {
+                match &res {
+                    Ok(resp)
+                        if !resp.ok
+                            && resp.message.contains("unknown variant")
+                            && resp.message.contains("logs") =>
+                    {
+                        self.connected = true;
+                        self.flash = Some((
+                            false,
+                            "Runtime is too old for Logs — Stop, then Start (or restart `localbox run`) to load the new binary.".into(),
+                        ));
+                        return Task::none();
+                    }
+                    Err(e) if e.contains("unknown variant") && e.contains("logs") => {
+                        self.flash = Some((
+                            false,
+                            "Runtime is too old for Logs — Stop, then Start (or restart `localbox run`) to load the new binary.".into(),
+                        ));
+                        return Task::none();
+                    }
+                    _ => {}
+                }
+                self.apply_result(res, |app, resp| {
+                    if let Some(data) = &resp.data {
+                        app.log_path = data
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        app.log_truncated = data
+                            .get("truncated")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        app.log_total_lines = data
+                            .get("total_lines")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        app.log_lines = data
+                            .get("lines")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    }
+                });
+                Task::none()
+            }
             Message::ThreadLoaded(res) => {
                 self.apply_result(res, |app, resp| {
                     app.messages = parse_vec(&resp);
@@ -330,10 +495,6 @@ impl App {
                     }
                 }
                 Task::done(Message::Refresh)
-            }
-            Message::ShareInput(s) => {
-                self.share = s;
-                Task::none()
             }
             Message::NewShareNameInput(s) => {
                 self.new_share_name = s;
@@ -392,8 +553,12 @@ impl App {
                 }
                 self.transfer_action(ControlRequest::ConfigUnset { key })
             }
-            Message::PeerInput(s) => {
+            Message::SelectPeer(s) => {
                 self.peer = s;
+                Task::none()
+            }
+            Message::SelectShare(s) => {
+                self.share = s;
                 Task::none()
             }
             Message::PathInput(s) => {
@@ -425,12 +590,14 @@ impl App {
                 accept: false,
                 reason: Some("declined from GUI".into()),
             }),
-            Message::ChatPeerInput(s) => {
+            Message::SelectChatPeer(s) => {
                 self.chat_peer = s;
+                self.chat_share.clear();
                 Task::none()
             }
-            Message::ChatShareInput(s) => {
+            Message::SelectChatShare(s) => {
                 self.chat_share = s;
+                self.chat_peer.clear();
                 Task::none()
             }
             Message::ChatBodyInput(s) => {
@@ -451,11 +618,21 @@ impl App {
             }
             Message::SelectThread(id) => {
                 if let Some(thread) = self.threads.iter().find(|t| t.id == id) {
-                    if let Some(pk) = &thread.peer_key {
-                        self.chat_peer = pk.clone();
-                    }
-                    if let Some(sn) = &thread.share_name {
-                        self.chat_share = sn.clone();
+                    match thread.kind.as_str() {
+                        "share" => {
+                            self.chat_peer.clear();
+                            self.chat_share = thread
+                                .share_name
+                                .clone()
+                                .unwrap_or_else(|| thread.title.clone());
+                        }
+                        _ => {
+                            self.chat_share.clear();
+                            self.chat_peer = thread
+                                .peer_key
+                                .clone()
+                                .unwrap_or_else(|| thread.title.clone());
+                        }
                     }
                 }
                 self.selected_thread = Some(id);
@@ -587,6 +764,67 @@ impl App {
                 self.flash = None;
                 Task::none()
             }
+            Message::LogTailInput(s) => {
+                self.log_tail_input = s;
+                Task::none()
+            }
+            Message::SaveLogTail => {
+                let parsed = self.log_tail_input.trim().parse::<usize>().ok();
+                let Some(n) = parsed else {
+                    self.flash = Some((false, "log line limit must be a number".into()));
+                    return Task::none();
+                };
+                let n = GuiPrefs::clamp_log_tail_lines(n);
+                self.log_tail_lines = n;
+                self.log_tail_input = n.to_string();
+                match self.persist_prefs() {
+                    Ok(()) => {
+                        self.flash = Some((
+                            true,
+                            format!("log window set to {n} lines (saved to UI prefs)"),
+                        ));
+                        if self.tab == Tab::Logs {
+                            Task::done(Message::Refresh)
+                        } else {
+                            Task::none()
+                        }
+                    }
+                    Err(e) => {
+                        self.flash = Some((false, format!("failed to save UI prefs: {e}")));
+                        Task::none()
+                    }
+                }
+            }
+            Message::ChatPanesResized(event) => {
+                self.chat_panes.resize(event.split, event.ratio);
+                self.chat_split_ratio = GuiPrefs::clamp_split_ratio(event.ratio);
+                self.split_prefs_dirty = true;
+                Task::none()
+            }
+            Message::StatusPanesResized(event) => {
+                self.status_panes.resize(event.split, event.ratio);
+                self.status_split_ratio = GuiPrefs::clamp_split_ratio(event.ratio);
+                self.split_prefs_dirty = true;
+                Task::none()
+            }
+            Message::TransfersPanesResized(event) => {
+                self.transfers_panes.resize(event.split, event.ratio);
+                self.transfers_split_ratio = GuiPrefs::clamp_split_ratio(event.ratio);
+                self.split_prefs_dirty = true;
+                Task::none()
+            }
+            Message::Tick => {
+                if self.split_prefs_dirty {
+                    if self.persist_prefs().is_ok() {
+                        self.split_prefs_dirty = false;
+                    }
+                }
+                if self.tab == Tab::Logs && self.connected {
+                    Task::done(Message::Refresh)
+                } else {
+                    Task::none()
+                }
+            }
             Message::SyncSystemTheme => {
                 let dark = theme::system_is_dark();
                 if self.dark != dark {
@@ -598,11 +836,24 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        time::every(Duration::from_secs(2)).map(|_| Message::SyncSystemTheme)
+        Subscription::batch([
+            time::every(Duration::from_secs(2)).map(|_| Message::SyncSystemTheme),
+            time::every(Duration::from_secs(2)).map(|_| Message::Tick),
+        ])
     }
 
     fn colors(&self) -> &'static Colors {
         theme::palette(self.dark)
+    }
+
+    fn persist_prefs(&self) -> std::io::Result<()> {
+        GuiPrefs {
+            log_tail_lines: self.log_tail_lines,
+            chat_split_ratio: self.chat_split_ratio,
+            status_split_ratio: self.status_split_ratio,
+            transfers_split_ratio: self.transfers_split_ratio,
+        }
+        .save(&self.prefs_path)
     }
 
     fn refresh_tasks(&self) -> Task<Message> {
@@ -703,6 +954,17 @@ impl App {
                 }
                 Task::batch(tasks)
             }
+            Tab::Logs => {
+                let limit = self.log_tail_lines;
+                Task::perform(
+                    async move {
+                        client::send_request(&sock, &ControlRequest::Logs { limit: Some(limit) })
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::LogsLoaded,
+                )
+            }
             Tab::Settings => Task::perform(
                 async move {
                     client::send_request(&sock, &ControlRequest::ConfigList)
@@ -799,6 +1061,7 @@ impl App {
                 tab_btn("Status", Tab::Status, self.tab),
                 tab_btn("Transfers", Tab::Transfers, self.tab),
                 tab_btn("Chat", Tab::Chat, self.tab),
+                tab_btn("Logs", Tab::Logs, self.tab),
                 tab_btn("Settings", Tab::Settings, self.tab),
             ]
             .spacing(6),
@@ -828,6 +1091,7 @@ impl App {
             Tab::Status => status_view(self),
             Tab::Transfers => transfers_view(self),
             Tab::Chat => chat_view(self),
+            Tab::Logs => logs_view(self),
             Tab::Settings => settings_view(self),
         };
 
@@ -879,6 +1143,123 @@ fn status_view(app: &App) -> Element<'_, Message> {
         Length::Shrink,
     );
 
+    let panes = PaneGrid::new(&app.status_panes, |_pane, kind, _maximized| {
+        let body = match kind {
+            StatusPane::Shares => status_shares_body(app),
+            StatusPane::Peers => status_peers_body(app),
+        };
+        resizable_pane(body)
+    })
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .spacing(10)
+    .on_resize(8, Message::StatusPanesResized)
+    .style(theme::pane_grid_style);
+
+    column![
+        section_title("Overview", c),
+        metrics,
+        add_share,
+        panes,
+    ]
+    .spacing(10)
+    .height(Length::Fill)
+    .into()
+}
+
+fn transfers_view(app: &App) -> Element<'_, Message> {
+    let c = app.colors();
+    let form = panel_sized(
+        column![
+            section_title("Manual transfer", c),
+            picker_row(
+                "Peer",
+                &app.peer,
+                peer_picker_options(app),
+                Message::SelectPeer,
+                c,
+            ),
+            picker_row(
+                "Share",
+                &app.share,
+                share_picker_options(app),
+                Message::SelectShare,
+                c,
+            ),
+            labeled_input("Path", &app.path, Message::PathInput, c),
+            row![
+                styled_button("Push", Message::Push, theme::btn_primary),
+                styled_button("Pull", Message::Pull, theme::btn_secondary),
+                styled_button("Request", Message::Request, theme::btn_secondary),
+            ]
+            .spacing(8),
+        ]
+        .spacing(12),
+        Length::Fill,
+        Length::Shrink,
+    );
+
+    let panes = PaneGrid::new(&app.transfers_panes, |_pane, kind, _maximized| {
+        let body = match kind {
+            TransfersPane::Pending => transfers_pending_body(app),
+            TransfersPane::Intents => transfers_intents_body(app),
+        };
+        resizable_pane(body)
+    })
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .spacing(12)
+    .on_resize(8, Message::TransfersPanesResized)
+    .style(theme::pane_grid_style);
+
+    column![form, panes]
+        .spacing(12)
+        .height(Length::Fill)
+        .into()
+}
+
+fn chat_view(app: &App) -> Element<'_, Message> {
+    PaneGrid::new(&app.chat_panes, |_pane, kind, _maximized| {
+        let body = match kind {
+            ChatPane::Inbox => chat_inbox_body(app),
+            ChatPane::Thread => chat_thread_body(app),
+        };
+        resizable_pane(body)
+    })
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .spacing(12)
+    .on_resize(8, Message::ChatPanesResized)
+    .style(theme::pane_grid_style)
+    .into()
+}
+
+fn two_pane_state<T: Copy>(
+    axis: pane_grid::Axis,
+    ratio: f32,
+    a: T,
+    b: T,
+) -> pane_grid::State<T> {
+    pane_grid::State::with_configuration(pane_grid::Configuration::Split {
+        axis,
+        ratio: GuiPrefs::clamp_split_ratio(ratio),
+        a: Box::new(pane_grid::Configuration::Pane(a)),
+        b: Box::new(pane_grid::Configuration::Pane(b)),
+    })
+}
+
+fn resizable_pane(body: Element<'_, Message>) -> pane_grid::Content<'_, Message> {
+    pane_grid::Content::new(
+        container(body)
+            .padding(16)
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .style(theme::panel_style)
+}
+
+fn status_shares_body(app: &App) -> Element<'_, Message> {
+    let c = app.colors();
     let mut shares_col: Column<'_, Message> = column![section_title("Shares", c)].spacing(6);
     if app.local_shares.is_empty() {
         shares_col = shares_col.push(empty_state("No local shares yet.", c));
@@ -904,7 +1285,11 @@ fn status_view(app: &App) -> Element<'_, Message> {
             );
         }
     }
+    scrollable(shares_col).height(Length::Fill).into()
+}
 
+fn status_peers_body(app: &App) -> Element<'_, Message> {
+    let c = app.colors();
     let mut peers_col: Column<'_, Message> = column![section_title("Peers", c)].spacing(8);
     if app.peers.is_empty() {
         peers_col = peers_col.push(empty_state("No peers discovered yet.", c));
@@ -913,42 +1298,11 @@ fn status_view(app: &App) -> Element<'_, Message> {
             peers_col = peers_col.push(peer_card(peer, c));
         }
     }
-
-    column![
-        section_title("Overview", c),
-        metrics,
-        add_share,
-        panel(scrollable(shares_col).height(Length::FillPortion(1)), Length::Fill),
-        panel(scrollable(peers_col).height(Length::FillPortion(1)), Length::Fill),
-    ]
-    .spacing(10)
-    .height(Length::Fill)
-    .into()
+    scrollable(peers_col).height(Length::Fill).into()
 }
 
-fn transfers_view(app: &App) -> Element<'_, Message> {
+fn transfers_pending_body(app: &App) -> Element<'_, Message> {
     let c = app.colors();
-    let form = panel_sized(
-        column![
-            section_title("Manual transfer", c),
-            row![
-                labeled_input("Share", &app.share, Message::ShareInput, c),
-                labeled_input("Peer", &app.peer, Message::PeerInput, c),
-                labeled_input("Path", &app.path, Message::PathInput, c),
-            ]
-            .spacing(12),
-            row![
-                styled_button("Push", Message::Push, theme::btn_primary),
-                styled_button("Pull", Message::Pull, theme::btn_secondary),
-                styled_button("Request", Message::Request, theme::btn_secondary),
-            ]
-            .spacing(8),
-        ]
-        .spacing(12),
-        Length::Fill,
-        Length::Shrink,
-    );
-
     let mut pending_col: Column<'_, Message> =
         column![section_title("Pending inbound requests", c)].spacing(8);
     if app.pending.is_empty() {
@@ -958,7 +1312,11 @@ fn transfers_view(app: &App) -> Element<'_, Message> {
             pending_col = pending_col.push(pending_card(req, c));
         }
     }
+    scrollable(pending_col).height(Length::Fill).into()
+}
 
+fn transfers_intents_body(app: &App) -> Element<'_, Message> {
+    let c = app.colors();
     let mut intents_col: Column<'_, Message> =
         column![section_title("Active transfer intents", c)].spacing(8);
     if app.intents.is_empty() {
@@ -968,28 +1326,10 @@ fn transfers_view(app: &App) -> Element<'_, Message> {
             intents_col = intents_col.push(intent_card(intent, c));
         }
     }
-
-    column![
-        form,
-        row![
-            panel(
-                scrollable(pending_col).height(Length::Fill),
-                Length::FillPortion(1),
-            ),
-            panel(
-                scrollable(intents_col).height(Length::Fill),
-                Length::FillPortion(1),
-            ),
-        ]
-        .spacing(12)
-        .height(Length::Fill),
-    ]
-    .spacing(12)
-    .height(Length::Fill)
-    .into()
+    scrollable(intents_col).height(Length::Fill).into()
 }
 
-fn chat_view(app: &App) -> Element<'_, Message> {
+fn chat_inbox_body(app: &App) -> Element<'_, Message> {
     let c = app.colors();
     let mut inbox_col: Column<'_, Message> = column![section_title("Inbox", c)].spacing(6);
     if app.threads.is_empty() {
@@ -1000,7 +1340,11 @@ fn chat_view(app: &App) -> Element<'_, Message> {
             inbox_col = inbox_col.push(thread_item(thread, selected, c));
         }
     }
+    scrollable(inbox_col).height(Length::Fill).into()
+}
 
+fn chat_thread_body(app: &App) -> Element<'_, Message> {
+    let c = app.colors();
     let title = app
         .selected_thread
         .as_ref()
@@ -1020,11 +1364,20 @@ fn chat_view(app: &App) -> Element<'_, Message> {
     }
 
     let composer = column![
-        row![
-            labeled_input("Peer", &app.chat_peer, Message::ChatPeerInput, c),
-            labeled_input("Share", &app.chat_share, Message::ChatShareInput, c),
-        ]
-        .spacing(8),
+        picker_row(
+            "Peer DM",
+            &app.chat_peer,
+            peer_picker_options(app),
+            Message::SelectChatPeer,
+            c,
+        ),
+        picker_row(
+            "Share thread",
+            &app.chat_share,
+            share_picker_options(app),
+            Message::SelectChatShare,
+            c,
+        ),
         row![
             text_input("Write a message…", &app.chat_body)
                 .on_input(Message::ChatBodyInput)
@@ -1038,7 +1391,7 @@ fn chat_view(app: &App) -> Element<'_, Message> {
     ]
     .spacing(8);
 
-    let thread_pane = column![
+    column![
         row![
             text(title).size(16).color(c.text),
             Space::with_width(Length::Fill),
@@ -1050,19 +1403,97 @@ fn chat_view(app: &App) -> Element<'_, Message> {
     ]
     .spacing(10)
     .width(Length::Fill)
-    .height(Length::Fill);
+    .height(Length::Fill)
+    .into()
+}
 
-    row![
-        panel(scrollable(inbox_col).height(Length::Fill), Length::Fixed(120.0)),
-        panel(thread_pane, Length::Fill),
+fn logs_view(app: &App) -> Element<'_, Message> {
+    let c = app.colors();
+    let meta = if app.log_path.is_empty() {
+        "Waiting for log tail…".to_string()
+    } else if app.log_truncated {
+        format!(
+            "{} · showing last {} of {} lines",
+            app.log_path, app.log_tail_lines, app.log_total_lines
+        )
+    } else {
+        format!(
+            "{} · {} line{}",
+            app.log_path,
+            app.log_total_lines,
+            if app.log_total_lines == 1 { "" } else { "s" }
+        )
+    };
+
+    let mut lines_col: Column<'_, Message> = column![].spacing(2);
+    if app.log_lines.is_empty() {
+        lines_col = lines_col.push(empty_state("No log lines yet.", c));
+    } else {
+        for line in &app.log_lines {
+            lines_col = lines_col.push(
+                text(line.clone())
+                    .size(12)
+                    .font(iced::Font::MONOSPACE)
+                    .color(c.text),
+            );
+        }
+    }
+
+    column![
+        row![
+            column![
+                section_title("Engine logs", c),
+                text(meta).size(12).color(c.muted),
+            ]
+            .spacing(4)
+            .width(Length::Fill),
+            row![
+                labeled_input("Lines", &app.log_tail_input, Message::LogTailInput, c),
+                styled_button("Apply", Message::SaveLogTail, theme::btn_secondary),
+            ]
+            .spacing(8)
+            .align_y(Alignment::End),
+        ]
+        .spacing(12)
+        .align_y(Alignment::End),
+        panel(scrollable(lines_col).height(Length::Fill), Length::Fill),
     ]
-    .spacing(12)
+    .spacing(10)
     .height(Length::Fill)
     .into()
 }
 
 fn settings_view(app: &App) -> Element<'_, Message> {
     let c = app.colors();
+    let ui_prefs = column![
+        section_title("UI preferences", c),
+        text(format!(
+            "Stored in {} (GUI only; not sent to the engine).",
+            app.prefs_path.display()
+        ))
+        .size(12)
+        .color(c.muted),
+        row![
+            labeled_input(
+                "Log tail lines",
+                &app.log_tail_input,
+                Message::LogTailInput,
+                c,
+            ),
+            styled_button("Save", Message::SaveLogTail, theme::btn_primary),
+        ]
+        .spacing(8)
+        .align_y(Alignment::End),
+        text(format!(
+            "Rolling window for the Logs tab (default {DEFAULT_LOG_TAIL_LINES}; min {}; max {}).",
+            prefs::MIN_LOG_TAIL_LINES,
+            prefs::MAX_LOG_TAIL_LINES
+        ))
+        .size(12)
+        .color(c.muted),
+    ]
+    .spacing(8);
+
     let editor = column![
         section_title("Override setting", c),
         text("Saved values override config.toml; unset falls back to the file/defaults. CLI flags still win for the current process.")
@@ -1092,7 +1523,8 @@ fn settings_view(app: &App) -> Element<'_, Message> {
     }
 
     column![
-        panel(editor, Length::Fill),
+        panel(ui_prefs, Length::Shrink),
+        panel(editor, Length::Shrink),
         panel(scrollable(list).height(Length::Fill), Length::Fill),
     ]
     .spacing(12)
@@ -1128,7 +1560,7 @@ fn setting_row<'a>(row: &'a SettingRow, c: &'a Colors) -> Element<'a, Message> {
 }
 
 fn peer_card<'a>(peer: &'a PeerInfo, c: &'a Colors) -> Element<'a, Message> {
-    let key = format!("{}@{}", peer.pc_name, peer.instance_id);
+    let key = peer.peer_key();
     let endpoint = if peer.last_tls_port > 0 {
         format!(
             "{}:{} (tls {})",
@@ -1152,26 +1584,51 @@ fn peer_card<'a>(peer: &'a PeerInfo, c: &'a Colors) -> Element<'a, Message> {
         )
     };
 
+    let label = peer.label();
     let mut title = row![
-        text(&peer.pc_name).size(15).color(c.text),
+        text(label).size(15).color(c.text),
         status_pill(&peer.state, c),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
+    if !peer.app_state.is_empty() {
+        title = title.push(status_pill(&peer.app_state, c));
+    }
     if peer.quarantined {
         title = title.push(status_pill("quarantined", c));
     }
+
+    let shares_line = if peer.shares.is_empty() {
+        "No advertised shares".to_string()
+    } else {
+        peer.shares
+            .iter()
+            .map(|s| {
+                format!(
+                    "{} (sync={}, pull={})",
+                    s.name,
+                    if s.sync.is_empty() { "manual" } else { &s.sync },
+                    if s.pull.is_empty() { "manual" } else { &s.pull },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
 
     container(
         row![
             column![
                 title,
-                text(format!("#{} · instance {}", peer.id, peer.instance_id))
-                    .size(12)
-                    .color(c.muted),
+                text(format!(
+                    "{} · #{} · instance {}",
+                    peer.pc_name, peer.id, peer.instance_id
+                ))
+                .size(12)
+                .color(c.muted),
                 text(format!("{endpoint} · last seen {seen}"))
                     .size(12)
                     .color(c.muted),
+                text(shares_line).size(12).color(c.muted),
             ]
             .spacing(4)
             .width(Length::Fill),
@@ -1445,6 +1902,83 @@ fn labeled_input<'a>(
     .spacing(4)
     .width(Length::Fill)
     .into()
+}
+
+fn peer_picker_options(app: &App) -> Vec<(String, String)> {
+    app.peers
+        .iter()
+        .map(|p| (p.peer_key(), p.label()))
+        .collect()
+}
+
+fn share_picker_options(app: &App) -> Vec<(String, String)> {
+    let mut names: Vec<String> = app
+        .local_shares
+        .iter()
+        .map(|s| s.share_name.clone())
+        .collect();
+    for peer in &app.peers {
+        for share in &peer.shares {
+            if !names.iter().any(|n| n == &share.name) {
+                names.push(share.name.clone());
+            }
+        }
+    }
+    names.sort();
+    names.into_iter().map(|n| (n.clone(), n)).collect()
+}
+
+fn picker_row<'a>(
+    label: &'a str,
+    selected: &str,
+    options: Vec<(String, String)>,
+    on_pick: impl Fn(String) -> Message + Copy + 'a,
+    c: &'a Colors,
+) -> Element<'a, Message> {
+    let mut chips = row![].spacing(6);
+    if options.is_empty() {
+        chips = chips.push(text("None discovered yet").size(12).color(c.muted));
+    } else {
+        for (value, caption) in options {
+            let active = selected == value;
+            chips = chips.push(picker_chip(caption, value, active, on_pick, c));
+        }
+    }
+    column![
+        text(label).size(12).color(c.muted),
+        text(if selected.is_empty() {
+            "(none selected)".into()
+        } else {
+            selected.to_string()
+        })
+        .size(12)
+        .color(c.text),
+        scrollable(chips).direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new(),
+        )),
+    ]
+    .spacing(4)
+    .width(Length::Fill)
+    .into()
+}
+
+fn picker_chip<'a>(
+    caption: String,
+    value: String,
+    active: bool,
+    on_pick: impl Fn(String) -> Message + 'a,
+    _c: &'a Colors,
+) -> Element<'a, Message> {
+    let style = if active {
+        theme::btn_primary
+    } else {
+        theme::btn_ghost
+    };
+    button(text(caption).size(12))
+        .padding(Padding::from([6, 10]))
+        .style(style)
+        .on_press(on_pick(value))
+        .into()
 }
 
 fn tab_btn(label: &str, tab: Tab, active: Tab) -> Element<'_, Message> {

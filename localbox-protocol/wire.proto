@@ -2,14 +2,27 @@ syntax = "proto3";
 
 package protocol;
 
+message AdvertisedShare {
+  string name = 1;
+  bool recursive = 2;
+  // "manual" | "auto"
+  string sync = 3;
+  string pull = 4;
+}
+
 message Hello {
   string pc_name = 1;
   string instance_id = 2;
   uint32 listen_port = 3;
+  // Deprecated: kept for wire field number stability; prefer advertised_shares.
   repeated string shares = 4;
   uint32 plain_port = 5;
   bool use_tls_for_peers = 6;
   bool decline_remote_shares = 7;
+  string display_name = 8;
+  string app_state = 9;
+  uint32 utp_port = 10;
+  repeated AdvertisedShare advertised_shares = 11;
 }
 
 enum ChangeKind {

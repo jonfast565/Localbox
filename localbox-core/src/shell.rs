@@ -224,6 +224,7 @@ fn print_help() {
     println!(
         "Commands:\n\
          \x20 status | peers | shares | pending | intents [--all] [--limit N]\n\
+         \x20 logs [--limit N]  — tail the engine log file\n\
          \x20 share list | share add --name NAME --path DIR [--recursive true|false]\n\
          \x20 config list | config get KEY | config set KEY VALUE | config unset KEY\n\
          \x20 intent show --id ID\n\
@@ -321,6 +322,12 @@ pub fn parse_repl_to_request(line: &str) -> Result<ControlRequest> {
             }
         }
         "pending" | "pending_requests" => Ok(ControlRequest::PendingRequests),
+        "logs" | "log" => {
+            let args = parse_flags(&parts[1..])?;
+            Ok(ControlRequest::Logs {
+                limit: args.get("limit").and_then(|s| s.parse().ok()),
+            })
+        }
         "intents" => {
             let args = parse_flags(&parts[1..])?;
             Ok(ControlRequest::Intents {

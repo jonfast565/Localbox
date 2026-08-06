@@ -13,6 +13,7 @@ fn test_config(pc_name: &str, share_name: &str) -> AppConfig {
     AppConfig {
         pc_name: pc_name.to_string(),
         instance_id: "inst".to_string(),
+            display_name: String::new(),
         listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         use_tls_for_peers: true,
@@ -236,7 +237,7 @@ fn journal_append_and_list() {
 #[test]
 fn schema_version_is_current() {
     let db = Db::open_in_memory().unwrap();
-    assert_eq!(db.schema_version().unwrap(), 8);
+    assert_eq!(db.schema_version().unwrap(), 10);
 }
 
 #[test]
@@ -395,7 +396,7 @@ fn migrates_v4_to_v6_renames_share_journal() {
         .unwrap();
     }
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 8);
+    assert_eq!(db.schema_version().unwrap(), 10);
     assert_eq!(db.journal_entry_count().unwrap(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1055,4 +1056,44 @@ fn sent_outbound_rows_are_reclaimed() {
         .unwrap();
     assert_eq!(db.cleanup_old_batches(-60).unwrap(), 0);
     assert_eq!(db.outbound_queue_depth().unwrap(), 1);
+}
+
+
+#[test]
+fn set_peer_shares_stores_structured_ads() {
+    use models::{AdvertisedShare, TransferMode};
+    let db = Db::open_in_memory().unwrap();
+    let addr: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let peer_id = db
+        .upsert_peer_with_meta(
+            "bob",
+            "1",
+            addr,
+            100,
+            "connected",
+            5000,
+            5002,
+            true,
+            "Bob Desk",
+            "mirrorhost",
+        )
+        .unwrap();
+    let ads = vec![AdvertisedShare {
+        name: "docs".into(),
+        recursive: true,
+        sync: TransferMode::Auto,
+        pull: TransferMode::Manual,
+    }];
+    db.set_peer_shares(peer_id, &ads).unwrap();
+    let got = db.list_peer_shares(peer_id).unwrap();
+    assert_eq!(got, ads);
+    let info = db.list_peers_info().unwrap();
+    assert_eq!(info.len(), 1);
+    assert_eq!(info[0].peer.display_name, "Bob Desk");
+    assert_eq!(info[0].shares, ads);
+    assert_eq!(
+        db.refresh_chat_thread_titles_for_peer("bob@1", "Bob Desk")
+            .unwrap(),
+        0
+    );
 }

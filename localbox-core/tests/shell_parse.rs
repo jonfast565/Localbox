@@ -64,3 +64,24 @@ fn parses_share_add_and_list() {
     let req = parse_repl_to_request("share list").unwrap();
     assert!(matches!(req, ControlRequest::ShareList));
 }
+
+#[test]
+fn parses_logs_tail() {
+    let req = parse_repl_to_request("logs").unwrap();
+    assert!(matches!(req, ControlRequest::Logs { limit: None }));
+    let req = parse_repl_to_request("logs --limit 50").unwrap();
+    match req {
+        ControlRequest::Logs { limit: Some(50) } => {}
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+
+#[test]
+fn logs_request_serde_round_trip() {
+    let req = ControlRequest::Logs { limit: Some(100) };
+    let json = serde_json::to_string(&req).unwrap();
+    assert!(json.contains(r#""cmd":"logs""#), "got {json}");
+    let back: ControlRequest = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back, ControlRequest::Logs { limit: Some(100) }));
+}

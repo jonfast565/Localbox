@@ -21,3 +21,4 @@ certs/
 sync.db
 sync.log
 config.toml
+localbox-gui.toml

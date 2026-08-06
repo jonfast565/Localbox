@@ -399,6 +399,7 @@ mod tests {
         let cfg = AppConfig {
             pc_name: node.to_string(),
             instance_id: format!("{node}-inst"),
+            display_name: String::new(),
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             use_tls_for_peers: true,

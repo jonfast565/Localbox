@@ -106,6 +106,11 @@ pub enum ControlRequest {
     ConfigUnset {
         key: String,
     },
+    /// Tail the engine log file (`log_path`). Returns the last `limit` lines.
+    Logs {
+        /// Max lines to return (default 100, capped).
+        limit: Option<usize>,
+    },
     /// Disconnect this control client only; does not stop the daemon.
     Quit,
     /// Cancel the engine (`CancellationToken`) and shut down the daemon.
@@ -345,7 +350,7 @@ impl ControlService {
                 ))
             }
             ControlRequest::PeerList => {
-                let peers = self.db.lock().await.list_peers()?;
+                let peers = self.db.lock().await.list_peers_info()?;
                 Ok(ControlResponse::ok_data(
                     "peers",
                     serde_json::to_value(peers)?,
@@ -411,7 +416,30 @@ impl ControlService {
                     }),
                 ))
             }
+            ControlRequest::Logs { limit } => self.tail_logs(limit).await,
         }
+    }
+
+    async fn tail_logs(&self, limit: Option<usize>) -> Result<ControlResponse> {
+        const DEFAULT_LIMIT: usize = 100;
+        const MAX_LIMIT: usize = 10_000;
+        let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+        let path = self.cfg_snapshot().log_path;
+        let path_display = path.display().to_string();
+        let (lines, truncated, total_lines) =
+            tokio::task::spawn_blocking(move || read_log_tail(&path, limit))
+                .await
+                .context("join log tail task")??;
+        Ok(ControlResponse::ok_data(
+            "logs",
+            serde_json::json!({
+                "path": path_display,
+                "limit": limit,
+                "truncated": truncated,
+                "total_lines": total_lines,
+                "lines": lines,
+            }),
+        ))
     }
 
     async fn add_share(
@@ -740,12 +768,17 @@ impl ControlService {
                     .ok_or_else(|| anyhow!("peer '{peer_s}' not found"))?;
                 let remote_key = peer_key(&remote.pc_name, &remote.instance_id);
                 let tid = thread.unwrap_or_else(|| peer_thread_id(&local_key, &remote_key));
+                let title = if remote.display_name.trim().is_empty() {
+                    remote_key.clone()
+                } else {
+                    remote.display_name.clone()
+                };
                 (
                     ThreadKind::Peer,
                     tid,
-                    Some(remote_key.clone()),
+                    Some(remote_key),
                     None,
-                    remote_key,
+                    title,
                 )
             } else {
                 bail!("chat send requires --peer or --share");
@@ -920,4 +953,20 @@ impl ControlService {
         }
         Ok(ControlResponse::ok(msg))
     }
+}
+
+/// Read the last `limit` lines from `path`.
+/// Returns `(lines, truncated, total_lines)`.
+fn read_log_tail(path: &Path, limit: usize) -> Result<(Vec<String>, bool, usize)> {
+    if !path.exists() {
+        return Ok((Vec::new(), false, 0));
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read log file {}", path.display()))?;
+    let all: Vec<&str> = text.lines().collect();
+    let total = all.len();
+    let truncated = total > limit;
+    let start = total.saturating_sub(limit);
+    let lines = all[start..].iter().map(|s| (*s).to_string()).collect();
+    Ok((lines, truncated, total))
 }

@@ -1,4 +1,4 @@
-use models::{BatchAck, BatchManifest, ChangeKind, FileChange, FileMeta, HelloMessage, ShareId, WireMessage};
+use models::{AdvertisedShare, BatchAck, BatchManifest, ChangeKind, FileChange, FileMeta, HelloMessage, ShareId, WireMessage};
 use localbox_protocol as protocol;
 use protocol::{
     decode_file_chunk_proto, decode_wire_message_proto, encode_file_chunk_proto,
@@ -17,11 +17,17 @@ fn parse_discovery_messages() {
         DiscoveryMessage::Discover {
             pc_name: "pc1".to_string(),
             instance_id: "i1".to_string(),
+            display_name: String::new(),
+            app_state: String::new(),
             tls_port: 5000,
             plain_port: 0,
             utp_port: 0,
             use_tls_for_peers: true,
-            shares: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            shares: vec![
+                AdvertisedShare::new("a"),
+                AdvertisedShare::new("b"),
+                AdvertisedShare::new("c"),
+            ],
             accepts_remote_shares: true,
         }
     );
@@ -33,6 +39,8 @@ fn parse_discovery_messages() {
         DiscoveryMessage::Here {
             pc_name: "pc2".to_string(),
             instance_id: "i2".to_string(),
+            display_name: String::new(),
+            app_state: String::new(),
             tls_port: 6000,
             plain_port: 0,
             utp_port: 0,
@@ -46,16 +54,42 @@ fn parse_discovery_messages() {
 }
 
 #[test]
+fn parse_discovery_structured_shares_and_meta() {
+    let d = parse_discovery_message(
+        "DISCOVER v1 pc_name=pc1 instance_id=i1 display_name=Living%20Room app_state=mirrorhost tls_port=5000 shares=docs:true:auto:manual,photos",
+    )
+    .expect("discover should parse");
+    match d {
+        DiscoveryMessage::Discover {
+            display_name,
+            app_state,
+            shares,
+            ..
+        } => {
+            assert_eq!(display_name, "Living Room");
+            assert_eq!(app_state, "mirrorhost");
+            assert_eq!(shares.len(), 2);
+            assert_eq!(shares[0].name, "docs");
+            assert!(shares[0].sync.is_auto());
+            assert_eq!(shares[1].name, "photos");
+        }
+        _ => panic!("expected Discover"),
+    }
+}
+
+#[test]
 fn wire_message_json_parse_round_trip() {
     let msg = WireMessage::Hello(HelloMessage {
         protocol_version: models::WIRE_PROTOCOL_VERSION,
         pc_name: "pc".to_string(),
         instance_id: "inst".to_string(),
+        display_name: String::new(),
+        app_state: String::new(),
         listen_port: 1,
         plain_port: 2,
         use_tls_for_peers: true,
         utp_port: 0,
-        shares: vec!["s".to_string()],
+        shares: vec![AdvertisedShare::new("s")],
         accepts_remote_shares: true,
     });
     let json = serde_json::to_vec(&msg).unwrap();
@@ -107,11 +141,13 @@ fn proto_wire_message_round_trip() {
         protocol_version: models::WIRE_PROTOCOL_VERSION,
         pc_name: "pc".to_string(),
         instance_id: "inst".to_string(),
+        display_name: String::new(),
+        app_state: String::new(),
         listen_port: 5000,
         plain_port: 4000,
         use_tls_for_peers: false,
         utp_port: 0,
-        shares: vec!["a".to_string()],
+        shares: vec![AdvertisedShare::new("a")],
         accepts_remote_shares: true,
     });
     let bytes = encode_wire_message_proto(&hello).unwrap();

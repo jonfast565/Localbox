@@ -13,6 +13,7 @@ use std::path::PathBuf;
 /// Keys that may be stored in the DB `settings` table / set via control plane.
 pub const SETTABLE_KEYS: &[&str] = &[
     "instance_id",
+    "display_name",
     "listen_port",
     "plain_listen_port",
     "discovery_port",
@@ -90,6 +91,7 @@ pub fn apply_setting(cfg: &mut AppConfig, key: &str, value: &Value) -> Result<()
     }
     match key {
         "instance_id" => cfg.instance_id = json_string(value, key)?,
+        "display_name" => cfg.display_name = json_string(value, key)?,
         "listen_port" => {
             let port = json_u16(value, key)?;
             cfg.listen_addr = SocketAddr::new(cfg.listen_addr.ip(), port);
@@ -156,6 +158,7 @@ pub fn read_setting(cfg: &AppConfig, key: &str) -> Result<Value> {
     }
     let v = match key {
         "instance_id" => Value::String(cfg.instance_id.clone()),
+        "display_name" => Value::String(cfg.display_name.clone()),
         "listen_port" => Value::from(cfg.listen_addr.port()),
         "plain_listen_port" => Value::from(cfg.plain_listen_addr.port()),
         "discovery_port" => Value::from(cfg.discovery_port),
@@ -348,6 +351,7 @@ mod tests {
         AppConfig {
             pc_name: "pc".into(),
             instance_id: "i".into(),
+            display_name: String::new(),
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5000),
             plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5002),
             use_tls_for_peers: true,

@@ -61,7 +61,7 @@ fn spawn_utp_listener(
                             info!("Incoming uTP connection from {addr}");
                             let db = Arc::clone(&db);
                             let cfg = cfg.clone();
-                            let share_names = local_share_names(&db, &cfg.pc_name).await;
+                            let shares = local_advertised_shares(&db, &cfg).await;
                             let connections = connections.clone();
                             let pending_files = pending_files.clone();
                             let tls = tls.clone();
@@ -75,7 +75,7 @@ fn spawn_utp_listener(
                                     dyn_stream,
                                     &cfg,
                                     &db,
-                                    &share_names,
+                                    &shares,
                                     addr,
                                     connections,
                                     pending_files,
@@ -356,7 +356,7 @@ impl PeerManager {
                                 info!("Incoming connection from {addr}");
                                 let db = Arc::clone(&db);
                                 let cfg = cfg.clone();
-                                let share_names = local_share_names(&db, &cfg.pc_name).await;
+                                let shares = local_advertised_shares(&db, &cfg).await;
                                 let connections = connections.clone();
                                 let pending_files = pending_files.clone();
                                 let tls = tls.clone();
@@ -370,7 +370,7 @@ impl PeerManager {
                                             stream,
                                             &cfg,
                                             &db,
-                                            &share_names,
+                                            &shares,
                                             addr,
                                             connections,
                                             pending_files,
@@ -427,7 +427,7 @@ impl PeerManager {
                                 warn!("Incoming plaintext connection from {addr}");
                                 let db = Arc::clone(&db);
                                 let cfg = cfg.clone();
-                                let share_names = local_share_names(&db, &cfg.pc_name).await;
+                                let shares = local_advertised_shares(&db, &cfg).await;
                                 let connections = connections.clone();
                                 let pending_files = pending_files.clone();
                                 let fs = fs.clone();
@@ -438,7 +438,7 @@ impl PeerManager {
                                             stream,
                                             &cfg,
                                             &db,
-                                            &share_names,
+                                            &shares,
                                             addr,
                                             connections,
                                             pending_files,
@@ -631,14 +631,22 @@ fn compute_backoff_secs(attempts: i64) -> i64 {
     (base * 5).min(300)
 }
 
-async fn local_share_names(db: &DbHandle, pc_name: &str) -> Vec<String> {
-    match db.lock().await.list_shares_for_pc(pc_name) {
-        Ok(rows) => rows.into_iter().map(|r| r.share_name).collect(),
+pub(crate) async fn local_advertised_shares(
+    db: &DbHandle,
+    cfg: &models::AppConfig,
+) -> Vec<models::AdvertisedShare> {
+    let rows = match db.lock().await.list_shares_for_pc(&cfg.pc_name) {
+        Ok(rows) => rows,
         Err(e) => {
             warn!("Failed to list local shares: {e}");
-            Vec::new()
+            return Vec::new();
         }
-    }
+    };
+    let pairs: Vec<(String, bool)> = rows
+        .into_iter()
+        .map(|r| (r.share_name, r.recursive))
+        .collect();
+    cfg.advertised_shares_for(&pairs)
 }
 
 const FILE_CHUNK_SIZE: usize = 128 * 1024;

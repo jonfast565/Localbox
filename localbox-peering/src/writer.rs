@@ -57,7 +57,7 @@ pub async fn recv_framed_message<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::{recv_framed_message, send_framed_message};
-    use models::{HelloMessage, WireMessage};
+    use models::{AdvertisedShare, HelloMessage, WireMessage};
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
@@ -67,11 +67,13 @@ mod tests {
             protocol_version: models::WIRE_PROTOCOL_VERSION,
             pc_name: "pc".to_string(),
             instance_id: "inst".to_string(),
+            display_name: String::new(),
+            app_state: String::new(),
             listen_port: 5000,
             plain_port: 0,
             use_tls_for_peers: true,
             utp_port: 5004,
-            shares: vec!["shareA".to_string()],
+            shares: vec![AdvertisedShare::new("shareA")],
             accepts_remote_shares: true,
         });
         let msg_for_sender = msg.clone();

@@ -1,5 +1,6 @@
 //! Visual tokens and widget styles for the Localbox GUI.
 
+use iced::widget::pane_grid::{self, Line};
 use iced::widget::{button, container, progress_bar, text_input};
 use iced::{Background, Border, Color, Shadow, Theme, Vector};
 
@@ -248,6 +249,31 @@ pub fn panel_style(theme: &Theme) -> container::Style {
             color: Color::from_rgba(0.0, 0.0, 0.0, if matches!(theme, Theme::Dark) { 0.35 } else { 0.08 }),
             offset: Vector::new(0.0, 1.0),
             blur_radius: 4.0,
+        },
+    }
+}
+
+pub fn pane_grid_style(theme: &Theme) -> pane_grid::Style {
+    let c = colors(theme);
+    pane_grid::Style {
+        hovered_region: pane_grid::Highlight {
+            background: Background::Color(Color {
+                a: 0.12,
+                ..c.accent
+            }),
+            border: Border {
+                width: 1.0,
+                color: c.border_strong,
+                radius: 10.0.into(),
+            },
+        },
+        hovered_split: Line {
+            color: c.border_strong,
+            width: 3.0,
+        },
+        picked_split: Line {
+            color: c.accent,
+            width: 3.0,
         },
     }
 }

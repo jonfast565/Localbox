@@ -22,7 +22,6 @@ pub enum RuntimeMode {
 }
 
 pub struct RuntimeHandle {
-    #[allow(dead_code)]
     pub socket: PathBuf,
     pub mode: RuntimeMode,
     child: Option<Child>,
@@ -34,6 +33,15 @@ impl RuntimeHandle {
             RuntimeMode::Attached => "attached",
             RuntimeMode::Managed => "managed",
         }
+    }
+
+    /// Kill a GUI-owned child process. No-op when attached (no child).
+    pub fn kill_managed(&mut self) -> Result<()> {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Ok(())
     }
 }
 
@@ -137,15 +145,16 @@ fn spawn_runtime(bin: &Path, config: Option<&Path>, socket: &Path) -> Result<Chi
         .with_context(|| format!("spawn runtime {}", bin.display()))
 }
 
-pub struct EnsureOpts<'a> {
+#[derive(Debug, Clone)]
+pub struct EnsureOpts {
     pub socket: PathBuf,
-    pub config: Option<&'a Path>,
-    pub core: Option<&'a Path>,
+    pub config: Option<PathBuf>,
+    pub core: Option<PathBuf>,
     pub no_runtime: bool,
 }
 
 /// Attach to a live control plane, or spawn `localbox-core run` when none is listening.
-pub async fn ensure_runtime(opts: EnsureOpts<'_>) -> Result<RuntimeHandle> {
+pub async fn ensure_runtime(opts: EnsureOpts) -> Result<RuntimeHandle> {
     let socket = opts.socket;
 
     if probe_alive(&socket).await {
@@ -163,8 +172,8 @@ pub async fn ensure_runtime(opts: EnsureOpts<'_>) -> Result<RuntimeHandle> {
         );
     }
 
-    let bin = resolve_core_binary(opts.core)?;
-    let mut child = spawn_runtime(&bin, opts.config, &socket)?;
+    let bin = resolve_core_binary(opts.core.as_deref())?;
+    let mut child = spawn_runtime(&bin, opts.config.as_deref(), &socket)?;
     let deadline = Instant::now() + READY_TIMEOUT;
 
     loop {
@@ -191,5 +200,23 @@ pub async fn ensure_runtime(opts: EnsureOpts<'_>) -> Result<RuntimeHandle> {
             ));
         }
         sleep(READY_POLL).await;
+    }
+}
+
+/// Stop a runtime: kill a managed child, or send `Shutdown` when attached.
+pub async fn stop_runtime(handle: &mut RuntimeHandle) -> Result<&'static str> {
+    match handle.mode {
+        RuntimeMode::Managed => {
+            handle.kill_managed()?;
+            Ok("stopped managed runtime")
+        }
+        RuntimeMode::Attached => {
+            let resp = client::send_request(&handle.socket, &ControlRequest::Shutdown).await?;
+            if resp.ok {
+                Ok("sent shutdown to attached daemon")
+            } else {
+                bail!(resp.message)
+            }
+        }
     }
 }

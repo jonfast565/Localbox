@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, mpsc::Sender};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -31,6 +32,41 @@ pub use net::{DynStream, Net, RealNet, TcpListenerLike, UdpSocketLike, VirtualNe
 static FILE_GUARD: OnceCell<WorkerGuard> = OnceCell::new();
 /// Ensures logging is only initialized once.
 static LOG_INIT: OnceCell<()> = OnceCell::new();
+/// Optional sink for console log lines (used by the interactive shell).
+static CONSOLE_BRIDGE: Mutex<Option<Sender<String>>> = Mutex::new(None);
+
+/// Route console log lines to `tx` instead of raw stdout (e.g. rustyline ExternalPrinter).
+/// Pass `None` to restore direct stdout writes.
+pub fn set_console_log_bridge(tx: Option<Sender<String>>) {
+    if let Ok(mut guard) = CONSOLE_BRIDGE.lock() {
+        *guard = tx;
+    }
+}
+
+struct ConsoleWriter;
+
+impl Write for ConsoleWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let text = String::from_utf8_lossy(buf).into_owned();
+        if let Ok(guard) = CONSOLE_BRIDGE.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(text);
+                return Ok(buf.len());
+            }
+        }
+        let mut out = io::stdout().lock();
+        out.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
+fn console_writer() -> ConsoleWriter {
+    ConsoleWriter
+}
 
 /// Initialize tracing-based logging with both console and file output.
 ///
@@ -309,7 +345,7 @@ fn configure_logging(log_path: &Path, fs: &dyn FileSystem) -> Result<()> {
     let _ = FILE_GUARD.set(guard);
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let console_layer = fmt::layer().with_writer(std::io::stdout);
+    let console_layer = fmt::layer().with_writer(console_writer);
     let file_layer = fmt::layer().with_ansi(false).with_writer(file_writer);
 
     tracing_subscriber::registry()

@@ -30,6 +30,7 @@ pub async fn run_control_server(
         peer_cmd_tx: cmd_tx,
         progress,
         share_hooks,
+        token: token.clone(),
     };
 
     #[cfg(unix)]

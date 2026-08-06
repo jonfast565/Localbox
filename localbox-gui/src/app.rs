@@ -2,6 +2,7 @@ use iced::widget::{
     button, column, container, progress_bar, row, scrollable, text, text_input, Column, Space,
 };
 use iced::{time, Alignment, Element, Length, Padding, Subscription, Task, Theme};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::theme::Colors;
@@ -10,6 +11,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::client::{self, ControlRequest, ControlResponse};
+use crate::runtime::{ensure_runtime, stop_runtime, EnsureOpts, RuntimeHandle, RuntimeMode};
 use crate::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +52,10 @@ pub enum Message {
     MarkRead,
     QuarantinePeer(String),
     UnquarantinePeer(String),
+    StartRuntime,
+    StopRuntime,
+    RuntimeStarted(Result<(String, bool), String>),
+    RuntimeStopped(Result<String, String>),
     ClearFlash,
     SyncSystemTheme,
 }
@@ -151,8 +157,11 @@ struct ChatMsg {
 
 pub struct App {
     socket: PathBuf,
+    ensure_opts: EnsureOpts,
+    runtime: Arc<Mutex<Option<RuntimeHandle>>>,
     runtime_label: String,
     managed_runtime: bool,
+    runtime_busy: bool,
     dark: bool,
     tab: Tab,
     connected: bool,
@@ -176,11 +185,25 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(socket: PathBuf, runtime_label: String, managed_runtime: bool) -> (Self, Task<Message>) {
+    pub fn new(
+        socket: PathBuf,
+        ensure_opts: EnsureOpts,
+        runtime: Arc<Mutex<Option<RuntimeHandle>>>,
+    ) -> (Self, Task<Message>) {
+        let (runtime_label, managed_runtime) = {
+            let guard = runtime.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(h) => (h.label().to_string(), h.mode == RuntimeMode::Managed),
+                None => ("stopped".into(), false),
+            }
+        };
         let app = Self {
             socket,
+            ensure_opts,
+            runtime,
             runtime_label,
             managed_runtime,
+            runtime_busy: false,
             dark: theme::system_is_dark(),
             tab: Tab::Status,
             connected: false,
@@ -383,6 +406,114 @@ impl App {
             Message::UnquarantinePeer(peer) => {
                 self.transfer_action(ControlRequest::PeerUnquarantine { peer })
             }
+            Message::StartRuntime => {
+                if self.runtime_busy || self.connected {
+                    return Task::none();
+                }
+                if self.ensure_opts.no_runtime {
+                    self.flash = Some((
+                        false,
+                        "cannot start runtime with --no-runtime".into(),
+                    ));
+                    return Task::none();
+                }
+                self.runtime_busy = true;
+                let opts = self.ensure_opts.clone();
+                let slot = Arc::clone(&self.runtime);
+                Task::perform(
+                    async move {
+                        // Drop any previous handle (kills a managed child) before attach/spawn.
+                        {
+                            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.take();
+                        }
+                        let handle = ensure_runtime(opts).await.map_err(|e| e.to_string())?;
+                        let label = handle.label().to_string();
+                        let managed = handle.mode == RuntimeMode::Managed;
+                        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                        *guard = Some(handle);
+                        Ok((label, managed))
+                    },
+                    Message::RuntimeStarted,
+                )
+            }
+            Message::StopRuntime => {
+                if self.runtime_busy {
+                    return Task::none();
+                }
+                let has_handle = self
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some();
+                if !has_handle && !self.connected {
+                    return Task::none();
+                }
+                self.runtime_busy = true;
+                let slot = Arc::clone(&self.runtime);
+                let socket = self.socket.clone();
+                let was_managed = self.managed_runtime;
+                Task::perform(
+                    async move {
+                        let taken = {
+                            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+                            guard.take()
+                        };
+                        if let Some(mut handle) = taken {
+                            let msg = stop_runtime(&mut handle).await.map_err(|e| e.to_string())?;
+                            Ok(msg.to_string())
+                        } else if was_managed {
+                            Err("no managed runtime to stop".into())
+                        } else {
+                            let resp = client::send_request(&socket, &ControlRequest::Shutdown)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            if resp.ok {
+                                Ok(resp.message)
+                            } else {
+                                Err(resp.message)
+                            }
+                        }
+                    },
+                    Message::RuntimeStopped,
+                )
+            }
+            Message::RuntimeStarted(res) => {
+                self.runtime_busy = false;
+                match res {
+                    Ok((label, managed)) => {
+                        self.runtime_label = label;
+                        self.managed_runtime = managed;
+                        self.connected = true;
+                        self.flash =
+                            Some((true, format!("runtime {} ready", self.runtime_label)));
+                        Task::done(Message::Refresh)
+                    }
+                    Err(e) => {
+                        self.runtime_label = "stopped".into();
+                        self.managed_runtime = false;
+                        self.connected = false;
+                        self.flash = Some((false, e));
+                        Task::none()
+                    }
+                }
+            }
+            Message::RuntimeStopped(res) => {
+                self.runtime_busy = false;
+                self.runtime_label = "stopped".into();
+                self.managed_runtime = false;
+                self.connected = false;
+                self.status = None;
+                match res {
+                    Ok(msg) => {
+                        self.flash = Some((true, msg));
+                    }
+                    Err(e) => {
+                        self.flash = Some((false, e));
+                    }
+                }
+                Task::none()
+            }
             Message::ClearFlash => {
                 self.flash = None;
                 Task::none()
@@ -541,6 +672,31 @@ impl App {
 
     pub fn view(&self) -> Element<'_, Message> {
         let c = self.colors();
+        let has_handle = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        let can_start =
+            !self.connected && !has_handle && !self.runtime_busy && !self.ensure_opts.no_runtime;
+        let can_stop =
+            (self.connected || self.managed_runtime || has_handle) && !self.runtime_busy;
+        let mut runtime_controls = row![].spacing(6).align_y(Alignment::Center);
+        if can_start {
+            runtime_controls = runtime_controls.push(styled_button(
+                "Start",
+                Message::StartRuntime,
+                theme::btn_secondary,
+            ));
+        }
+        if can_stop {
+            runtime_controls = runtime_controls.push(styled_button(
+                "Stop",
+                Message::StopRuntime,
+                theme::btn_secondary,
+            ));
+        }
+
         let header = row![
             column![
                 text("Localbox").size(26).color(c.accent),
@@ -555,6 +711,7 @@ impl App {
             .spacing(2),
             Space::with_width(Length::Fill),
             connection_badge(self.connected, c),
+            runtime_controls,
             styled_button("Refresh", Message::Refresh, theme::btn_secondary),
         ]
         .spacing(12)

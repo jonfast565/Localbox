@@ -46,6 +46,8 @@ pub enum Command {
     Shell(ShellArgs),
     /// Alias for shell
     Interactive(ShellArgs),
+    /// Stop a running daemon via the control plane (`Shutdown`)
+    Stop(StopArgs),
     /// Manually push share changes to peers
     Push(PushArgs),
     /// Request/pull share changes from a peer
@@ -137,6 +139,13 @@ pub enum PeerCliCommand {
 
 #[derive(Debug, Args)]
 pub struct ShellArgs {
+    /// Control socket path (defaults to config / localbox.sock)
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct StopArgs {
     /// Control socket path (defaults to config / localbox.sock)
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
@@ -1507,19 +1516,21 @@ control_socket = "{control_socket}"
 # conflict = "keep_both"
 # quarantined_peers = ["compromised-host"]
 
-[[shares]]
-name = "docs"
-root_path = "C:/path/to/docs"
-recursive = true
-# sync/pull default to "manual" (no automatic transfers).
-# `sync = "auto"` streams journal changes to peers continuously; it does not
-# affect `localbox push`, which is always available on demand.
-sync = "manual"
-pull = "manual"
-# ignore_patterns = ["**/.git/**", "**/*.tmp"]
-# sync_allow = ["docs/**"]  # empty = all non-ignored paths
-# conflict = "last_write_wins"  # last_write_wins | keep_both | owner_wins
-# max_file_size_bytes = 1073741824 # 1 GiB
+# Shares are optional at startup. Uncomment and edit, or add later with:
+#   localbox share add --name docs --path /path/to/docs
+# [[shares]]
+# name = "docs"
+# root_path = "C:/path/to/docs"
+# recursive = true
+# # sync/pull default to "manual" (no automatic transfers).
+# # `sync = "auto"` streams journal changes to peers continuously; it does not
+# # affect `localbox push`, which is always available on demand.
+# sync = "manual"
+# pull = "manual"
+# # ignore_patterns = ["**/.git/**", "**/*.tmp"]
+# # sync_allow = ["docs/**"]  # empty = all non-ignored paths
+# # conflict = "last_write_wins"  # last_write_wins | keep_both | owner_wins
+# # max_file_size_bytes = 1073741824 # 1 GiB
 "#,
         instance_id = DEFAULT_INSTANCE_ID,
         listen_port = DEFAULT_LISTEN_PORT,
@@ -1610,7 +1621,9 @@ mod tests {
     fn template_is_valid_toml() {
         let tpl = default_config_template();
         let parsed: toml::Value = toml::from_str(&tpl).unwrap();
-        assert!(parsed.get("shares").is_some());
+        assert!(parsed.get("instance_id").is_some());
+        // Example [[shares]] is commented out so a fresh init can start without paths.
+        assert!(parsed.get("shares").is_none());
     }
 
     /// `sync` gates journal sync; `push` is the pre-v7 spelling of the same key.

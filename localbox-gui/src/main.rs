@@ -6,8 +6,9 @@ mod theme;
 use clap::Parser;
 use iced::Size;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
-use runtime::{default_control_socket, ensure_runtime, resolve_socket, EnsureOpts, RuntimeMode};
+use runtime::{default_control_socket, ensure_runtime, resolve_socket, EnsureOpts, RuntimeHandle};
 
 #[derive(Debug, Parser)]
 #[command(name = "localbox-gui", about = "Localbox desktop control UI")]
@@ -47,10 +48,17 @@ fn main() -> iced::Result {
         }
     };
 
+    let ensure_opts = EnsureOpts {
+        socket: socket.clone(),
+        config: args.config.clone(),
+        core: args.core.clone(),
+        no_runtime: args.no_runtime,
+    };
+
     let handle = match rt.block_on(ensure_runtime(EnsureOpts {
         socket: socket.clone(),
-        config: args.config.as_deref(),
-        core: args.core.as_deref(),
+        config: args.config.clone(),
+        core: args.core.clone(),
         no_runtime: args.no_runtime,
     })) {
         Ok(h) => h,
@@ -60,16 +68,14 @@ fn main() -> iced::Result {
         }
     };
 
-    let mode = handle.mode;
-    let mode_label = handle.label().to_string();
+    let runtime: Arc<Mutex<Option<RuntimeHandle>>> = Arc::new(Mutex::new(Some(handle)));
+    let runtime_for_app = Arc::clone(&runtime);
     let result = iced::application(app::App::title, app::App::update, app::App::view)
         .theme(app::App::theme)
         .subscription(app::App::subscription)
-        .window_size(Size::new(360.0, 520.0))
-        .run_with(move || {
-            app::App::new(socket, mode_label, mode == RuntimeMode::Managed)
-        });
+        .window_size(Size::new(420.0, 520.0))
+        .run_with(move || app::App::new(socket, ensure_opts, runtime_for_app));
 
-    drop(handle);
+    drop(runtime);
     result
 }

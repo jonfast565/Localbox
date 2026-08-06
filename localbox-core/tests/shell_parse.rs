@@ -32,6 +32,18 @@ fn push_requires_a_share() {
 }
 
 #[test]
+fn parses_shutdown_and_stop() {
+    assert!(matches!(
+        parse_repl_to_request("shutdown").unwrap(),
+        ControlRequest::Shutdown
+    ));
+    assert!(matches!(
+        parse_repl_to_request("stop").unwrap(),
+        ControlRequest::Shutdown
+    ));
+}
+
+#[test]
 fn parses_share_add_and_list() {
     let req = parse_repl_to_request("share add --name docs --path /tmp/docs").unwrap();
     match req {

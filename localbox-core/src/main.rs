@@ -41,6 +41,16 @@ async fn main() -> anyhow::Result<()> {
             let sock = resolve_control_socket(&cli, args.socket.clone())?;
             run_attached_shell(sock).await
         }
+        Command::Stop(args) => {
+            let sock = resolve_control_socket(&cli, args.socket.clone())?;
+            let resp = send_control_request(&sock, &ControlRequest::Shutdown).await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
+            }
+        }
         Command::Push(args) => {
             let sock = resolve_control_socket(&cli, args.socket.clone())?;
             let resp = send_control_request(

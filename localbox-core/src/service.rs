@@ -91,7 +91,10 @@ pub enum ControlRequest {
         #[serde(default = "default_true")]
         recursive: bool,
     },
+    /// Disconnect this control client only; does not stop the daemon.
     Quit,
+    /// Cancel the engine (`CancellationToken`) and shut down the daemon.
+    Shutdown,
 }
 
 fn default_true() -> bool {
@@ -149,6 +152,7 @@ pub struct ControlService {
     pub peer_cmd_tx: mpsc::Sender<PeerCommand>,
     pub progress: Arc<TransferProgressRegistry>,
     pub share_hooks: Option<ShareHooks>,
+    pub token: CancellationToken,
 }
 
 impl ControlService {
@@ -163,6 +167,10 @@ impl ControlService {
         match req {
             ControlRequest::Ping => Ok(ControlResponse::ok("pong")),
             ControlRequest::Quit => Ok(ControlResponse::ok("bye")),
+            ControlRequest::Shutdown => {
+                self.token.cancel();
+                Ok(ControlResponse::ok("shutting down"))
+            }
             ControlRequest::Status => {
                 let db = self.db.lock().await;
                 let peers = db.list_peers()?.len();

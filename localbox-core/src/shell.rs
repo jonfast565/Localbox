@@ -1,17 +1,30 @@
 //! Interactive REPL for Localbox (in-process or attached to control socket).
+//!
+//! Uses rustyline for line editing/history. Engine logs are routed through an
+//! ExternalPrinter so they scroll above a sticky `localbox>` prompt.
 
 use anyhow::{anyhow, Result};
 use db::Db;
 use models::{AppConfig, TransferProgressRegistry};
 use peering::PeerCommand;
+use rustyline::error::ReadlineError;
+use rustyline::{DefaultEditor, ExternalPrinter};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self as std_mpsc, SyncSender};
 use std::sync::Arc;
+use std::thread;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use utilities::set_console_log_bridge;
 
 use crate::control::send_control_request;
 use crate::service::{ControlRequest, ControlResponse, ControlService, ShareHooks};
+
+enum ReplEvent {
+    Line { line: String, done: SyncSender<()> },
+    Eof,
+}
 
 pub async fn run_inprocess_shell(
     cfg: AppConfig,
@@ -23,7 +36,6 @@ pub async fn run_inprocess_shell(
     token: CancellationToken,
 ) -> Result<()> {
     info!("Interactive shell (in-process). Type 'help' or 'quit'.");
-    println!("localbox interactive shell (ephemeral). Type help or quit.");
     let service = ControlService {
         cfg,
         db,
@@ -31,40 +43,39 @@ pub async fn run_inprocess_shell(
         peer_cmd_tx: cmd_tx,
         progress,
         share_hooks,
+        token: token.clone(),
     };
-    let stdin = std::io::stdin();
-    loop {
-        if token.is_cancelled() {
-            break;
-        }
-        print!("localbox> ");
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        if stdin.read_line(&mut line)? == 0 {
-            break;
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if matches!(line, "quit" | "exit" | "q") {
-            token.cancel();
-            break;
-        }
-        if line == "help" || line == "?" {
-            print_help();
-            continue;
-        }
-        match parse_repl_to_request(line) {
-            Ok(req) => {
-                let resp = service.handle(req).await;
-                print_resp(&resp);
+    run_repl_loop(
+        "localbox interactive shell. Logs scroll above; type help or quit.",
+        token.clone(),
+        move |line| {
+            let service = service.clone();
+            let token = token.clone();
+            async move {
+                if matches!(line.as_str(), "quit" | "exit" | "q") {
+                    token.cancel();
+                    return true;
+                }
+                if line == "help" || line == "?" {
+                    print_help();
+                    return false;
+                }
+                match parse_repl_to_request(&line) {
+                    Ok(req) => {
+                        let shutting_down = matches!(req, ControlRequest::Shutdown);
+                        let resp = service.handle(req).await;
+                        print_resp(&resp);
+                        if shutting_down {
+                            return true;
+                        }
+                    }
+                    Err(e) => eprintln!("error: {e}"),
+                }
+                false
             }
-            Err(e) => eprintln!("error: {e}"),
-        }
-    }
-    Ok(())
+        },
+    )
+    .await
 }
 
 pub async fn run_attached_shell(socket: PathBuf) -> Result<()> {
@@ -74,39 +85,139 @@ pub async fn run_attached_shell(socket: PathBuf) -> Result<()> {
             socket.display()
         ));
     }
-    println!(
-        "localbox shell attached to {}. Type help or quit.",
+    let banner = format!(
+        "localbox shell attached to {}. Logs scroll above; type help or quit.",
         socket.display()
     );
-    let stdin = std::io::stdin();
-    loop {
-        print!("localbox> ");
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        if stdin.read_line(&mut line)? == 0 {
-            break;
-        }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if matches!(line, "quit" | "exit" | "q") {
-            break;
-        }
-        if line == "help" || line == "?" {
-            print_help();
-            continue;
-        }
-        match parse_repl_to_request(line) {
-            Ok(req) => match send_control_request(&socket, &req).await {
-                Ok(resp) => print_resp(&resp),
+    let token = CancellationToken::new();
+    run_repl_loop(&banner, token.clone(), move |line| {
+        let socket = socket.clone();
+        let token = token.clone();
+        async move {
+            if matches!(line.as_str(), "quit" | "exit" | "q") {
+                token.cancel();
+                return true;
+            }
+            if line == "help" || line == "?" {
+                print_help();
+                return false;
+            }
+            match parse_repl_to_request(&line) {
+                Ok(req) => {
+                    let shutting_down = matches!(req, ControlRequest::Shutdown);
+                    match send_control_request(&socket, &req).await {
+                        Ok(resp) => print_resp(&resp),
+                        Err(e) => eprintln!("error: {e}"),
+                    }
+                    if shutting_down {
+                        token.cancel();
+                        return true;
+                    }
+                }
                 Err(e) => eprintln!("error: {e}"),
-            },
-            Err(e) => eprintln!("error: {e}"),
+            }
+            false
+        }
+    })
+    .await
+}
+
+async fn run_repl_loop<F, Fut>(banner: &str, token: CancellationToken, mut on_line: F) -> Result<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let (log_tx, log_rx) = std_mpsc::channel::<String>();
+    set_console_log_bridge(Some(log_tx));
+
+    let (event_tx, mut event_rx) = mpsc::channel::<ReplEvent>(8);
+    let banner = banner.to_string();
+    let readline_token = token.clone();
+
+    let readline_thread = thread::spawn(move || -> Result<()> {
+        let mut rl = DefaultEditor::new()?;
+        let mut printer = rl.create_external_printer()?;
+        let _ = printer.print(format!("{banner}\n"));
+
+        let printer_thread = thread::spawn(move || {
+            while let Ok(chunk) = log_rx.recv() {
+                for line in chunk.split_inclusive('\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let _ = printer.print(line.to_string());
+                }
+            }
+        });
+
+        let result = (|| -> Result<()> {
+            loop {
+                if readline_token.is_cancelled() {
+                    break;
+                }
+                match rl.readline("localbox> ") {
+                    Ok(line) => {
+                        let trimmed = line.trim().to_string();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        let _ = rl.add_history_entry(trimmed.as_str());
+                        let (done_tx, done_rx) = std_mpsc::sync_channel(0);
+                        if event_tx
+                            .blocking_send(ReplEvent::Line {
+                                line: trimmed,
+                                done: done_tx,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let _ = done_rx.recv();
+                        if readline_token.is_cancelled() {
+                            break;
+                        }
+                    }
+                    Err(ReadlineError::Interrupted) => continue,
+                    Err(ReadlineError::Eof) => {
+                        let _ = event_tx.blocking_send(ReplEvent::Eof);
+                        break;
+                    }
+                    Err(e) => return Err(anyhow!("readline error: {e}")),
+                }
+            }
+            Ok(())
+        })();
+
+        // Drop the console bridge so the printer thread can exit (channel closes).
+        set_console_log_bridge(None);
+        drop(event_tx);
+        let _ = printer_thread.join();
+        result
+    });
+
+    while let Some(ev) = event_rx.recv().await {
+        match ev {
+            ReplEvent::Eof => {
+                token.cancel();
+                break;
+            }
+            ReplEvent::Line { line, done } => {
+                let quit = on_line(line).await;
+                let _ = done.send(());
+                if quit {
+                    break;
+                }
+            }
         }
     }
-    Ok(())
+
+    set_console_log_bridge(None);
+    token.cancel();
+    match readline_thread.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(anyhow!("readline thread panicked")),
+    }
 }
 
 fn print_help() {
@@ -121,7 +232,8 @@ fn print_help() {
          \x20 chat inbox | chat show --thread ID | chat read --thread ID\n\
          \x20 chat send --peer KEY|--share NAME --message TEXT\n\
          \x20 chat send --peer KEY --file REL --share-dest NAME\n\
-         \x20 quit"
+         \x20 shutdown | stop  — stop the daemon (control-plane Shutdown)\n\
+         \x20 quit | exit | q  — leave this shell / disconnect (does not stop a remote daemon)"
     );
 }
 
@@ -143,6 +255,7 @@ pub fn parse_repl_to_request(line: &str) -> Result<ControlRequest> {
     }
     match parts[0].as_str() {
         "status" | "ping" => Ok(ControlRequest::Status),
+        "shutdown" | "stop" => Ok(ControlRequest::Shutdown),
         "peers" => Ok(ControlRequest::Status), // status includes peer count; use Pending for lists via inbox-like
         "shares" => Ok(ControlRequest::ShareList),
         "share" => {
@@ -154,10 +267,8 @@ pub fn parse_repl_to_request(line: &str) -> Result<ControlRequest> {
                 "list" | "ls" => Ok(ControlRequest::ShareList),
                 "add" => {
                     let args = parse_flags(&parts[2..])?;
-                    let name = required(&args, "name")
-                        .or_else(|_| required(&args, "share"))?;
-                    let path = required(&args, "path")
-                        .or_else(|_| required(&args, "root"))?;
+                    let name = required(&args, "name").or_else(|_| required(&args, "share"))?;
+                    let path = required(&args, "path").or_else(|_| required(&args, "root"))?;
                     let recursive = args
                         .get("recursive")
                         .map(|v| v != "false" && v != "0")
@@ -323,10 +434,7 @@ fn parse_flags(parts: &[String]) -> Result<std::collections::HashMap<String, Str
     Ok(map)
 }
 
-fn required(
-    args: &std::collections::HashMap<String, String>,
-    key: &str,
-) -> Result<String> {
+fn required(args: &std::collections::HashMap<String, String>, key: &str) -> Result<String> {
     args.get(key)
         .cloned()
         .ok_or_else(|| anyhow!("missing --{key}"))

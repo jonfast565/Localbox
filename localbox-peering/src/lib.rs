@@ -209,12 +209,17 @@ impl PeerManager {
         let tls = self.tls.clone();
         let tls_watch = tls.clone().spawn_watcher(token.clone());
 
-        let (utp_socket, utp_listener) = match bind_utp_endpoint(self.cfg.utp_port).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!("uTP bind failed on port {}: {e:#}", self.cfg.utp_port);
-                (None, None)
+        // LAN UDP discovery + TCP always run. DHT and uTP are independent toggles.
+        let (utp_socket, utp_listener) = if self.cfg.utp_enabled() {
+            match bind_utp_endpoint(self.cfg.utp_port).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!("uTP bind failed on port {}: {e:#}", self.cfg.utp_port);
+                    (None, None)
+                }
             }
+        } else {
+            (None, None)
         };
 
         let discovery = discovery::spawn_discovery(
@@ -255,7 +260,7 @@ impl PeerManager {
             Arc::clone(&self.progress),
             token.clone(),
         );
-        let dht_task = if self.cfg.wan_discovery_enabled() {
+        let dht_task = if self.cfg.dht_enabled() {
             dht::spawn_dht(
                 self.cfg.clone(),
                 Arc::clone(&self.db),

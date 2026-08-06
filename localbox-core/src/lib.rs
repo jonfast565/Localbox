@@ -7,6 +7,7 @@ pub mod intent_ops;
 pub mod integrity;
 pub mod monitoring;
 pub mod service;
+pub mod settings;
 pub mod shell;
 
 pub use engine::Engine;

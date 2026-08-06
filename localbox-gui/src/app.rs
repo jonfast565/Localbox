@@ -19,6 +19,7 @@ pub enum Tab {
     Status,
     Transfers,
     Chat,
+    Settings,
 }
 
 #[derive(Debug, Clone)]
@@ -31,12 +32,18 @@ pub enum Message {
     IntentsLoaded(Result<ControlResponse, String>),
     PeersLoaded(Result<ControlResponse, String>),
     SharesLoaded(Result<ControlResponse, String>),
+    SettingsLoaded(Result<ControlResponse, String>),
     ThreadLoaded(Result<ControlResponse, String>),
     ActionDone(Result<ControlResponse, String>),
     ShareInput(String),
     NewShareNameInput(String),
     NewSharePathInput(String),
     AddShare,
+    ConfigKeyInput(String),
+    ConfigValueInput(String),
+    ConfigSet,
+    ConfigUnset,
+    ConfigRefresh,
     PeerInput(String),
     PathInput(String),
     Push,
@@ -97,6 +104,15 @@ struct PeerInfo {
     state: String,
     #[serde(default)]
     quarantined: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SettingRow {
+    key: String,
+    value: Value,
+    source: String,
+    #[serde(default)]
+    restart_required: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -171,6 +187,9 @@ pub struct App {
     local_shares: Vec<ShareInfo>,
     new_share_name: String,
     new_share_path: String,
+    config_key: String,
+    config_value: String,
+    settings: Vec<SettingRow>,
     pending: Vec<PendingRequest>,
     intents: Vec<IntentRow>,
     threads: Vec<ThreadInfo>,
@@ -213,6 +232,9 @@ impl App {
             local_shares: Vec::new(),
             new_share_name: String::new(),
             new_share_path: String::new(),
+            config_key: String::new(),
+            config_value: String::new(),
+            settings: Vec::new(),
             pending: Vec::new(),
             intents: Vec::new(),
             threads: Vec::new(),
@@ -275,6 +297,12 @@ impl App {
                 });
                 Task::none()
             }
+            Message::SettingsLoaded(res) => {
+                self.apply_result(res, |app, resp| {
+                    app.settings = parse_vec(&resp);
+                });
+                Task::none()
+            }
             Message::ThreadLoaded(res) => {
                 self.apply_result(res, |app, resp| {
                     app.messages = parse_vec(&resp);
@@ -288,6 +316,11 @@ impl App {
                         if resp.ok && resp.message.starts_with("added share") {
                             self.new_share_name.clear();
                             self.new_share_path.clear();
+                        }
+                        if resp.ok
+                            && (resp.message.starts_with("set ") || resp.message.starts_with("unset "))
+                        {
+                            self.config_value.clear();
                         }
                         self.flash = Some((resp.ok, resp.message));
                     }
@@ -322,6 +355,42 @@ impl App {
                     path,
                     recursive: true,
                 })
+            }
+            Message::ConfigKeyInput(s) => {
+                self.config_key = s;
+                Task::none()
+            }
+            Message::ConfigValueInput(s) => {
+                self.config_value = s;
+                Task::none()
+            }
+            Message::ConfigRefresh => {
+                self.tab = Tab::Settings;
+                Task::done(Message::Refresh)
+            }
+            Message::ConfigSet => {
+                let key = self.config_key.trim().to_string();
+                let raw = self.config_value.trim().to_string();
+                if key.is_empty() || raw.is_empty() {
+                    self.flash = Some((false, "key and value are required".into()));
+                    return Task::none();
+                }
+                let value = match localbox_core::settings::parse_value_literal(&raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.flash = Some((false, e.to_string()));
+                        return Task::none();
+                    }
+                };
+                self.transfer_action(ControlRequest::ConfigSet { key, value })
+            }
+            Message::ConfigUnset => {
+                let key = self.config_key.trim().to_string();
+                if key.is_empty() {
+                    self.flash = Some((false, "key is required".into()));
+                    return Task::none();
+                }
+                self.transfer_action(ControlRequest::ConfigUnset { key })
             }
             Message::PeerInput(s) => {
                 self.peer = s;
@@ -634,6 +703,14 @@ impl App {
                 }
                 Task::batch(tasks)
             }
+            Tab::Settings => Task::perform(
+                async move {
+                    client::send_request(&sock, &ControlRequest::ConfigList)
+                        .await
+                        .map_err(|e| e.to_string())
+                },
+                Message::SettingsLoaded,
+            ),
         }
     }
 
@@ -722,6 +799,7 @@ impl App {
                 tab_btn("Status", Tab::Status, self.tab),
                 tab_btn("Transfers", Tab::Transfers, self.tab),
                 tab_btn("Chat", Tab::Chat, self.tab),
+                tab_btn("Settings", Tab::Settings, self.tab),
             ]
             .spacing(6),
         )
@@ -750,6 +828,7 @@ impl App {
             Tab::Status => status_view(self),
             Tab::Transfers => transfers_view(self),
             Tab::Chat => chat_view(self),
+            Tab::Settings => settings_view(self),
         };
 
         let mut content = column![header, tabs].spacing(10);
@@ -979,6 +1058,72 @@ fn chat_view(app: &App) -> Element<'_, Message> {
     ]
     .spacing(12)
     .height(Length::Fill)
+    .into()
+}
+
+fn settings_view(app: &App) -> Element<'_, Message> {
+    let c = app.colors();
+    let editor = column![
+        section_title("Override setting", c),
+        text("Saved values override config.toml; unset falls back to the file/defaults. CLI flags still win for the current process.")
+            .size(12)
+            .color(c.muted),
+        row![
+            labeled_input("Key", &app.config_key, Message::ConfigKeyInput, c),
+            labeled_input("Value", &app.config_value, Message::ConfigValueInput, c),
+        ]
+        .spacing(8),
+        row![
+            styled_button("Set", Message::ConfigSet, theme::btn_primary),
+            styled_button("Unset", Message::ConfigUnset, theme::btn_secondary),
+            styled_button("Refresh", Message::ConfigRefresh, theme::btn_ghost),
+        ]
+        .spacing(8),
+    ]
+    .spacing(10);
+
+    let mut list: Column<'_, Message> = column![section_title("Effective settings", c)].spacing(6);
+    if app.settings.is_empty() {
+        list = list.push(empty_state("Connect to a running daemon to load settings.", c));
+    } else {
+        for row in &app.settings {
+            list = list.push(setting_row(row, c));
+        }
+    }
+
+    column![
+        panel(editor, Length::Fill),
+        panel(scrollable(list).height(Length::Fill), Length::Fill),
+    ]
+    .spacing(12)
+    .height(Length::Fill)
+    .into()
+}
+
+fn setting_row<'a>(row: &'a SettingRow, c: &'a Colors) -> Element<'a, Message> {
+    let value = match &row.value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let mut meta = row.source.clone();
+    if row.restart_required {
+        meta.push_str(" · restart");
+    }
+    container(
+        column![
+            row![
+                text(&row.key).size(14).color(c.text),
+                Space::with_width(Length::Fill),
+                text(meta).size(11).color(c.muted),
+            ]
+            .align_y(Alignment::Center),
+            text(value).size(12).color(c.muted),
+        ]
+        .spacing(4),
+    )
+    .padding(12)
+    .width(Length::Fill)
+    .style(theme::card_style)
     .into()
 }
 

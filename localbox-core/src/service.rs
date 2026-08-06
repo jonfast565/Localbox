@@ -91,6 +91,21 @@ pub enum ControlRequest {
         #[serde(default = "default_true")]
         recursive: bool,
     },
+    /// List effective settings (and which keys are saved in the DB).
+    ConfigList,
+    /// Get one setting's effective value.
+    ConfigGet {
+        key: String,
+    },
+    /// Persist a setting to the DB (overrides config.toml) and update live cfg.
+    ConfigSet {
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Remove a DB-saved setting (fall back to config.toml / defaults).
+    ConfigUnset {
+        key: String,
+    },
     /// Disconnect this control client only; does not stop the daemon.
     Quit,
     /// Cancel the engine (`CancellationToken`) and shut down the daemon.
@@ -146,7 +161,8 @@ pub struct ShareHooks {
 
 #[derive(Clone)]
 pub struct ControlService {
-    pub cfg: AppConfig,
+    /// Live effective config (updated by ConfigSet; peering may need restart for bind keys).
+    pub cfg: Arc<std::sync::RwLock<AppConfig>>,
     pub db: Arc<Mutex<Db>>,
     pub net_tx: mpsc::Sender<String>,
     pub peer_cmd_tx: mpsc::Sender<PeerCommand>,
@@ -156,6 +172,13 @@ pub struct ControlService {
 }
 
 impl ControlService {
+    fn cfg_snapshot(&self) -> AppConfig {
+        self.cfg
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     pub async fn handle(&self, req: ControlRequest) -> ControlResponse {
         match self.handle_inner(req).await {
             Ok(r) => r,
@@ -167,6 +190,10 @@ impl ControlService {
         match req {
             ControlRequest::Ping => Ok(ControlResponse::ok("pong")),
             ControlRequest::Quit => Ok(ControlResponse::ok("bye")),
+            ControlRequest::ConfigList => self.config_list().await,
+            ControlRequest::ConfigGet { key } => self.config_get(&key).await,
+            ControlRequest::ConfigSet { key, value } => self.config_set(&key, value).await,
+            ControlRequest::ConfigUnset { key } => self.config_unset(&key).await,
             ControlRequest::Shutdown => {
                 self.token.cancel();
                 Ok(ControlResponse::ok("shutting down"))
@@ -357,7 +384,7 @@ impl ControlService {
                     .db
                     .lock()
                     .await
-                    .list_shares_for_pc(&self.cfg.pc_name)?;
+                    .list_shares_for_pc(&self.cfg_snapshot().pc_name)?;
                 Ok(ControlResponse::ok_data(
                     "shares",
                     serde_json::to_value(shares)?,
@@ -393,10 +420,10 @@ impl ControlService {
         root_path: &Path,
         recursive: bool,
     ) -> Result<ShareContext> {
-        if !self.cfg.app_state.can_share() {
+        if !self.cfg_snapshot().app_state.can_share() {
             bail!(
                 "app_state {:?} cannot host local shares",
-                self.cfg.app_state
+                self.cfg_snapshot().app_state
             );
         }
         let name = name.trim();
@@ -429,7 +456,7 @@ impl ControlService {
             request_handling: None,
             conflict: Default::default(),
         };
-        let share_id = ShareId::new(&sc.name, &self.cfg.pc_name);
+        let share_id = ShareId::new(&sc.name, &self.cfg_snapshot().pc_name);
         let fs: Arc<dyn FileSystem> = self
             .share_hooks
             .as_ref()
@@ -443,11 +470,11 @@ impl ControlService {
 
         let ctx = {
             let mut db = self.db.lock().await;
-            let id = db.upsert_share(&self.cfg.pc_name, &sc, &share_id)?;
+            let id = db.upsert_share(&self.cfg_snapshot().pc_name, &sc, &share_id)?;
             let ctx = ShareContext {
                 id,
                 share_name: sc.name.clone(),
-                pc_name: self.cfg.pc_name.clone(),
+                pc_name: self.cfg_snapshot().pc_name.clone(),
                 share_id,
                 root_path: sc.root_path.clone(),
                 recursive: sc.recursive,
@@ -487,7 +514,7 @@ impl ControlService {
         path: Option<&str>,
         origin: IntentOrigin,
     ) -> Result<(Vec<String>, Vec<String>)> {
-        let share_id = ShareId::new(share_name, &self.cfg.pc_name);
+        let share_id = ShareId::new(share_name, &self.cfg_snapshot().pc_name);
         let paths = path.map(|p| vec![p.to_string()]).unwrap_or_default();
         let peer_ids = {
             let db = self.db.lock().await;
@@ -515,7 +542,7 @@ impl ControlService {
                     .map(|p| format!("{}@{}", p.pc_name, p.instance_id))
             };
             if let Some(ref pk) = peer_key {
-                if !self.cfg.resolve_allow_push(share_name, pk) {
+                if !self.cfg_snapshot().resolve_allow_push(share_name, pk) {
                     bail!("allow_push=false for peer {pk}");
                 }
             }
@@ -531,7 +558,7 @@ impl ControlService {
                     paths: paths.clone(),
                 },
                 None,
-                &self.cfg.pc_name,
+                &self.cfg_snapshot().pc_name,
             )
             .await?;
             if batches.is_empty() {
@@ -549,7 +576,7 @@ impl ControlService {
         peer_key_str: &str,
         path: Option<&str>,
     ) -> Result<String> {
-        if !self.cfg.resolve_allow_request(share_name, peer_key_str) {
+        if !self.cfg_snapshot().resolve_allow_request(share_name, peer_key_str) {
             bail!("allow_request=false for peer {peer_key_str}");
         }
         let peer = self
@@ -575,8 +602,8 @@ impl ControlService {
             share_id,
             paths: path.map(|p| vec![p.to_string()]).unwrap_or_default(),
             since_seq,
-            from_pc: self.cfg.pc_name.clone(),
-            from_instance: self.cfg.instance_id.clone(),
+            from_pc: self.cfg_snapshot().pc_name.clone(),
+            from_instance: self.cfg_snapshot().instance_id.clone(),
         };
         self.db
             .lock()
@@ -623,10 +650,10 @@ impl ControlService {
             let share_name = pending.share_name.clone();
             let req_id = pending.request_id.clone();
             let from_key = format!("{}@{}", pending.from_pc, pending.from_instance);
-            if !self.cfg.resolve_allow_pull(&share_name, &from_key) {
+            if !self.cfg_snapshot().resolve_allow_pull(&share_name, &from_key) {
                 bail!("allow_pull=false for peer {from_key}");
             }
-            let local_share_id = ShareId::new(&share_name, &self.cfg.pc_name);
+            let local_share_id = ShareId::new(&share_name, &self.cfg_snapshot().pc_name);
             let basis = if !paths.is_empty() {
                 IntentBasis::Snapshot { paths }
             } else {
@@ -650,7 +677,7 @@ impl ControlService {
                 Some(peer_id),
                 basis,
                 Some(&req_id),
-                &self.cfg.pc_name,
+                &self.cfg_snapshot().pc_name,
             )
             .await?;
             self.db
@@ -693,7 +720,7 @@ impl ControlService {
         file: Option<String>,
         share_dest: Option<String>,
     ) -> Result<String> {
-        let local_key = peer_key(&self.cfg.pc_name, &self.cfg.instance_id);
+        let local_key = peer_key(&self.cfg_snapshot().pc_name, &self.cfg_snapshot().instance_id);
         let (kind, thread_id, peer_key_opt, share_name_opt, title) =
             if let Some(share_name) = share.clone() {
                 let tid = thread.unwrap_or_else(|| share_thread_id(&share_name));
@@ -768,8 +795,8 @@ impl ControlService {
             thread_kind: kind,
             peer_key: peer_key_opt.clone(),
             share_name: share_name_opt.clone(),
-            from_pc: self.cfg.pc_name.clone(),
-            from_instance: self.cfg.instance_id.clone(),
+            from_pc: self.cfg_snapshot().pc_name.clone(),
+            from_instance: self.cfg_snapshot().instance_id.clone(),
             body,
             attachment,
             created_at: now,
@@ -800,5 +827,97 @@ impl ControlService {
 
         let _: Option<ThreadSummary> = None;
         Ok(message_id)
+    }
+
+    async fn config_list(&self) -> Result<ControlResponse> {
+        use crate::settings::{read_setting, SETTABLE_KEYS};
+        let cfg = self.cfg_snapshot();
+        let saved = self.db.lock().await.list_settings()?;
+        let mut rows = Vec::new();
+        for key in SETTABLE_KEYS {
+            let value = read_setting(&cfg, key)?;
+            let source = if saved.contains_key(*key) {
+                "database"
+            } else {
+                "config_or_default"
+            };
+            rows.push(serde_json::json!({
+                "key": key,
+                "value": value,
+                "source": source,
+                "restart_required": crate::settings::requires_restart(key),
+            }));
+        }
+        Ok(ControlResponse::ok_data(
+            "settings",
+            serde_json::Value::Array(rows),
+        ))
+    }
+
+    async fn config_get(&self, key: &str) -> Result<ControlResponse> {
+        use crate::settings::{is_settable_key, read_setting, requires_restart};
+        if !is_settable_key(key) {
+            bail!("unknown setting '{key}'");
+        }
+        let cfg = self.cfg_snapshot();
+        let value = read_setting(&cfg, key)?;
+        let saved = self.db.lock().await.get_setting(key)?;
+        let source = if saved.is_some() {
+            "database"
+        } else {
+            "config_or_default"
+        };
+        Ok(ControlResponse::ok_data(
+            "setting",
+            serde_json::json!({
+                "key": key,
+                "value": value,
+                "source": source,
+                "restart_required": requires_restart(key),
+            }),
+        ))
+    }
+
+    async fn config_set(&self, key: &str, value: serde_json::Value) -> Result<ControlResponse> {
+        use crate::settings::{apply_setting, is_settable_key, requires_restart};
+        if !is_settable_key(key) {
+            bail!("unknown setting '{key}'");
+        }
+        {
+            let mut cfg = self.cfg.write().unwrap_or_else(|e| e.into_inner());
+            apply_setting(&mut cfg, key, &value)?;
+        }
+        let raw = serde_json::to_string(&value)?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        self.db.lock().await.set_setting(key, &raw, now)?;
+        let mut msg = format!("set {key} (saved to database, overrides config.toml)");
+        if requires_restart(key) {
+            msg.push_str("; restart required for this setting to take full effect");
+        }
+        Ok(ControlResponse::ok(msg))
+    }
+
+    async fn config_unset(&self, key: &str) -> Result<ControlResponse> {
+        use crate::settings::{is_settable_key, requires_restart};
+        if !is_settable_key(key) {
+            bail!("unknown setting '{key}'");
+        }
+        let removed = self.db.lock().await.delete_setting(key)?;
+        if !removed {
+            return Ok(ControlResponse::ok(format!(
+                "{key} was not saved in the database"
+            )));
+        }
+        // Reload effective config from file+defaults+remaining DB (no CLI).
+        if let Ok(base) = crate::config::resolve_effective_config(None) {
+            let mut guard = self.cfg.write().unwrap_or_else(|e| e.into_inner());
+            *guard = base;
+        }
+        let mut msg =
+            format!("unset {key} from database; effective value reloaded from config/defaults");
+        if requires_restart(key) {
+            msg.push_str("; restart recommended for listeners");
+        }
+        Ok(ControlResponse::ok(msg))
     }
 }

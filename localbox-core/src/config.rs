@@ -85,6 +85,42 @@ pub enum Command {
     Peer(PeerArgs),
     /// List / add local shares on a running node (control plane)
     Share(ShareArgs),
+    /// Get / set / list / unset settings (DB overrides config.toml)
+    Config(ConfigArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub command: ConfigCliCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCliCommand {
+    /// List effective settings and whether each is saved in the DB
+    List {
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Show one setting
+    Get {
+        key: String,
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Set a setting (persisted in DB; overrides config.toml)
+    Set {
+        key: String,
+        value: String,
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+    /// Remove a DB-saved setting (fall back to config.toml / defaults)
+    Unset {
+        key: String,
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -705,6 +741,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub enable_dht: Option<bool>,
 
+    /// Enable TLS-over-uTP listen/dial (LAN UDP discovery always stays on)
+    #[arg(long)]
+    pub enable_utp: Option<bool>,
+
     /// Aggregation window in milliseconds
     #[arg(long)]
     pub aggregation_window_ms: Option<u64>,
@@ -781,6 +821,15 @@ impl From<AppStateArg> for ApplicationState {
     }
 }
 
+/// Resolve config.toml + DB settings + defaults (no CLI RunArgs).
+pub fn resolve_effective_config(config_path: Option<&Path>) -> Result<AppConfig> {
+    let cli = Cli {
+        config: config_path.map(|p| p.to_path_buf()),
+        command: Command::Validate(ValidateArgs {}),
+    };
+    cli.resolve_app_config()
+}
+
 impl Cli {
     pub fn resolve_app_config(&self) -> Result<AppConfig> {
         self.resolve_app_config_inner(None)
@@ -853,6 +902,10 @@ impl Cli {
             .enable_dht
             .or_else(|| file_cfg.as_ref().and_then(|c| c.enable_dht))
             .unwrap_or(!bootstrap_peers.is_empty());
+        let enable_utp = run
+            .enable_utp
+            .or_else(|| file_cfg.as_ref().and_then(|c| c.enable_utp))
+            .unwrap_or(false);
 
         let aggregation_window_ms = run
             .aggregation_window_ms
@@ -945,7 +998,7 @@ impl Cli {
             .or_else(|| file_cfg.as_ref().and_then(|c| c.control_socket.clone()))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTROL_SOCKET));
 
-        Ok(AppConfig {
+        let mut cfg = AppConfig {
             pc_name,
             instance_id,
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
@@ -958,6 +1011,7 @@ impl Cli {
             dht_port,
             utp_port,
             enable_dht,
+            enable_utp,
             bootstrap_peers,
             aggregation_window_ms,
             db_path,
@@ -975,7 +1029,56 @@ impl Cli {
             peer_policies,
             quarantined_peers,
             control_socket,
-        })
+        };
+
+        // Resolution: defaults/file → DB saved → CLI RunArgs (already applied above).
+        // Re-apply DB under CLI so persisted overrides beat config.toml.
+        if cfg.db_path.exists() {
+            if let Ok(db) = db::Db::open(&cfg.db_path) {
+                if let Ok(settings) = db.list_settings() {
+                    let run = run;
+                    let _ = crate::settings::apply_db_settings_filtered(
+                        &mut cfg,
+                        &settings,
+                        |key| cli_overrides_key(run, key),
+                    );
+                }
+            }
+        }
+
+        Ok(cfg)
+    }
+}
+
+/// Whether a `run` CLI flag already set this settings key (CLI wins over DB).
+fn cli_overrides_key(run: &RunArgs, key: &str) -> bool {
+    match key {
+        "instance_id" => run.instance_id.is_some(),
+        "listen_port" => run.listen_port.is_some(),
+        "plain_listen_port" => run.plain_listen_port.is_some(),
+        "discovery_port" => run.discovery_port.is_some(),
+        "dht_port" => run.dht_port.is_some(),
+        "utp_port" => run.utp_port.is_some(),
+        "enable_dht" => run.enable_dht.is_some(),
+        "enable_utp" => run.enable_utp.is_some(),
+        "aggregation_window_ms" => run.aggregation_window_ms.is_some(),
+        "log_path" => run.log_path.is_some(),
+        "tls_cert_path" => run.tls_cert_path.is_some(),
+        "tls_key_path" => run.tls_key_path.is_some(),
+        "tls_ca_cert_path" => run.tls_ca_cert_path.is_some(),
+        "use_tls_for_peers" => run.use_tls_for_peers.is_some(),
+        "remote_share_root" => run.remote_share_root.is_some(),
+        "app_state" => run.app_state.is_some(),
+        "control_socket" => run.control_socket.is_some(),
+        // No dedicated RunArgs; DB may always overlay file for these:
+        "tls_pinned_ca_fingerprints"
+        | "tls_peer_fingerprints"
+        | "tls_insecure_shared_cert"
+        | "request_handling"
+        | "peer_policies"
+        | "quarantined_peers"
+        | "bootstrap_peers" => false,
+        _ => false,
     }
 }
 
@@ -1217,6 +1320,7 @@ struct FileConfig {
     dht_port: Option<u16>,
     utp_port: Option<u16>,
     enable_dht: Option<bool>,
+    enable_utp: Option<bool>,
     #[serde(default)]
     bootstrap_peers: Option<Vec<BootstrapPeer>>,
     aggregation_window_ms: Option<u64>,
@@ -1504,12 +1608,15 @@ instance_id = "{instance_id}"
 listen_port = {listen_port}
 plain_listen_port = {plain_listen_port}
 discovery_port = {discovery_port}
+# LAN UDP discovery (discovery_port) always runs.
+# Optional WAN stack — both default off; enable independently as needed.
 dht_port = {dht_port}
 utp_port = {utp_port}
-# Private BEP5 DHT (irontide). Off unless enable_dht or bootstrap_peers is set.
 enable_dht = false
+enable_utp = false
 
-# WAN bootstrap for the private DHT mesh (do not list public Mainline routers):
+# Private BEP5 DHT bootstrap mesh (do not list public Mainline routers).
+# Setting [[bootstrap_peers]] also implies enable_dht unless you set enable_dht = false.
 # [[bootstrap_peers]]
 # addr = "bootstrap.example.com:5003"
 # session_addr = "bootstrap.example.com:5000"
@@ -1717,6 +1824,7 @@ mod tests {
             dht_port: 5003,
             utp_port: 5004,
             enable_dht: false,
+        enable_utp: false,
             bootstrap_peers: Vec::new(),
             aggregation_window_ms: 10,
             db_path: PathBuf::from("db"),
@@ -1762,6 +1870,7 @@ mod tests {
             dht_port: 5003,
             utp_port: 5004,
             enable_dht: false,
+        enable_utp: false,
             bootstrap_peers: Vec::new(),
             aggregation_window_ms: 10,
             db_path: PathBuf::from("db"),

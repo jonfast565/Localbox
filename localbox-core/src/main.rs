@@ -2,7 +2,8 @@ use clap::Parser;
 use comfy_table::{presets::ASCII_FULL_CONDENSED, Table};
 use localbox_core::config::{
     init_config_template, set_quarantined_peer_in_config, validate_app_config, BootstrapCommand,
-    ChatCommand, Cli, Command, PeerCliCommand, ShareCliCommand, StatusSection, DEFAULT_CONFIG_PATH,
+    ChatCommand, Cli, Command, ConfigCliCommand, PeerCliCommand, ShareCliCommand, StatusSection,
+    DEFAULT_CONFIG_PATH,
 };
 use localbox_core::control::send_control_request;
 use localbox_core::integrity;
@@ -509,6 +510,68 @@ async fn main() -> anyhow::Result<()> {
                         path: path.display().to_string(),
                         recursive: *recursive,
                     },
+                )
+                .await?;
+                print_control_resp(&resp);
+                if resp.ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(resp.message))
+                }
+            }
+        },
+        Command::Config(args) => match &args.command {
+            ConfigCliCommand::List { socket } => {
+                let sock = resolve_control_socket(&cli, socket.clone())?;
+                let resp = send_control_request(&sock, &ControlRequest::ConfigList).await?;
+                print_control_resp(&resp);
+                if resp.ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(resp.message))
+                }
+            }
+            ConfigCliCommand::Get { key, socket } => {
+                let sock = resolve_control_socket(&cli, socket.clone())?;
+                let resp = send_control_request(
+                    &sock,
+                    &ControlRequest::ConfigGet { key: key.clone() },
+                )
+                .await?;
+                print_control_resp(&resp);
+                if resp.ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(resp.message))
+                }
+            }
+            ConfigCliCommand::Set {
+                key,
+                value,
+                socket,
+            } => {
+                let sock = resolve_control_socket(&cli, socket.clone())?;
+                let value = localbox_core::settings::parse_value_literal(value)?;
+                let resp = send_control_request(
+                    &sock,
+                    &ControlRequest::ConfigSet {
+                        key: key.clone(),
+                        value,
+                    },
+                )
+                .await?;
+                print_control_resp(&resp);
+                if resp.ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(resp.message))
+                }
+            }
+            ConfigCliCommand::Unset { key, socket } => {
+                let sock = resolve_control_socket(&cli, socket.clone())?;
+                let resp = send_control_request(
+                    &sock,
+                    &ControlRequest::ConfigUnset { key: key.clone() },
                 )
                 .await?;
                 print_control_resp(&resp);

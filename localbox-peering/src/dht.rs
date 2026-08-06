@@ -122,10 +122,15 @@ async fn dht_loop(
             if let Ok(addr) = session.parse::<SocketAddr>() {
                 let plain = SocketAddr::new(addr.ip(), 0);
                 let share_names = local_share_names(&db, &cfg.pc_name).await;
+                let utp_hint = if cfg.utp_enabled() {
+                    Some(SocketAddr::new(addr.ip(), cfg.utp_port))
+                } else {
+                    None
+                };
                 spawn_connect_task(
                     addr,
                     plain,
-                    Some(SocketAddr::new(addr.ip(), cfg.utp_port)),
+                    utp_hint,
                     pc_name,
                     &cfg,
                     &db,
@@ -143,10 +148,15 @@ async fn dht_loop(
                 if let Some(addr) = addrs.filter(|a| a.is_ipv4()).next() {
                     let plain = SocketAddr::new(addr.ip(), 0);
                     let share_names = local_share_names(&db, &cfg.pc_name).await;
+                    let utp_hint = if cfg.utp_enabled() {
+                        Some(SocketAddr::new(addr.ip(), cfg.utp_port))
+                    } else {
+                        None
+                    };
                     spawn_connect_task(
                         addr,
                         plain,
-                        Some(SocketAddr::new(addr.ip(), cfg.utp_port)),
+                        utp_hint,
                         pc_name,
                         &cfg,
                         &db,
@@ -214,11 +224,18 @@ async fn announce_self(
     seq: &mut i64,
 ) -> Result<()> {
     let info_hash = peer_infohash(&cfg.pc_name);
-    dht.announce(info_hash, cfg.utp_port).await?;
+    let announce_port = if cfg.utp_enabled() {
+        cfg.utp_port
+    } else {
+        cfg.listen_addr.port()
+    };
+    dht.announce(info_hash, announce_port).await?;
 
     let mut candidates = Vec::new();
     if let Some(ip) = reflexive {
-        candidates.push(SocketAddr::new(ip, cfg.utp_port).to_string());
+        if cfg.utp_enabled() {
+            candidates.push(SocketAddr::new(ip, cfg.utp_port).to_string());
+        }
         candidates.push(SocketAddr::new(ip, cfg.listen_addr.port()).to_string());
     }
     let record = PeerEndpointRecord {
@@ -226,7 +243,7 @@ async fn announce_self(
         instance_id: cfg.instance_id.clone(),
         tls_port: cfg.listen_addr.port(),
         plain_port: cfg.plain_listen_addr.port(),
-        utp_port: cfg.utp_port,
+        utp_port: cfg.advertised_utp_port(),
         candidates,
     };
     let json = serde_json::to_vec(&record)?;
@@ -307,12 +324,20 @@ async fn lookup_and_dial(
                     batch = rx.recv() => {
                         let Some(addrs) = batch else { break; };
                         for addr in addrs {
-                            let tls_addr = SocketAddr::new(addr.ip(), 0);
+                            // Announced port is uTP when enable_utp, else TLS listen port.
+                            let (tls_addr, utp_addr) = if cfg.utp_enabled() {
+                                (
+                                    SocketAddr::new(addr.ip(), 0),
+                                    Some(addr),
+                                )
+                            } else {
+                                (addr, None)
+                            };
                             let plain = SocketAddr::new(addr.ip(), 0);
                             spawn_connect_task(
                                 tls_addr,
                                 plain,
-                                Some(addr),
+                                utp_addr,
                                 &pc_name,
                                 cfg,
                                 db,
@@ -366,12 +391,17 @@ fn dial_from_record(
         if !seen.insert(addr.ip()) {
             continue;
         }
-        let tls_addr = SocketAddr::new(addr.ip(), record.tls_port);
+        let tls_addr = SocketAddr::new(
+            addr.ip(),
+            if record.tls_port != 0 {
+                record.tls_port
+            } else {
+                addr.port()
+            },
+        );
         let plain_addr = SocketAddr::new(addr.ip(), record.plain_port);
-        let utp_addr = if record.utp_port != 0 {
+        let utp_addr = if cfg.utp_enabled() && record.utp_port != 0 {
             Some(SocketAddr::new(addr.ip(), record.utp_port))
-        } else if addr.port() != 0 {
-            Some(addr)
         } else {
             None
         };

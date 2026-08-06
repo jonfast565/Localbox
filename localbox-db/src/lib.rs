@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-const DB_SCHEMA_VERSION: i32 = 8;
+const DB_SCHEMA_VERSION: i32 = 9;
 
 pub struct Db {
     conn: Connection,
@@ -283,6 +283,12 @@ impl Db {
                 reason         TEXT,
                 created_at     INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key        TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
         "#,
         )?;
         self.apply_schema_migrations()?;
@@ -530,6 +536,18 @@ impl Db {
             }
         }
 
+        if current < 9 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS settings (
+                    key        TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                "#,
+            )?;
+        }
+
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {DB_SCHEMA_VERSION};"))?;
 
@@ -546,6 +564,55 @@ impl Db {
             }
         }
         Ok(false)
+    }
+
+    /// Sparse config overrides: key → JSON text.
+    pub fn list_settings(&self) -> Result<HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, value_json FROM settings ORDER BY key")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            out.insert(k, v);
+        }
+        Ok(out)
+    }
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value_json FROM settings WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value_json: &str, updated_at: i64) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO settings (key, value_json, updated_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            "#,
+            params![key, value_json, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<bool> {
+        let n = self
+            .conn
+            .execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+        Ok(n > 0)
     }
 
     pub fn schema_version(&self) -> Result<i32> {

@@ -56,9 +56,14 @@ pub struct AppConfig {
     /// UDP port for uTP peer sessions (irontide). Default 5004.
     #[serde(default = "default_utp_port")]
     pub utp_port: u16,
-    /// Run the private DHT node (also implied when `bootstrap_peers` is non-empty).
+    /// Run the private BEP5 DHT (also implied when `bootstrap_peers` is non-empty).
+    /// LAN UDP discovery always runs regardless of this flag.
     #[serde(default)]
     pub enable_dht: bool,
+    /// Bind/accept/dial TLS-over-uTP. When false, peers use TCP/TLS (LAN path).
+    /// LAN UDP discovery always runs regardless of this flag.
+    #[serde(default)]
+    pub enable_utp: bool,
     /// Private-mesh DHT bootstrap peers (no public Mainline routers).
     #[serde(default)]
     pub bootstrap_peers: Vec<BootstrapPeer>,
@@ -176,8 +181,24 @@ pub struct PeerPolicy {
 
 impl AppConfig {
     /// Whether the private BEP5 DHT should run.
-    pub fn wan_discovery_enabled(&self) -> bool {
-        self.enable_dht || !self.bootstrap_peers.is_empty()
+    /// LAN UDP discovery always runs; this only gates the DHT mesh.
+    /// (`enable_dht` defaults to true at config resolve when `bootstrap_peers` is set.)
+    pub fn dht_enabled(&self) -> bool {
+        self.enable_dht
+    }
+
+    /// Whether uTP listen/dial should run.
+    pub fn utp_enabled(&self) -> bool {
+        self.enable_utp && self.utp_port != 0
+    }
+
+    /// Advertised uTP port in Hello/discovery (0 when uTP is disabled).
+    pub fn advertised_utp_port(&self) -> u16 {
+        if self.utp_enabled() {
+            self.utp_port
+        } else {
+            0
+        }
     }
 
     /// Whether journal sync (SyncCatchup) runs automatically for this share/peer.

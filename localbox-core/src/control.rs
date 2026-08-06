@@ -22,7 +22,32 @@ pub async fn run_control_server(
     share_hooks: Option<ShareHooks>,
     token: CancellationToken,
 ) -> Result<()> {
-    let path = cfg.control_socket.clone();
+    run_control_server_with_cfg(
+        Arc::new(std::sync::RwLock::new(cfg)),
+        db,
+        net_tx,
+        cmd_tx,
+        progress,
+        share_hooks,
+        token,
+    )
+    .await
+}
+
+pub async fn run_control_server_with_cfg(
+    cfg: Arc<std::sync::RwLock<AppConfig>>,
+    db: Arc<Mutex<Db>>,
+    net_tx: mpsc::Sender<String>,
+    cmd_tx: mpsc::Sender<PeerCommand>,
+    progress: Arc<TransferProgressRegistry>,
+    share_hooks: Option<ShareHooks>,
+    token: CancellationToken,
+) -> Result<()> {
+    let path = cfg
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .control_socket
+        .clone();
     let service = ControlService {
         cfg,
         db,

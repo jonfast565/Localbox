@@ -20,6 +20,7 @@ fn test_config(pc_name: &str, share_name: &str) -> AppConfig {
             dht_port: 5003,
             utp_port: 5004,
             enable_dht: false,
+        enable_utp: false,
             bootstrap_peers: Vec::new(),
         aggregation_window_ms: 100,
         db_path: PathBuf::new(),

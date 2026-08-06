@@ -37,7 +37,7 @@ pub async fn run_inprocess_shell(
 ) -> Result<()> {
     info!("Interactive shell (in-process). Type 'help' or 'quit'.");
     let service = ControlService {
-        cfg,
+        cfg: Arc::new(std::sync::RwLock::new(cfg)),
         db,
         net_tx,
         peer_cmd_tx: cmd_tx,
@@ -225,6 +225,7 @@ fn print_help() {
         "Commands:\n\
          \x20 status | peers | shares | pending | intents [--all] [--limit N]\n\
          \x20 share list | share add --name NAME --path DIR [--recursive true|false]\n\
+         \x20 config list | config get KEY | config set KEY VALUE | config unset KEY\n\
          \x20 intent show --id ID\n\
          \x20 push --share NAME [--peer KEY] [--path REL]\n\
          \x20 pull|request --share NAME --peer KEY [--path REL]\n\
@@ -280,6 +281,43 @@ pub fn parse_repl_to_request(line: &str) -> Result<ControlRequest> {
                     })
                 }
                 other => Err(anyhow!("unknown share subcommand '{other}'")),
+            }
+        }
+        "config" => {
+            let sub = parts
+                .get(1)
+                .map(|s| s.as_str())
+                .ok_or_else(|| anyhow!("usage: config list|get|set|unset"))?;
+            match sub {
+                "list" | "ls" => Ok(ControlRequest::ConfigList),
+                "get" => {
+                    let key = parts
+                        .get(2)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("usage: config get KEY"))?;
+                    Ok(ControlRequest::ConfigGet { key })
+                }
+                "set" => {
+                    let key = parts
+                        .get(2)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("usage: config set KEY VALUE"))?;
+                    let value_raw = parts
+                        .get(3..)
+                        .map(|s| s.join(" "))
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| anyhow!("usage: config set KEY VALUE"))?;
+                    let value = crate::settings::parse_value_literal(&value_raw)?;
+                    Ok(ControlRequest::ConfigSet { key, value })
+                }
+                "unset" | "delete" | "rm" => {
+                    let key = parts
+                        .get(2)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("usage: config unset KEY"))?;
+                    Ok(ControlRequest::ConfigUnset { key })
+                }
+                other => Err(anyhow!("unknown config subcommand '{other}'")),
             }
         }
         "pending" | "pending_requests" => Ok(ControlRequest::PendingRequests),

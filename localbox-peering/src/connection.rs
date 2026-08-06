@@ -177,11 +177,11 @@ pub async fn connect_to_peer(
         peer_tls_addr
     };
 
-    let prefer_utp = peer_utp_addr
-        .map(|a| !is_likely_lan(a.ip()))
-        .unwrap_or(false)
-        && utp.is_some()
-        && use_tls;
+    let utp_ok = cfg.utp_enabled() && utp.is_some() && use_tls;
+    let prefer_utp = utp_ok
+        && peer_utp_addr
+            .map(|a| !is_likely_lan(a.ip()))
+            .unwrap_or(false);
 
     if prefer_utp {
         if let (Some(utp_sock), Some(utp_addr)) = (utp.as_ref(), peer_utp_addr) {
@@ -221,8 +221,8 @@ pub async fn connect_to_peer(
     let tcp = match net.connect_tcp(target_addr).await {
         Ok(s) => s,
         Err(e) => {
-            // Coordinated dial: try uTP when TCP fails (typical WAN / NAT case).
-            if use_tls {
+            // Coordinated dial: try uTP when enabled and TCP fails (WAN / NAT).
+            if utp_ok {
                 if let (Some(utp_sock), Some(utp_addr)) = (utp.as_ref(), peer_utp_addr) {
                     return connect_tls_over_utp(
                         utp_sock,
@@ -414,7 +414,7 @@ async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         listen_port: cfg.listen_addr.port(),
         plain_port: cfg.plain_listen_addr.port(),
         use_tls_for_peers: cfg.use_tls_for_peers,
-        utp_port: cfg.utp_port,
+        utp_port: cfg.advertised_utp_port(),
         shares: share_names.to_vec(),
         accepts_remote_shares: cfg.app_state.can_host_remote(),
     };

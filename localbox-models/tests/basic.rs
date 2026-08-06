@@ -57,6 +57,49 @@ fn wire_message_json_round_trip() {
 }
 
 #[test]
+fn dht_and_utp_toggles_default_to_lan_only() {
+    let mut cfg = AppConfig {
+        pc_name: "pc".into(),
+        instance_id: "i".into(),
+        listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
+        plain_listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5002),
+        use_tls_for_peers: true,
+        discovery_port: 5001,
+        dht_port: 5003,
+        utp_port: 5004,
+        enable_dht: false,
+        enable_utp: false,
+        bootstrap_peers: Vec::new(),
+        aggregation_window_ms: 200,
+        db_path: PathBuf::from("db.sqlite"),
+        log_path: PathBuf::from("app.log"),
+        tls_cert_path: PathBuf::from("cert.pem"),
+        tls_key_path: PathBuf::from("key.pem"),
+        tls_ca_cert_path: PathBuf::from("ca.pem"),
+        tls_pinned_ca_fingerprints: Vec::new(),
+        tls_peer_fingerprints: Default::default(),
+        tls_insecure_shared_cert: false,
+        remote_share_root: PathBuf::from("remote"),
+        shares: Vec::new(),
+        app_state: ApplicationState::MirrorHost,
+        request_handling: Default::default(),
+        peer_policies: Vec::new(),
+        quarantined_peers: Vec::new(),
+        control_socket: PathBuf::from("localbox.sock"),
+    };
+    assert!(!cfg.dht_enabled());
+    assert!(!cfg.utp_enabled());
+    assert_eq!(cfg.advertised_utp_port(), 0);
+
+    cfg.enable_utp = true;
+    assert!(cfg.utp_enabled());
+    assert_eq!(cfg.advertised_utp_port(), 5004);
+
+    cfg.enable_dht = true;
+    assert!(cfg.dht_enabled());
+}
+
+#[test]
 fn app_config_json_round_trip() {
     let cfg = AppConfig {
         pc_name: "pc-one".to_string(),
@@ -68,6 +111,7 @@ fn app_config_json_round_trip() {
         dht_port: 5003,
         utp_port: 5004,
         enable_dht: false,
+        enable_utp: false,
         bootstrap_peers: Vec::new(),
         aggregation_window_ms: 200,
         db_path: PathBuf::from("db.sqlite"),

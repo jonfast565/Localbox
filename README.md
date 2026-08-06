@@ -9,7 +9,8 @@ Localbox is a peer-to-peer file replication engine for small networks (and optio
 - **On-demand transfers:** `push` / `pull` / `request` / `reply` over the wire (`TransferRequest` / `TransferReply`) plus optional `sync=auto` / `pull=auto` policies. Every outbound transfer is a `TransferIntent` (Snapshot from the file index, or SyncCatchup from the share journal).
 - **Interactive shell:** `localbox run --interactive` (ephemeral engine + REPL) or `localbox shell` attached to a running daemon’s control plane (Unix socket or Windows named pipe). Use `intents` / `intent show` to inspect the outbox.
 - **Chat + inbox:** Peer DMs and share-scoped threads, with dead CLI (`localbox chat …`) or live REPL; optional file attachments trigger a push into a share.
-- **Desktop GUI:** `localbox-gui` (iced) talks to the same control socket for status, transfers, and chat.
+- **Desktop GUI:** `localbox-gui` (iced) talks to the same control socket for status, transfers, chat, and settings.
+- **Layered settings:** CLI/REPL/UI overrides persist in the SQLite `settings` table and beat `config.toml`; otherwise the DB value wins; then the config file / built-in defaults.
 - **Operational tooling:** `localbox init`, `validate`, `bootstrap invite/accept/join`, TLS helpers, and `localbox monitor` for queue-depth/peer-health alerts.
 - **WAN peering:** private BEP5 DHT + uTP (via [irontide](https://crates.io/crates/irontide-dht)) with `[[bootstrap_peers]]` — no public Mainline routers. Session trust remains mTLS enrollment.
 
@@ -217,6 +218,7 @@ are, and are visible in `localbox status`.
 - **Chat:** Peer DM thread ids are deterministic (`min(local,remote)`); share threads key off share name. Messages persist in SQLite (`chat_threads` / `chat_messages`).
 - **Discovery:** Nodes broadcast `DISCOVER` and respond with `HERE`. Protocol version is 4; there is no version negotiation, so all peers must be upgraded together.
 - **Control plane:** Daemon listens on `control_socket` for newline-delimited JSON (`shell`, dead CLI, `localbox-gui`). Default `localbox.sock` on Unix, `\\.\pipe\localbox` on Windows. List intents with `intents` / `intent show --id …`. Transfer byte progress is exposed via `transfer_progress` (and enriched on `intents` / `intent_show`).
+- **Settings:** Effective config resolves as **process CLI flags → DB `settings` → `config.toml` → defaults**. Use `localbox config list|get|set|unset`, REPL `config …`, or the GUI Settings tab. DB values override the file without editing it; `unset` restores the file/default. Bind/TLS/DHT/uTP changes may require a restart.
 
 ## Application States
 
@@ -263,7 +265,7 @@ cargo run -p localbox-gui -- --config config.toml
 cargo run -p localbox-gui -- --no-runtime --socket localbox.sock
 ```
 
-Binary resolution for a spawned runtime: `--core PATH`, then `$LOCALBOX_CORE`, then a `localbox-core` sibling of the GUI binary, then `PATH`. The Transfers tab lists pending requests and active TransferIntents with byte/batch progress bars. The Status tab shows quarantined peers (manage quarantine via CLI/control plane).
+Binary resolution for a spawned runtime: `--core PATH`, then `$LOCALBOX_CORE`, then a `localbox-core` sibling of the GUI binary, then `PATH`. The Transfers tab lists pending requests and active TransferIntents with byte/batch progress bars. The Status tab shows quarantined peers (manage quarantine via CLI/control plane). The Settings tab lists effective values and can set/unset DB overrides.
 
 ## Repository Layout
 
@@ -288,10 +290,12 @@ Binary resolution for a spawned runtime: `--core PATH`, then `$LOCALBOX_CORE`, t
 
 ## WAN / private DHT
 
-Same-LAN peers keep using UDP `DISCOVER`/`HERE` and TCP/TLS. For one peer on the LAN and one off-LAN, configure a **private** BEP5 mesh (irontide) that only uses your bootstrap nodes:
+**LAN discovery always stays on** (UDP `DISCOVER`/`HERE` + TCP/TLS). DHT and uTP are independent toggles — leave both off for a pure LAN mesh.
 
 ```toml
-enable_dht = true
+# defaults: both off → LAN only
+enable_dht = true   # private BEP5 DHT (irontide); also implied by [[bootstrap_peers]]
+enable_utp = true   # TLS-over-uTP listen/dial; when false, dial TCP/TLS only
 dht_port = 5003
 utp_port = 5004
 
@@ -301,7 +305,13 @@ session_addr = "bootstrap.example.com:5000"  # optional TCP/TLS dial hint
 pc_name = "home-server"
 ```
 
-At least one node (or a tiny third host) must be UDP-reachable for DHT bootstrap. Peers announce under an infohash derived from `pc_name`, publish a BEP44 endpoint record (TLS/plain/uTP ports + reflexive candidates when known), and dial with TCP on LAN or TLS-over-uTP on WAN. Enrollment / mTLS still gates trust — DHT visibility alone is not enough.
+| Mode | Config | Behavior |
+|---|---|---|
+| LAN only | `enable_dht=false`, `enable_utp=false` | Broadcast discovery + TCP/TLS (default) |
+| DHT + TCP | `enable_dht=true`, `enable_utp=false` | WAN find via DHT; dial TCP/TLS |
+| DHT + uTP | both true | WAN find via DHT; prefer TLS-over-uTP off-LAN |
+
+At least one node (or a tiny third host) must be UDP-reachable for DHT bootstrap. Peers announce under an infohash derived from `pc_name`, publish a BEP44 endpoint record, and dial TCP on LAN or uTP on WAN when enabled. Enrollment / mTLS still gates trust — DHT visibility alone is not enough.
 
 ## License
 

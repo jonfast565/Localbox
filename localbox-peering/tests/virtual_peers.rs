@@ -759,6 +759,7 @@ fn test_config_with_state(
         dht_port: 5003,
         utp_port: 5004,
         enable_dht: false,
+        enable_utp: false,
         bootstrap_peers: Vec::new(),
         aggregation_window_ms: 100,
         db_path: PathBuf::from(""),

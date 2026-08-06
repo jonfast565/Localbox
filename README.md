@@ -1,6 +1,6 @@
 # Localbox
 
-Localbox is a peer-to-peer file replication engine for small networks. Each node is both a client and a server: it discovers peers via UDP, dials and listens over TCP/TLS, and exchanges encrypted batches of file metadata and contents. Transfers are **manual by default**; opt into auto sync and/or auto pull per share (or per peer). Peers can also chat (DM or share-scoped threads) with a persistent inbox.
+Localbox is a peer-to-peer file replication engine for small networks (and optional WAN meshes). Each node is both a client and a server: it discovers peers via LAN UDP broadcast and/or a private BEP5 DHT (irontide), dials over TCP/TLS or TLS-over-uTP, and exchanges encrypted batches of file metadata and contents. Transfers are **manual by default**; opt into auto sync and/or auto pull per share (or per peer). Peers can also chat (DM or share-scoped threads) with a persistent inbox.
 
 ## Highlights
 
@@ -11,11 +11,13 @@ Localbox is a peer-to-peer file replication engine for small networks. Each node
 - **Chat + inbox:** Peer DMs and share-scoped threads, with dead CLI (`localbox chat …`) or live REPL; optional file attachments trigger a push into a share.
 - **Desktop GUI:** `localbox-gui` (iced) talks to the same control socket for status, transfers, and chat.
 - **Operational tooling:** `localbox init`, `validate`, `bootstrap invite/accept/join`, TLS helpers, and `localbox monitor` for queue-depth/peer-health alerts.
+- **WAN peering:** private BEP5 DHT + uTP (via [irontide](https://crates.io/crates/irontide-dht)) with `[[bootstrap_peers]]` — no public Mainline routers. Session trust remains mTLS enrollment.
 
 ## Requirements
 
 - Rust stable (Edition 2021).
 - UDP broadcast reachability on the discovery port (default `5001`) plus TCP access to the peer listen ports (default TLS `5000`, plaintext `5002`).
+- For WAN: UDP reachability for DHT (`dht_port`, default `5003`) and uTP (`utp_port`, default `5004`) to at least one bootstrap peer; do not list public BitTorrent DHT routers.
 - Ability to create TLS materials under `certs/` (or custom paths) and persist a SQLite database file.
 
 ## Getting Started
@@ -284,6 +286,23 @@ Binary resolution for a spawned runtime: `--core PATH`, then `$LOCALBOX_CORE`, t
 - For a full validation, run `cargo test` from the workspace root (on slower hardware this may exceed CI/CLI timeouts—rerun locally if needed).
 - `cargo fmt` and `cargo clippy --workspace --all-targets` keep the style and lints consistent.
 
+## WAN / private DHT
+
+Same-LAN peers keep using UDP `DISCOVER`/`HERE` and TCP/TLS. For one peer on the LAN and one off-LAN, configure a **private** BEP5 mesh (irontide) that only uses your bootstrap nodes:
+
+```toml
+enable_dht = true
+dht_port = 5003
+utp_port = 5004
+
+[[bootstrap_peers]]
+addr = "bootstrap.example.com:5003"          # DHT UDP
+session_addr = "bootstrap.example.com:5000"  # optional TCP/TLS dial hint
+pc_name = "home-server"
+```
+
+At least one node (or a tiny third host) must be UDP-reachable for DHT bootstrap. Peers announce under an infohash derived from `pc_name`, publish a BEP44 endpoint record (TLS/plain/uTP ports + reflexive candidates when known), and dial with TCP on LAN or TLS-over-uTP on WAN. Enrollment / mTLS still gates trust — DHT visibility alone is not enough.
+
 ## License
 
-MIT. See [`LICENSE`](LICENSE) for full text.
+GPL-3.0-or-later (required for the irontide BEP5/uTP stack). See [`LICENSE`](LICENSE) for full text.

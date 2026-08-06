@@ -2212,10 +2212,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "dark-light",
  "iced",
  "serde",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]

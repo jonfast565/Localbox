@@ -242,17 +242,20 @@ Nodes advertise their capability to peers so that hosts don't waste time pushing
 
 ## GUI
 
-The `localbox-gui` crate is an iced desktop UI for the same control-plane IPC as the CLI. Start a node first (`localbox run`), then:
+The `localbox-gui` crate is an iced desktop UI for the same control-plane IPC as the CLI. On launch it **attaches** if a daemon is already listening on the control socket; otherwise it **spawns** `localbox-core run` as a child and stops that child when the GUI exits (an already-running daemon is left alone).
 
 ```bash
-# Unix
-cargo run -p localbox-gui -- --socket localbox.sock
+# Attach or spawn (default socket: localbox.sock / \\.\pipe\localbox)
+cargo run -p localbox-gui
 
-# Windows (named pipe; default if --socket omitted on Windows builds)
-cargo run -p localbox-gui -- --socket '\\.\pipe\localbox'
+# Use a config.toml (passed to a spawned runtime; also sets control_socket if --socket is default)
+cargo run -p localbox-gui -- --config config.toml
+
+# Client-only: never spawn
+cargo run -p localbox-gui -- --no-runtime --socket localbox.sock
 ```
 
-Optional `--config path/to/config.toml` picks up `control_socket` when `--socket` is left at the default. The Transfers tab lists pending requests and active TransferIntents with byte/batch progress bars. The Status tab shows quarantined peers (manage quarantine via CLI/control plane).
+Binary resolution for a spawned runtime: `--core PATH`, then `$LOCALBOX_CORE`, then a `localbox-core` sibling of the GUI binary, then `PATH`. The Transfers tab lists pending requests and active TransferIntents with byte/batch progress bars. The Status tab shows quarantined peers (manage quarantine via CLI/control plane).
 
 ## Repository Layout
 

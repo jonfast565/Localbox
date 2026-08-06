@@ -1,7 +1,10 @@
 use iced::widget::{
     button, column, container, progress_bar, row, scrollable, text, text_input, Column, Space,
 };
-use iced::{Alignment, Element, Length, Padding, Task, Theme};
+use iced::{time, Alignment, Element, Length, Padding, Subscription, Task, Theme};
+use std::time::Duration;
+
+use crate::theme::Colors;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -44,6 +47,7 @@ pub enum Message {
     QuarantinePeer(String),
     UnquarantinePeer(String),
     ClearFlash,
+    SyncSystemTheme,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +132,9 @@ struct ChatMsg {
 
 pub struct App {
     socket: PathBuf,
+    runtime_label: String,
+    managed_runtime: bool,
+    dark: bool,
     tab: Tab,
     connected: bool,
     flash: Option<(bool, String)>,
@@ -147,9 +154,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(socket: PathBuf) -> (Self, Task<Message>) {
+    pub fn new(socket: PathBuf, runtime_label: String, managed_runtime: bool) -> (Self, Task<Message>) {
         let app = Self {
             socket,
+            runtime_label,
+            managed_runtime,
+            dark: theme::system_is_dark(),
             tab: Tab::Status,
             connected: false,
             flash: None,
@@ -223,10 +233,10 @@ impl App {
                         self.connected = true;
                         self.flash = Some((resp.ok, resp.message));
                     }
-                    Err(e) => {
-                        self.connected = false;
-                        self.flash = Some((false, e));
-                    }
+            Err(e) => {
+                self.connected = false;
+                self.flash = Some((false, disconnect_message(&e, self.managed_runtime)));
+            }
                 }
                 Task::done(Message::Refresh)
             }
@@ -321,7 +331,22 @@ impl App {
                 self.flash = None;
                 Task::none()
             }
+            Message::SyncSystemTheme => {
+                let dark = theme::system_is_dark();
+                if self.dark != dark {
+                    self.dark = dark;
+                }
+                Task::none()
+            }
         }
+    }
+
+    pub fn subscription(&self) -> Subscription<Message> {
+        time::every(Duration::from_secs(2)).map(|_| Message::SyncSystemTheme)
+    }
+
+    fn colors(&self) -> &'static Colors {
+        theme::palette(self.dark)
     }
 
     fn refresh_tasks(&self) -> Task<Message> {
@@ -444,22 +469,27 @@ impl App {
             }
             Err(e) => {
                 self.connected = false;
-                self.flash = Some((false, format!("Disconnected: {e}")));
+                self.flash = Some((false, disconnect_message(&e, self.managed_runtime)));
             }
         }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        let c = self.colors();
         let header = row![
             column![
-                text("Localbox").size(26).color(theme::ACCENT),
-                text(self.socket.display().to_string())
-                    .size(12)
-                    .color(theme::MUTED),
+                text("Localbox").size(26).color(c.accent),
+                text(format!(
+                    "{} · runtime {}",
+                    self.socket.display(),
+                    self.runtime_label
+                ))
+                .size(12)
+                .color(c.muted),
             ]
             .spacing(2),
             Space::with_width(Length::Fill),
-            connection_badge(self.connected),
+            connection_badge(self.connected, c),
             styled_button("Refresh", Message::Refresh, theme::btn_secondary),
         ]
         .spacing(12)
@@ -474,18 +504,10 @@ impl App {
             .spacing(6),
         )
         .padding(6)
-        .style(|_| container::Style {
-            background: Some(iced::Background::Color(theme::SURFACE)),
-            border: iced::Border {
-                color: theme::BORDER,
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            ..Default::default()
-        });
+        .style(theme::tab_bar_style);
 
         let flash = self.flash.as_ref().map(|(ok, msg)| {
-            let color = if *ok { theme::OK } else { theme::DANGER };
+            let color = if *ok { c.ok } else { c.danger };
             container(
                 row![
                     text(msg).size(13).color(color),
@@ -508,13 +530,13 @@ impl App {
             Tab::Chat => chat_view(self),
         };
 
-        let mut content = column![header, tabs].spacing(16);
+        let mut content = column![header, tabs].spacing(10);
         if let Some(banner) = flash {
             content = content.push(banner);
         }
         content = content.push(body);
 
-        container(content.padding(24).width(Length::Fill).height(Length::Fill))
+        container(content.padding(12).width(Length::Fill).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
             .style(theme::root_style)
@@ -522,36 +544,41 @@ impl App {
     }
 
     pub fn theme(&self) -> Theme {
-        Theme::Dark
+        if self.dark {
+            Theme::Dark
+        } else {
+            Theme::Light
+        }
     }
 }
 
 fn status_view(app: &App) -> Element<'_, Message> {
+    let c = app.colors();
     let metrics = if let Some(s) = &app.status {
         row![
-            metric_card("Peers", s.peers.to_string()),
-            metric_card("Shares", s.shares.to_string()),
-            metric_card("Queue", s.queue_depth.to_string()),
-            metric_card("Pending", s.pending_requests.to_string()),
-            metric_card("Intents", s.active_intents.to_string()),
+            metric_card("Peers", s.peers.to_string(), c),
+            metric_card("Shares", s.shares.to_string(), c),
+            metric_card("Queue", s.queue_depth.to_string(), c),
+            metric_card("Pending", s.pending_requests.to_string(), c),
+            metric_card("Intents", s.active_intents.to_string(), c),
         ]
         .spacing(12)
         .width(Length::Fill)
     } else {
-        row![text("Waiting for status…").size(14).color(theme::MUTED)].width(Length::Fill)
+        row![text("Waiting for status…").size(14).color(c.muted)].width(Length::Fill)
     };
 
-    let mut peers_col: Column<'_, Message> = column![section_title("Peers")].spacing(8);
+    let mut peers_col: Column<'_, Message> = column![section_title("Peers", c)].spacing(8);
     if app.peers.is_empty() {
-        peers_col = peers_col.push(empty_state("No peers discovered yet."));
+        peers_col = peers_col.push(empty_state("No peers discovered yet.", c));
     } else {
         for peer in &app.peers {
-            peers_col = peers_col.push(peer_card(peer));
+            peers_col = peers_col.push(peer_card(peer, c));
         }
     }
 
     column![
-        section_title("Overview"),
+        section_title("Overview", c),
         metrics,
         Space::with_height(8),
         panel(scrollable(peers_col).height(Length::Fill), Length::Fill),
@@ -562,13 +589,14 @@ fn status_view(app: &App) -> Element<'_, Message> {
 }
 
 fn transfers_view(app: &App) -> Element<'_, Message> {
+    let c = app.colors();
     let form = panel_sized(
         column![
-            section_title("Manual transfer"),
+            section_title("Manual transfer", c),
             row![
-                labeled_input("Share", &app.share, Message::ShareInput),
-                labeled_input("Peer", &app.peer, Message::PeerInput),
-                labeled_input("Path", &app.path, Message::PathInput),
+                labeled_input("Share", &app.share, Message::ShareInput, c),
+                labeled_input("Peer", &app.peer, Message::PeerInput, c),
+                labeled_input("Path", &app.path, Message::PathInput, c),
             ]
             .spacing(12),
             row![
@@ -584,22 +612,22 @@ fn transfers_view(app: &App) -> Element<'_, Message> {
     );
 
     let mut pending_col: Column<'_, Message> =
-        column![section_title("Pending inbound requests")].spacing(8);
+        column![section_title("Pending inbound requests", c)].spacing(8);
     if app.pending.is_empty() {
-        pending_col = pending_col.push(empty_state("No pending requests."));
+        pending_col = pending_col.push(empty_state("No pending requests.", c));
     } else {
         for req in &app.pending {
-            pending_col = pending_col.push(pending_card(req));
+            pending_col = pending_col.push(pending_card(req, c));
         }
     }
 
     let mut intents_col: Column<'_, Message> =
-        column![section_title("Active transfer intents")].spacing(8);
+        column![section_title("Active transfer intents", c)].spacing(8);
     if app.intents.is_empty() {
-        intents_col = intents_col.push(empty_state("No active intents."));
+        intents_col = intents_col.push(empty_state("No active intents.", c));
     } else {
         for intent in &app.intents {
-            intents_col = intents_col.push(intent_card(intent));
+            intents_col = intents_col.push(intent_card(intent, c));
         }
     }
 
@@ -624,13 +652,14 @@ fn transfers_view(app: &App) -> Element<'_, Message> {
 }
 
 fn chat_view(app: &App) -> Element<'_, Message> {
-    let mut inbox_col: Column<'_, Message> = column![section_title("Inbox")].spacing(6);
+    let c = app.colors();
+    let mut inbox_col: Column<'_, Message> = column![section_title("Inbox", c)].spacing(6);
     if app.threads.is_empty() {
-        inbox_col = inbox_col.push(empty_state("No conversations yet."));
+        inbox_col = inbox_col.push(empty_state("No conversations yet.", c));
     } else {
         for thread in &app.threads {
             let selected = app.selected_thread.as_deref() == Some(thread.id.as_str());
-            inbox_col = inbox_col.push(thread_item(thread, selected));
+            inbox_col = inbox_col.push(thread_item(thread, selected, c));
         }
     }
 
@@ -643,19 +672,19 @@ fn chat_view(app: &App) -> Element<'_, Message> {
 
     let mut messages_col: Column<'_, Message> = column![].spacing(8);
     if app.selected_thread.is_none() {
-        messages_col = messages_col.push(empty_state("Choose a thread from the inbox."));
+        messages_col = messages_col.push(empty_state("Choose a thread from the inbox.", c));
     } else if app.messages.is_empty() {
-        messages_col = messages_col.push(empty_state("No messages in this thread."));
+        messages_col = messages_col.push(empty_state("No messages in this thread.", c));
     } else {
         for msg in &app.messages {
-            messages_col = messages_col.push(message_bubble(msg));
+            messages_col = messages_col.push(message_bubble(msg, c));
         }
     }
 
     let composer = column![
         row![
-            labeled_input("Peer", &app.chat_peer, Message::ChatPeerInput),
-            labeled_input("Share", &app.chat_share, Message::ChatShareInput),
+            labeled_input("Peer", &app.chat_peer, Message::ChatPeerInput, c),
+            labeled_input("Share", &app.chat_share, Message::ChatShareInput, c),
         ]
         .spacing(8),
         row![
@@ -673,7 +702,7 @@ fn chat_view(app: &App) -> Element<'_, Message> {
 
     let thread_pane = column![
         row![
-            text(title).size(16).color(theme::TEXT),
+            text(title).size(16).color(c.text),
             Space::with_width(Length::Fill),
             styled_button("Mark read", Message::MarkRead, theme::btn_ghost),
         ]
@@ -686,7 +715,7 @@ fn chat_view(app: &App) -> Element<'_, Message> {
     .height(Length::Fill);
 
     row![
-        panel(scrollable(inbox_col).height(Length::Fill), Length::Fixed(260.0)),
+        panel(scrollable(inbox_col).height(Length::Fill), Length::Fixed(120.0)),
         panel(thread_pane, Length::Fill),
     ]
     .spacing(12)
@@ -694,7 +723,7 @@ fn chat_view(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-fn peer_card(peer: &PeerInfo) -> Element<'_, Message> {
+fn peer_card<'a>(peer: &'a PeerInfo, c: &'a Colors) -> Element<'a, Message> {
     let key = format!("{}@{}", peer.pc_name, peer.instance_id);
     let endpoint = if peer.last_tls_port > 0 {
         format!(
@@ -720,13 +749,13 @@ fn peer_card(peer: &PeerInfo) -> Element<'_, Message> {
     };
 
     let mut title = row![
-        text(&peer.pc_name).size(15).color(theme::TEXT),
-        status_pill(&peer.state),
+        text(&peer.pc_name).size(15).color(c.text),
+        status_pill(&peer.state, c),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
     if peer.quarantined {
-        title = title.push(status_pill("quarantined"));
+        title = title.push(status_pill("quarantined", c));
     }
 
     container(
@@ -735,10 +764,10 @@ fn peer_card(peer: &PeerInfo) -> Element<'_, Message> {
                 title,
                 text(format!("#{} · instance {}", peer.id, peer.instance_id))
                     .size(12)
-                    .color(theme::MUTED),
+                    .color(c.muted),
                 text(format!("{endpoint} · last seen {seen}"))
                     .size(12)
-                    .color(theme::MUTED),
+                    .color(c.muted),
             ]
             .spacing(4)
             .width(Length::Fill),
@@ -753,7 +782,7 @@ fn peer_card(peer: &PeerInfo) -> Element<'_, Message> {
     .into()
 }
 
-fn pending_card(req: &PendingRequest) -> Element<'_, Message> {
+fn pending_card<'a>(req: &'a PendingRequest, c: &'a Colors) -> Element<'a, Message> {
     let from = format!("{}@{}", req.from_pc, req.from_instance);
     let paths = if req.paths.is_empty() {
         "entire share".into()
@@ -763,22 +792,22 @@ fn pending_card(req: &PendingRequest) -> Element<'_, Message> {
     container(
         column![
             row![
-                text(&req.share_name).size(15).color(theme::TEXT),
+                text(&req.share_name).size(15).color(c.text),
                 Space::with_width(Length::Fill),
-                status_pill(&req.status),
+                status_pill(&req.status, c),
             ]
             .align_y(Alignment::Center),
             text(format!("{} · from {from}", req.direction))
                 .size(12)
-                .color(theme::MUTED),
-            text(format!("paths: {paths}")).size(12).color(theme::MUTED),
+                .color(c.muted),
+            text(format!("paths: {paths}")).size(12).color(c.muted),
             text(format!(
                 "id {} · {}",
                 short_id(&req.request_id),
                 format_ts(req.created_at)
             ))
             .size(11)
-            .color(theme::MUTED),
+            .color(c.muted),
             row![
                 styled_button(
                     "Accept",
@@ -801,7 +830,7 @@ fn pending_card(req: &PendingRequest) -> Element<'_, Message> {
     .into()
 }
 
-fn intent_card(intent: &IntentRow) -> Element<'_, Message> {
+fn intent_card<'a>(intent: &'a IntentRow, c: &'a Colors) -> Element<'a, Message> {
     let frac = if intent.bytes_total > 0 {
         intent.bytes_done as f32 / intent.bytes_total as f32
     } else if intent.pending_batches == 0 {
@@ -824,27 +853,27 @@ fn intent_card(intent: &IntentRow) -> Element<'_, Message> {
         row![
             text(format!("{} · {}", short_id(&intent.id), intent.kind))
                 .size(14)
-                .color(theme::TEXT),
+                .color(c.text),
             Space::with_width(Length::Fill),
-            status_pill(&intent.status),
+            status_pill(&intent.status, c),
         ]
         .align_y(Alignment::Center),
         text(format!("share {}", intent.share))
             .size(12)
-            .color(theme::MUTED),
+            .color(c.muted),
         progress_bar(0.0..=1.0, frac)
             .height(8)
             .style(theme::progress_style),
         row![
-            text(bytes).size(12).color(theme::MUTED),
+            text(bytes).size(12).color(c.muted),
             Space::with_width(Length::Fill),
-            text(files).size(12).color(theme::MUTED),
+            text(files).size(12).color(c.muted),
         ],
     ]
     .spacing(6);
 
     if let Some(err) = &intent.last_error {
-        col = col.push(text(err).size(12).color(theme::DANGER));
+        col = col.push(text(err).size(12).color(c.danger));
     }
 
     container(col)
@@ -854,7 +883,7 @@ fn intent_card(intent: &IntentRow) -> Element<'_, Message> {
         .into()
 }
 
-fn thread_item(thread: &ThreadInfo, selected: bool) -> Element<'_, Message> {
+fn thread_item<'a>(thread: &'a ThreadInfo, selected: bool, c: &'a Colors) -> Element<'a, Message> {
     let subtitle = match (&thread.peer_key, &thread.share_name) {
         (Some(p), Some(s)) => format!("{p} · {s}"),
         (Some(p), None) => p.clone(),
@@ -872,10 +901,10 @@ fn thread_item(thread: &ThreadInfo, selected: bool) -> Element<'_, Message> {
         column![
             text(format!("{}{unread}", thread.title))
                 .size(14)
-                .color(if selected { theme::TEXT } else { theme::MUTED }),
+                .color(if selected { c.text } else { c.muted }),
             text(format!("{subtitle} · {updated}"))
                 .size(11)
-                .color(theme::MUTED),
+                .color(c.muted),
         ]
         .spacing(2)
         .width(Length::Fill),
@@ -887,7 +916,7 @@ fn thread_item(thread: &ThreadInfo, selected: bool) -> Element<'_, Message> {
     .into()
 }
 
-fn message_bubble(msg: &ChatMsg) -> Element<'_, Message> {
+fn message_bubble<'a>(msg: &'a ChatMsg, c: &'a Colors) -> Element<'a, Message> {
     let outgoing = msg.direction == "out";
     let align = if outgoing {
         Alignment::End
@@ -895,8 +924,8 @@ fn message_bubble(msg: &ChatMsg) -> Element<'_, Message> {
         Alignment::Start
     };
     let mut body = column![
-        text(&msg.from_peer).size(11).color(theme::MUTED),
-        text(&msg.body).size(14).color(theme::TEXT),
+        text(&msg.from_peer).size(11).color(c.muted),
+        text(&msg.body).size(14).color(c.text),
     ]
     .spacing(4);
 
@@ -904,7 +933,7 @@ fn message_bubble(msg: &ChatMsg) -> Element<'_, Message> {
         body = body.push(
             text(format!("attachment {share}:{path}"))
                 .size(12)
-                .color(theme::ACCENT),
+                .color(c.accent),
         );
     }
 
@@ -916,7 +945,7 @@ fn message_bubble(msg: &ChatMsg) -> Element<'_, Message> {
             msg.status
         ))
         .size(10)
-        .color(theme::MUTED),
+        .color(c.muted),
     );
 
     let bubble = container(body)
@@ -930,11 +959,11 @@ fn message_bubble(msg: &ChatMsg) -> Element<'_, Message> {
         .into()
 }
 
-fn metric_card(label: &str, value: String) -> Element<'_, Message> {
+fn metric_card<'a>(label: &'a str, value: String, c: &'a Colors) -> Element<'a, Message> {
     container(
         column![
-            text(label).size(12).color(theme::MUTED),
-            text(value).size(24).color(theme::TEXT),
+            text(label).size(12).color(c.muted),
+            text(value).size(24).color(c.text),
         ]
         .spacing(4),
     )
@@ -944,12 +973,12 @@ fn metric_card(label: &str, value: String) -> Element<'_, Message> {
     .into()
 }
 
-fn section_title(label: &str) -> Element<'_, Message> {
-    text(label).size(16).color(theme::TEXT).into()
+fn section_title<'a>(label: &'a str, c: &'a Colors) -> Element<'a, Message> {
+    text(label).size(16).color(c.text).into()
 }
 
-fn empty_state(label: &str) -> Element<'_, Message> {
-    container(text(label).size(13).color(theme::MUTED))
+fn empty_state<'a>(label: &'a str, c: &'a Colors) -> Element<'a, Message> {
+    container(text(label).size(13).color(c.muted))
         .padding(16)
         .width(Length::Fill)
         .style(theme::card_style)
@@ -976,19 +1005,19 @@ fn panel_sized<'a>(
         .into()
 }
 
-fn status_pill(label: &str) -> Element<'_, Message> {
-    let color = theme::status_color(label);
+fn status_pill<'a>(label: &'a str, c: &'a Colors) -> Element<'a, Message> {
+    let color = theme::status_color(c, label);
     container(text(label).size(11).color(color))
         .padding(Padding::from([3, 8]))
         .style(theme::badge_style(color))
         .into()
 }
 
-fn connection_badge(ok: bool) -> Element<'static, Message> {
+fn connection_badge(ok: bool, c: &Colors) -> Element<'static, Message> {
     let (label, color) = if ok {
-        ("Connected", theme::OK)
+        ("Connected", c.ok)
     } else {
-        ("Offline", theme::DANGER)
+        ("Offline", c.danger)
     };
     container(text(label).size(12).color(color))
         .padding(Padding::from([5, 12]))
@@ -1000,9 +1029,10 @@ fn labeled_input<'a>(
     label: &'a str,
     value: &str,
     on_input: impl Fn(String) -> Message + 'a,
+    c: &Colors,
 ) -> Element<'a, Message> {
     column![
-        text(label).size(12).color(theme::MUTED),
+        text(label).size(12).color(c.muted),
         text_input(label, value)
             .on_input(on_input)
             .padding(9)
@@ -1166,5 +1196,13 @@ fn nonempty(s: &str) -> Option<String> {
         None
     } else {
         Some(t.to_string())
+    }
+}
+
+fn disconnect_message(err: &str, managed: bool) -> String {
+    if managed {
+        format!("Disconnected from managed runtime: {err}")
+    } else {
+        format!("Disconnected: {err}")
     }
 }

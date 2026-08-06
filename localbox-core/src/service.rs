@@ -3,8 +3,8 @@ use db::{Db, PendingTransferRequest};
 use models::{
     peer_key, peer_thread_id, share_thread_id, AppConfig, ChatAttachment, ChatMessage,
     ChatMessageRecord, IntentBasis, IntentKind, IntentOrigin, IntentStatus, ShareId, ThreadKind,
-    ThreadSummary, TransferReply, TransferReplyStatus, TransferRequest, WireMessage,
-    WIRE_PROTOCOL_VERSION,
+    ThreadSummary, TransferProgressRegistry, TransferReply, TransferReplyStatus, TransferRequest,
+    WireMessage, WIRE_PROTOCOL_VERSION,
 };
 use peering::PeerCommand;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,16 @@ pub enum ControlRequest {
     ChatRead {
         thread: String,
     },
+    TransferProgress {
+        intent_id: Option<String>,
+    },
+    PeerList,
+    PeerQuarantine {
+        peer: String,
+    },
+    PeerUnquarantine {
+        peer: String,
+    },
     Quit,
 }
 
@@ -109,6 +119,7 @@ pub struct ControlService {
     pub db: Arc<Mutex<Db>>,
     pub net_tx: mpsc::Sender<String>,
     pub peer_cmd_tx: mpsc::Sender<PeerCommand>,
+    pub progress: Arc<TransferProgressRegistry>,
 }
 
 impl ControlService {
@@ -185,9 +196,25 @@ impl ControlService {
                 } else {
                     intent_ops::list_active_intents(&self.db, lim).await?
                 };
+                let mut enriched = Vec::with_capacity(intents.len());
+                for intent in intents {
+                    let pending_batches = self
+                        .db
+                        .lock()
+                        .await
+                        .count_pending_batches_for_intent(&intent.id)
+                        .unwrap_or(0);
+                    let progress = self.progress.snapshot(Some(&intent.id));
+                    let mut v = serde_json::to_value(&intent)?;
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("pending_batches".into(), serde_json::json!(pending_batches));
+                        obj.insert("progress".into(), serde_json::to_value(progress)?);
+                    }
+                    enriched.push(v);
+                }
                 Ok(ControlResponse::ok_data(
                     "intents",
-                    serde_json::to_value(intents)?,
+                    serde_json::Value::Array(enriched),
                 ))
             }
             ControlRequest::IntentShow { id } => {
@@ -197,10 +224,19 @@ impl ControlService {
                     .await
                     .get_transfer_intent(&id)?
                     .ok_or_else(|| anyhow!("intent '{id}' not found"))?;
-                Ok(ControlResponse::ok_data(
-                    "intent",
-                    serde_json::to_value(intent)?,
-                ))
+                let pending_batches = self
+                    .db
+                    .lock()
+                    .await
+                    .count_pending_batches_for_intent(&id)
+                    .unwrap_or(0);
+                let progress = self.progress.snapshot(Some(&id));
+                let mut v = serde_json::to_value(&intent)?;
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("pending_batches".into(), serde_json::json!(pending_batches));
+                    obj.insert("progress".into(), serde_json::to_value(progress)?);
+                }
+                Ok(ControlResponse::ok_data("intent", v))
             }
             ControlRequest::ChatSend {
                 peer,
@@ -237,6 +273,48 @@ impl ControlService {
                 self.db.lock().await.mark_thread_read(&thread)?;
                 Ok(ControlResponse::ok(format!("marked {thread} read")))
             }
+            ControlRequest::TransferProgress { intent_id } => {
+                let snap = self.progress.snapshot(intent_id.as_deref());
+                Ok(ControlResponse::ok_data(
+                    "transfer_progress",
+                    serde_json::to_value(snap)?,
+                ))
+            }
+            ControlRequest::PeerList => {
+                let peers = self.db.lock().await.list_peers()?;
+                Ok(ControlResponse::ok_data(
+                    "peers",
+                    serde_json::to_value(peers)?,
+                ))
+            }
+            ControlRequest::PeerQuarantine { peer } => {
+                let found = self.db.lock().await.set_peer_quarantined(&peer, true)?;
+                let cfg_path = std::env::current_dir()
+                    .unwrap_or_default()
+                    .join("config.toml");
+                let _ = crate::config::set_quarantined_peer_in_config(&cfg_path, &peer, true);
+                if found {
+                    Ok(ControlResponse::ok(format!("quarantined {peer}")))
+                } else {
+                    Ok(ControlResponse::ok(format!(
+                        "quarantined {peer} in config (peer not yet in DB)"
+                    )))
+                }
+            }
+            ControlRequest::PeerUnquarantine { peer } => {
+                let found = self.db.lock().await.set_peer_quarantined(&peer, false)?;
+                let cfg_path = std::env::current_dir()
+                    .unwrap_or_default()
+                    .join("config.toml");
+                let _ = crate::config::set_quarantined_peer_in_config(&cfg_path, &peer, false);
+                if found {
+                    Ok(ControlResponse::ok(format!("unquarantined {peer}")))
+                } else {
+                    Ok(ControlResponse::ok(format!(
+                        "removed {peer} from config quarantine list"
+                    )))
+                }
+            }
         }
     }
 
@@ -269,6 +347,16 @@ impl ControlService {
         let mut intent_ids = Vec::new();
         let mut batch_ids = Vec::new();
         for pid in peer_ids {
+            let peer_key = {
+                let db = self.db.lock().await;
+                db.get_peer(pid)?
+                    .map(|p| format!("{}@{}", p.pc_name, p.instance_id))
+            };
+            if let Some(ref pk) = peer_key {
+                if !self.cfg.resolve_allow_push(share_name, pk) {
+                    bail!("allow_push=false for peer {pk}");
+                }
+            }
             let (intent_id, batches) = crate::intent_ops::enqueue_intent(
                 &self.db,
                 &self.net_tx,
@@ -299,6 +387,9 @@ impl ControlService {
         peer_key_str: &str,
         path: Option<&str>,
     ) -> Result<String> {
+        if !self.cfg.resolve_allow_request(share_name, peer_key_str) {
+            bail!("allow_request=false for peer {peer_key_str}");
+        }
         let peer = self
             .db
             .lock()
@@ -369,6 +460,10 @@ impl ControlService {
             let paths = pending.paths.clone();
             let share_name = pending.share_name.clone();
             let req_id = pending.request_id.clone();
+            let from_key = format!("{}@{}", pending.from_pc, pending.from_instance);
+            if !self.cfg.resolve_allow_pull(&share_name, &from_key) {
+                bail!("allow_pull=false for peer {from_key}");
+            }
             let local_share_id = ShareId::new(&share_name, &self.cfg.pc_name);
             let basis = if !paths.is_empty() {
                 IntentBasis::Snapshot { paths }

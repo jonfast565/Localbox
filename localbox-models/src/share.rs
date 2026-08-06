@@ -17,6 +17,10 @@ pub struct ShareContext {
     pub root_path: PathBuf,
     pub recursive: bool,
     pub ignore_patterns: Vec<String>,
+    #[serde(default)]
+    pub sync_allow: Vec<String>,
+    #[serde(default)]
+    pub conflict: crate::ConflictPolicy,
     pub max_file_size_bytes: Option<u64>,
     pub index: HashMap<String, FileMeta>,
 }

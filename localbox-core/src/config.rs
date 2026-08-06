@@ -2,13 +2,14 @@ use crate::engine::log_banner;
 use anyhow::{anyhow, Context, Result};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use models::{
-    AppConfig, ApplicationState, PeerPolicy, ShareConfig, TransferMode,
+    AppConfig, ApplicationState, ConflictPolicy, PeerPolicy, ShareConfig, TransferMode,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use utilities::write_file_atomic;
 
 const DEFAULT_INSTANCE_ID: &str = "instance-1";
 const DEFAULT_LISTEN_PORT: u16 = 5000;
@@ -75,6 +76,30 @@ pub enum Command {
     Bootstrap(BootstrapArgs),
     /// Show current status (peers, shares, progress, queue depth) from the local DB
     Status(StatusArgs),
+    /// List / quarantine / unquarantine peers
+    Peer(PeerArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PeerArgs {
+    #[command(subcommand)]
+    pub command: PeerCliCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PeerCliCommand {
+    /// List known peers from the local DB
+    List,
+    /// Quarantine a peer (refuse connections; persist in DB + config.toml)
+    Quarantine {
+        /// Peer key (`pc_name` or `pc_name@instance_id`)
+        peer: String,
+    },
+    /// Remove a peer from quarantine
+    Unquarantine {
+        /// Peer key (`pc_name` or `pc_name@instance_id`)
+        peer: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -832,6 +857,10 @@ impl Cli {
             .as_ref()
             .and_then(|c| c.peer_policies.clone())
             .unwrap_or_default();
+        let quarantined_peers = file_cfg
+            .as_ref()
+            .and_then(|c| c.quarantined_peers.clone())
+            .unwrap_or_default();
         let control_socket = run
             .control_socket
             .clone()
@@ -862,6 +891,7 @@ impl Cli {
             app_state,
             request_handling,
             peer_policies,
+            quarantined_peers,
             control_socket,
         })
     }
@@ -884,6 +914,56 @@ pub fn init_config_template(path: &Path, force: bool) -> Result<()> {
     std::fs::write(path, default_config_template())
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+/// Add or remove a peer string in `quarantined_peers` in a TOML config file.
+/// Returns `true` if the file was modified.
+pub fn set_quarantined_peer_in_config(
+    config_path: &Path,
+    peer: &str,
+    quarantined: bool,
+) -> Result<bool> {
+    let mut doc: toml::Value = if config_path.exists() {
+        toml::from_str(
+            &std::fs::read_to_string(config_path)
+                .with_context(|| format!("failed to read {}", config_path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", config_path.display()))?
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+    let table = doc
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("config {} is not a table", config_path.display()))?;
+    let entry = table
+        .entry("quarantined_peers")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let arr = entry
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("quarantined_peers must be an array"))?;
+
+    let already_present = arr.iter().any(|v| v.as_str() == Some(peer));
+    let changed = if quarantined {
+        if already_present {
+            false
+        } else {
+            arr.push(toml::Value::String(peer.to_string()));
+            true
+        }
+    } else if already_present {
+        arr.retain(|v| v.as_str() != Some(peer));
+        true
+    } else {
+        false
+    };
+
+    if !changed {
+        return Ok(false);
+    }
+    let updated = toml::to_string_pretty(&doc)?;
+    write_file_atomic(config_path, updated.as_bytes())
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    Ok(true)
 }
 
 pub fn validate_app_config(cfg: &AppConfig) -> Result<()> {
@@ -912,10 +992,12 @@ impl ShareCli {
             root_path: self.root,
             recursive: self.recursive,
             ignore_patterns: Vec::new(),
+            sync_allow: Vec::new(),
             max_file_size_bytes: None,
             sync: Default::default(),
             pull: Default::default(),
             request_handling: None,
+            conflict: ConflictPolicy::LastWriteWins,
         }
     }
 }
@@ -994,6 +1076,8 @@ struct FileConfig {
     request_handling: Option<TransferMode>,
     #[serde(default)]
     peer_policies: Option<Vec<PeerPolicy>>,
+    #[serde(default)]
+    quarantined_peers: Option<Vec<String>>,
     control_socket: Option<PathBuf>,
 }
 
@@ -1006,6 +1090,8 @@ struct FileShareConfig {
     recursive: bool,
     #[serde(default)]
     ignore_patterns: Vec<String>,
+    #[serde(default)]
+    sync_allow: Vec<String>,
     max_file_size_bytes: Option<u64>,
     /// Gates journal sync (SyncCatchup), not manual push.
     /// `push` is the pre-v7 spelling of this key.
@@ -1015,6 +1101,8 @@ struct FileShareConfig {
     pull: TransferMode,
     #[serde(default)]
     request_handling: Option<TransferMode>,
+    #[serde(default)]
+    conflict: ConflictPolicy,
 }
 
 fn default_recursive() -> bool {
@@ -1101,10 +1189,12 @@ fn merge_shares(
             root_path: s.root_path,
             recursive: s.recursive,
             ignore_patterns: s.ignore_patterns,
+            sync_allow: s.sync_allow,
             max_file_size_bytes: s.max_file_size_bytes,
             sync: s.sync,
             pull: s.pull,
             request_handling: s.request_handling,
+            conflict: s.conflict,
         });
     }
 
@@ -1116,10 +1206,12 @@ fn merge_shares(
                 root_path: s.root,
                 recursive: s.recursive,
                 ignore_patterns: existing.ignore_patterns,
+                sync_allow: existing.sync_allow,
                 max_file_size_bytes: existing.max_file_size_bytes,
                 sync: existing.sync,
                 pull: existing.pull,
                 request_handling: existing.request_handling,
+                conflict: existing.conflict,
             };
         } else {
             idx_by_name.insert(s.name.clone(), out.len());
@@ -1292,12 +1384,18 @@ request_handling = "manual"
 # Local control socket for `localbox shell` / dead CLI commands
 control_socket = "{control_socket}"
 
-# Optional per-peer transfer overrides:
+# Optional per-peer transfer overrides / ACLs:
 # [[peer_policies]]
 # peer = "workstation-b"
 # share = "docs"
 # sync = "auto"
 # pull = "manual"
+# allow_push = true       # accept inbound file data from peer
+# allow_pull = true       # fulfill their TransferRequest
+# allow_request = true    # we may pull/request from them
+# sync_allow = ["public/**"]
+# conflict = "keep_both"
+# quarantined_peers = ["compromised-host"]
 
 [[shares]]
 name = "docs"
@@ -1309,6 +1407,8 @@ recursive = true
 sync = "manual"
 pull = "manual"
 # ignore_patterns = ["**/.git/**", "**/*.tmp"]
+# sync_allow = ["docs/**"]  # empty = all non-ignored paths
+# conflict = "last_write_wins"  # last_write_wins | keep_both | owner_wins
 # max_file_size_bytes = 1073741824 # 1 GiB
 "#,
         instance_id = DEFAULT_INSTANCE_ID,
@@ -1330,7 +1430,7 @@ pull = "manual"
 mod tests {
     use super::{default_config_template, parse_share_arg, validate_app_config, Cli};
     use clap::Parser;
-    use models::{AppConfig, ApplicationState};
+    use models::{AppConfig, ApplicationState, ConflictPolicy};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use utilities::test_temp_path;
@@ -1453,14 +1553,17 @@ mod tests {
                 root_path: tmp_dir.clone(),
                 recursive: true,
                 ignore_patterns: Vec::new(),
+                sync_allow: Vec::new(),
                 max_file_size_bytes: None,
                 sync: Default::default(),
                 pull: Default::default(),
                 request_handling: None,
+                conflict: ConflictPolicy::LastWriteWins,
             }],
             app_state: ApplicationState::MirrorHost,
             request_handling: Default::default(),
             peer_policies: Vec::new(),
+            quarantined_peers: Vec::new(),
             control_socket: std::path::PathBuf::from("localbox.sock"),
         };
         validate_app_config(&cfg).unwrap();
@@ -1491,14 +1594,17 @@ mod tests {
                 root_path: PathBuf::from("/definitely/not/real"),
                 recursive: true,
                 ignore_patterns: Vec::new(),
+                sync_allow: Vec::new(),
                 max_file_size_bytes: None,
                 sync: Default::default(),
                 pull: Default::default(),
                 request_handling: None,
+                conflict: ConflictPolicy::LastWriteWins,
             }],
             app_state: ApplicationState::MirrorOnly,
             request_handling: Default::default(),
             peer_policies: Vec::new(),
+            quarantined_peers: Vec::new(),
             control_socket: std::path::PathBuf::from("localbox.sock"),
         };
         validate_app_config(&cfg).unwrap();

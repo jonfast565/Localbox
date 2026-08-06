@@ -212,13 +212,15 @@ impl Engine {
             self.spawn_change_aggregator(rx, token.clone());
         }
 
-        let peer_mgr = PeerManager::new(
+        let progress = models::TransferProgressRegistry::new();
+        let peer_mgr = PeerManager::with_progress(
             self.cfg.clone(),
             Arc::clone(&self.db),
             self.net_tx.clone(),
             self.shares.clone(),
             self.fs.clone(),
             self.net.clone(),
+            Arc::clone(&progress),
         )?;
 
         let cleanup_task = tokio::spawn(cleanup_old_batches_task(
@@ -242,10 +244,13 @@ impl Engine {
                 let cfg = self.cfg.clone();
                 let db = Arc::clone(&self.db);
                 let net_tx = self.net_tx.clone();
+                let progress = Arc::clone(&progress);
                 let token = token.clone();
                 Some(tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::control::run_control_server(cfg, db, net_tx, cmd_tx, token).await
+                    if let Err(e) = crate::control::run_control_server(
+                        cfg, db, net_tx, cmd_tx, progress, token,
+                    )
+                    .await
                     {
                         error!("Control server exited: {e}");
                     }
@@ -262,10 +267,13 @@ impl Engine {
                 let cfg = self.cfg.clone();
                 let db = Arc::clone(&self.db);
                 let net_tx = self.net_tx.clone();
+                let progress = Arc::clone(&progress);
                 let token = token.clone();
                 Some(tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::shell::run_inprocess_shell(cfg, db, net_tx, cmd_tx, token).await
+                    if let Err(e) = crate::shell::run_inprocess_shell(
+                        cfg, db, net_tx, cmd_tx, progress, token,
+                    )
+                    .await
                     {
                         error!("Interactive shell exited: {e}");
                     }
@@ -434,6 +442,11 @@ async fn process_share_changes(
                 format!("{}@{}", p.pc_name, p.instance_id)
             })
         };
+        if let Some(ref pk) = peer_key {
+            if !cfg.resolve_allow_push(&share_name, pk) {
+                continue;
+            }
+        }
         if !cfg
             .resolve_sync_mode(&share_name, peer_key.as_deref())
             .is_auto()
@@ -505,7 +518,7 @@ mod tests {
         map_event_kind,
     };
     use models::ShareContext;
-    use models::{ChangeKind, FileChange, ShareId};
+    use models::{ChangeKind, ConflictPolicy, FileChange, ShareId};
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::EventKind;
     use std::collections::HashMap;
@@ -601,6 +614,8 @@ mod tests {
             root_path: root.clone(),
             recursive: true,
             ignore_patterns: Vec::new(),
+            sync_allow: Vec::new(),
+            conflict: ConflictPolicy::LastWriteWins,
             max_file_size_bytes: None,
             index: HashMap::new(),
         };
@@ -642,6 +657,8 @@ mod tests {
             root_path: root.clone(),
             recursive: true,
             ignore_patterns: Vec::new(),
+            sync_allow: Vec::new(),
+            conflict: ConflictPolicy::LastWriteWins,
             max_file_size_bytes: None,
             index: HashMap::new(),
         };
@@ -668,7 +685,9 @@ mod tests {
     #[test]
     fn seed_journal_from_index_is_idempotent_across_restarts() {
         use super::seed_journal_from_index;
-        use models::{AppConfig, ApplicationState, FileMeta, ShareConfig, TransferMode};
+        use models::{
+            AppConfig, ApplicationState, ConflictPolicy, FileMeta, ShareConfig, TransferMode,
+        };
 
         let fs: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
         let root = PathBuf::from("/seed-share");
@@ -694,14 +713,17 @@ mod tests {
                 root_path: root.clone(),
                 recursive: true,
                 ignore_patterns: Vec::new(),
+                sync_allow: Vec::new(),
                 max_file_size_bytes: None,
                 sync: TransferMode::Manual,
                 pull: TransferMode::Manual,
                 request_handling: None,
+                conflict: ConflictPolicy::LastWriteWins,
             }],
             app_state: ApplicationState::MirrorHost,
             request_handling: TransferMode::Manual,
             peer_policies: Vec::new(),
+            quarantined_peers: Vec::new(),
             control_socket: PathBuf::from("localbox.sock"),
         };
 
@@ -1020,7 +1042,19 @@ fn handle_path_event(
         }
     };
 
-    if utilities::ignore::is_ignored_rel_path(&rel_path, &share.ignore_patterns) {
+    if !utilities::ignore::is_path_allowed(
+        &rel_path,
+        &share.sync_allow,
+        &share.ignore_patterns,
+    ) {
+        return;
+    }
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(utilities::is_staging_tmp_name)
+        .unwrap_or(false)
+    {
         return;
     }
 
@@ -1140,7 +1174,11 @@ fn seed_journal_from_index(
                 Err(_) => continue,
             };
             let rel_path = rel.to_string_lossy().to_string();
-            if utilities::ignore::is_ignored_rel_path(&rel_path, &share.ignore_patterns) {
+            if !utilities::ignore::is_path_allowed(
+                &rel_path,
+                &share.sync_allow,
+                &share.ignore_patterns,
+            ) {
                 continue;
             }
             if let Some(max) = share.max_file_size_bytes {
@@ -1206,7 +1244,11 @@ fn handle_rename_event(
     if let Some(from) = from_opt {
         if let Ok(rel) = from.strip_prefix(&share.root_path) {
             let rel_str = rel.to_string_lossy().to_string();
-            if utilities::ignore::is_ignored_rel_path(&rel_str, &share.ignore_patterns) {
+            if !utilities::ignore::is_path_allowed(
+                &rel_str,
+                &share.sync_allow,
+                &share.ignore_patterns,
+            ) {
                 return;
             }
             let change = FileChange {
@@ -1229,7 +1271,11 @@ fn handle_rename_event(
     if let Some(to) = to_opt {
         if let Ok(rel) = to.strip_prefix(&share.root_path) {
             let rel_str = rel.to_string_lossy().to_string();
-            if utilities::ignore::is_ignored_rel_path(&rel_str, &share.ignore_patterns) {
+            if !utilities::ignore::is_path_allowed(
+                &rel_str,
+                &share.sync_allow,
+                &share.ignore_patterns,
+            ) {
                 return;
             }
             match build_meta_with_retry_limited(

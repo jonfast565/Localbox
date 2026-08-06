@@ -17,6 +17,15 @@ impl TransferMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictPolicy {
+    #[default]
+    LastWriteWins,
+    KeepBoth,
+    OwnerWins,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub pc_name: String,
@@ -57,6 +66,9 @@ pub struct AppConfig {
     /// Optional per-peer transfer policy overrides.
     #[serde(default)]
     pub peer_policies: Vec<PeerPolicy>,
+    /// Peer keys (`pc_name` or `pc_name@instance_id`) that must be refused.
+    #[serde(default)]
+    pub quarantined_peers: Vec<String>,
     /// Unix domain socket for control plane (CLI/GUI).
     #[serde(default = "default_control_socket")]
     pub control_socket: PathBuf,
@@ -69,6 +81,9 @@ pub struct ShareConfig {
     pub recursive: bool,
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
+    /// Optional allowlist; empty means all non-ignored paths are eligible.
+    #[serde(default)]
+    pub sync_allow: Vec<String>,
     pub max_file_size_bytes: Option<u64>,
     /// Auto-sync local journal changes to peers via SyncCatchup (default: manual).
     /// Note: this gates *journal sync*, not `IntentKind::SnapshotPush` — a manual
@@ -82,6 +97,8 @@ pub struct ShareConfig {
     /// Override global request_handling for this share.
     #[serde(default)]
     pub request_handling: Option<TransferMode>,
+    #[serde(default)]
+    pub conflict: ConflictPolicy,
 }
 
 impl ShareConfig {
@@ -91,10 +108,12 @@ impl ShareConfig {
             root_path,
             recursive,
             ignore_patterns: Vec::new(),
+            sync_allow: Vec::new(),
             max_file_size_bytes: None,
             sync: TransferMode::Manual,
             pull: TransferMode::Manual,
             request_handling: None,
+            conflict: ConflictPolicy::LastWriteWins,
         }
     }
 }
@@ -113,6 +132,21 @@ pub struct PeerPolicy {
     pub pull: Option<TransferMode>,
     #[serde(default)]
     pub request_handling: Option<TransferMode>,
+    #[serde(default)]
+    pub conflict: Option<ConflictPolicy>,
+    #[serde(default)]
+    pub sync_allow: Option<Vec<String>>,
+    #[serde(default)]
+    pub ignore_patterns: Option<Vec<String>>,
+    /// Accept inbound file data (batches/chunks) from this peer. Default true.
+    #[serde(default)]
+    pub allow_push: Option<bool>,
+    /// Fulfill TransferRequests from this peer. Default true.
+    #[serde(default)]
+    pub allow_pull: Option<bool>,
+    /// Send TransferRequests / auto-pull to this peer. Default true.
+    #[serde(default)]
+    pub allow_request: Option<bool>,
 }
 
 impl AppConfig {
@@ -183,11 +217,110 @@ impl AppConfig {
         self.request_handling
     }
 
-    fn find_peer_policy(
+    pub fn resolve_conflict_policy(
         &self,
+        share_name: &str,
+        peer_key: Option<&str>,
+    ) -> ConflictPolicy {
+        if let Some(peer) = peer_key {
+            if let Some(p) = self.find_peer_policy(peer, Some(share_name)) {
+                if let Some(policy) = p.conflict {
+                    return policy;
+                }
+            }
+            if let Some(p) = self.find_peer_policy(peer, None) {
+                if let Some(policy) = p.conflict {
+                    return policy;
+                }
+            }
+        }
+        self.shares
+            .iter()
+            .find(|s| s.name == share_name)
+            .map(|s| s.conflict)
+            .unwrap_or(ConflictPolicy::LastWriteWins)
+    }
+
+    /// Resolved sync_allow (peer override wins). Empty = no allowlist restriction.
+    pub fn resolve_sync_allow(&self, share_name: &str, peer_key: Option<&str>) -> Vec<String> {
+        if let Some(peer) = peer_key {
+            if let Some(p) = self.find_peer_policy(peer, Some(share_name)) {
+                if let Some(ref allow) = p.sync_allow {
+                    return allow.clone();
+                }
+            }
+            if let Some(p) = self.find_peer_policy(peer, None) {
+                if let Some(ref allow) = p.sync_allow {
+                    return allow.clone();
+                }
+            }
+        }
+        self.shares
+            .iter()
+            .find(|s| s.name == share_name)
+            .map(|s| s.sync_allow.clone())
+            .unwrap_or_default()
+    }
+
+    /// Resolved ignore patterns (peer override replaces share list when set).
+    pub fn resolve_ignore_patterns(&self, share_name: &str, peer_key: Option<&str>) -> Vec<String> {
+        if let Some(peer) = peer_key {
+            if let Some(p) = self.find_peer_policy(peer, Some(share_name)) {
+                if let Some(ref ignore) = p.ignore_patterns {
+                    return ignore.clone();
+                }
+            }
+            if let Some(p) = self.find_peer_policy(peer, None) {
+                if let Some(ref ignore) = p.ignore_patterns {
+                    return ignore.clone();
+                }
+            }
+        }
+        self.shares
+            .iter()
+            .find(|s| s.name == share_name)
+            .map(|s| s.ignore_patterns.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn resolve_allow_push(&self, share_name: &str, peer_key: &str) -> bool {
+        self.resolve_allow_flag(share_name, peer_key, |p| p.allow_push)
+    }
+
+    pub fn resolve_allow_pull(&self, share_name: &str, peer_key: &str) -> bool {
+        self.resolve_allow_flag(share_name, peer_key, |p| p.allow_pull)
+    }
+
+    pub fn resolve_allow_request(&self, share_name: &str, peer_key: &str) -> bool {
+        self.resolve_allow_flag(share_name, peer_key, |p| p.allow_request)
+    }
+
+    fn resolve_allow_flag(
+        &self,
+        share_name: &str,
         peer_key: &str,
-        share: Option<&str>,
-    ) -> Option<&PeerPolicy> {
+        f: impl Fn(&PeerPolicy) -> Option<bool>,
+    ) -> bool {
+        if let Some(p) = self.find_peer_policy(peer_key, Some(share_name)) {
+            if let Some(v) = f(p) {
+                return v;
+            }
+        }
+        if let Some(p) = self.find_peer_policy(peer_key, None) {
+            if let Some(v) = f(p) {
+                return v;
+            }
+        }
+        true
+    }
+
+    pub fn is_peer_quarantined(&self, peer_key: &str) -> bool {
+        self.quarantined_peers
+            .iter()
+            .any(|q| peer_keys_match(q, peer_key))
+    }
+
+    pub fn find_peer_policy(&self, peer_key: &str, share: Option<&str>) -> Option<&PeerPolicy> {
         self.peer_policies.iter().find(|p| {
             peer_keys_match(&p.peer, peer_key)
                 && match (p.share.as_deref(), share) {
@@ -200,7 +333,7 @@ impl AppConfig {
     }
 }
 
-fn peer_keys_match(configured: &str, actual: &str) -> bool {
+pub fn peer_keys_match(configured: &str, actual: &str) -> bool {
     if configured == actual {
         return true;
     }

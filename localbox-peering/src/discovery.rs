@@ -1,4 +1,4 @@
-use models::{AppConfig, ShareContext};
+use models::{AppConfig, ShareContext, TransferProgressRegistry};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -23,6 +23,7 @@ pub fn spawn_discovery(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
+    progress: Arc<TransferProgressRegistry>,
     token: CancellationToken,
 ) -> JoinHandle<()> {
     let share_names: Vec<String> = shares.iter().map(|s| s.share_name.clone()).collect();
@@ -39,6 +40,7 @@ pub fn spawn_discovery(
         fs,
         net,
         pending_files,
+        progress,
         token,
     ))
 }
@@ -54,6 +56,7 @@ async fn discovery_loop(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
+    progress: Arc<TransferProgressRegistry>,
     token: CancellationToken,
 ) {
     let addr: SocketAddr = format!("0.0.0.0:{}", cfg.discovery_port)
@@ -103,6 +106,7 @@ async fn discovery_loop(
                             fs.clone(),
                             net.clone(),
                             pending_files.clone(),
+                            Arc::clone(&progress),
                             token.clone(),
                         )
                         .await;
@@ -163,6 +167,7 @@ async fn handle_discovery_message(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
+    progress: Arc<TransferProgressRegistry>,
     token: CancellationToken,
 ) {
     let parsed = match parse_discovery_message(msg) {
@@ -203,6 +208,7 @@ async fn handle_discovery_message(
                 fs.clone(),
                 net.clone(),
                 pending_files.clone(),
+                progress,
                 token.clone(),
             )
             .await;
@@ -235,6 +241,7 @@ async fn handle_discovery_message(
                 fs.clone(),
                 net.clone(),
                 pending_files.clone(),
+                progress,
                 token.clone(),
             )
             .await;
@@ -262,6 +269,7 @@ async fn handle_discover(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
+    progress: Arc<TransferProgressRegistry>,
     token: CancellationToken,
 ) {
     if is_self_peer(cfg, pc_name, instance_id) {
@@ -348,6 +356,7 @@ async fn handle_discover(
         fs,
         net.clone(),
         pending_files,
+        progress,
         token,
     );
 }
@@ -371,6 +380,7 @@ async fn handle_here(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
+    progress: Arc<TransferProgressRegistry>,
     token: CancellationToken,
 ) {
     if is_self_peer(cfg, pc_name, instance_id) {
@@ -447,6 +457,7 @@ async fn handle_here(
         fs,
         net.clone(),
         pending_files,
+        progress,
         token,
     );
 }
@@ -463,8 +474,14 @@ fn spawn_connect_task(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
+    progress: Arc<TransferProgressRegistry>,
     token: CancellationToken,
 ) {
+    if cfg.is_peer_quarantined(pc_name) {
+        info!(peer = %pc_name, "Skipping dial; peer is quarantined");
+        return;
+    }
+
     let cfg_clone = cfg.clone();
     let db = Arc::clone(db);
     let share_names = share_names.to_vec();
@@ -482,6 +499,7 @@ fn spawn_connect_task(
         fs,
         net,
         pending_files,
+        progress,
         token,
     ));
 }
@@ -498,6 +516,7 @@ async fn run_connect_task(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
+    progress: Arc<TransferProgressRegistry>,
     token: CancellationToken,
 ) {
     tokio::select! {
@@ -516,6 +535,7 @@ async fn run_connect_task(
                 connector,
                 fs,
                 net,
+                progress,
             ).await
         } => {
             if let Err(e) = res {

@@ -2,7 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use models::{AppConfig, ApplicationState, ShareConfig};
+use models::{AppConfig, ApplicationState, ConflictPolicy, ShareConfig};
 use sha2::{Digest, Sha256};
 use utilities::{FileSystem, VirtualFileSystem};
 
@@ -40,14 +40,17 @@ fn pinning_blocks_auto_generation() {
             root_path: PathBuf::from("/share"),
             recursive: true,
             ignore_patterns: Vec::new(),
+            sync_allow: Vec::new(),
             max_file_size_bytes: None,
             sync: Default::default(),
             pull: Default::default(),
             request_handling: None,
+            conflict: ConflictPolicy::LastWriteWins,
         }],
         app_state: ApplicationState::MirrorHost,
         request_handling: Default::default(),
         peer_policies: Vec::new(),
+        quarantined_peers: Vec::new(),
         control_socket: std::path::PathBuf::from("localbox.sock"),
     };
 
@@ -107,14 +110,17 @@ fn pinning_allows_matching_ca() {
             root_path: PathBuf::from("/share"),
             recursive: true,
             ignore_patterns: Vec::new(),
+            sync_allow: Vec::new(),
             max_file_size_bytes: None,
             sync: Default::default(),
             pull: Default::default(),
             request_handling: None,
+            conflict: ConflictPolicy::LastWriteWins,
         }],
         app_state: ApplicationState::MirrorHost,
         request_handling: Default::default(),
         peer_policies: Vec::new(),
+        quarantined_peers: Vec::new(),
         control_socket: std::path::PathBuf::from("localbox.sock"),
     };
 

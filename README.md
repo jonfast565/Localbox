@@ -153,10 +153,11 @@ localbox ca install --chain b.chain.pem --key b.key.pem --pin
 The CA always issues for the name **it** was told, ignoring whatever the CSR asks
 for, so a request cannot choose its own identity.
 
-**Operational notes.** There is no CRL: a decommissioned machine stops being
-trusted when its certificate expires, so keep leaf lifetimes short (default 365
-days, `--days` to change) and re-enroll. Compromise of the root key compromises
-the network, so keep it on one administrative machine rather than on every node.
+**Operational notes.** There is no CRL. Prefer short leaf lifetimes (default 365
+days, `--days` to change) and re-enroll, and use `localbox peer quarantine` to
+block a hostname immediately without waiting for expiry. Compromise of the root
+key compromises the network, so keep it on one administrative machine rather
+than on every node.
 
 ### Peer identity
 
@@ -200,11 +201,14 @@ are, and are visible in `localbox status`.
 - **Manual by default:** Journal writes always happen, but SyncCatchup intents are created only when `sync = "auto"` (or a matching `[[peer_policies]]`). Discovery bootstrap/catch-up is similarly gated. Set `pull = "auto"` to send `TransferRequest`s on connect. `sync` gates *journal sync only* — `localbox push` works on demand regardless. (`push` is accepted as a deprecated alias for `sync`.)
 - **Intent completion:** `Acked` means the peer confirmed via `BatchAck` and is reached only by `SyncCatchup`. Everything else — `SnapshotPush`, `PullFulfill`, an accepted `PullRequest` — terminates as `Sent`, meaning the batches reached the transport with no confirmation expected. Both are terminal, so `is_active()` alone decides what still counts as in-flight work.
 - **Request/reply:** `pull`/`request` sends `TransferRequest`; the peer auto-fulfills only when `request_handling = "auto"`, otherwise pending until `reply accept|decline`. Fulfillment is a `PullFulfill` intent.
-- **Batching / framing (wire v4):** Materialized intents become `BatchManifest` batches; `FileChunk` carries `batch_id` + `protocol_version`; `BatchAck` may include `batch_id` so the sender resolves the DB-local intent. Intent ids never go on the wire.
+- **Conflict policy:** Per share (overridable per `[[peer_policies]]`) via `conflict = "last_write_wins" | "keep_both" | "owner_wins"` (default `last_write_wins`). LWW uses version then mtime/hash (including deletes). `keep_both` writes conflicting inbound bytes beside the original as `{stem} (conflict from {peer}){ext}`. `owner_wins` rejects inbound overwrites on shares this node owns and always applies when mirroring.
+- **Selective sync:** Optional `sync_allow` glob allowlist plus `ignore_patterns` (deny). Applied on local watch and inbound apply; peer policies may override both.
+- **Per-peer ACLs:** `allow_push` / `allow_pull` / `allow_request` on `[[peer_policies]]` (default true). False is a hard deny for auto and manual paths.
+- **Batching / framing (wire v4):** Materialized intents become `BatchManifest` batches; `FileChunk` carries `batch_id` + `protocol_version`; `BatchAck` may include `batch_id` so the sender resolves the DB-local intent. Intent ids never go on the wire. Chunk payloads stream from disk on send and stage to a temp file on receive (hash-verified, then atomic rename).
 - **Seq namespaces:** Every `share_journal.seq` is allocated **locally**; a peer's position is kept separately as `origin_peer_id`/`origin_seq`, with a partial unique index over the pair acting as the replay gate. `BatchManifest.basis` (`journal` / `snapshot`) tells the receiver whether `FileChange.seq` holds real positions, and `journal_from_seq`/`journal_to_seq` declare the range so a filtered-out change cannot pin the watermark. `BatchAck.upto_seq` is always in the **sender's** namespace, and 0 for a snapshot batch. Outbound watermarks (`last_seq_sent`/`last_seq_acked`, our journal) are separate from the inbound one (`last_seq_recv`, theirs) — `TransferRequest.since_seq` comes from the latter.
 - **Chat:** Peer DM thread ids are deterministic (`min(local,remote)`); share threads key off share name. Messages persist in SQLite (`chat_threads` / `chat_messages`).
 - **Discovery:** Nodes broadcast `DISCOVER` and respond with `HERE`. Protocol version is 4; there is no version negotiation, so all peers must be upgraded together.
-- **Control plane:** Daemon listens on `control_socket` for newline-delimited JSON (`shell`, dead CLI, `localbox-gui`). Default `localbox.sock` on Unix, `\\.\pipe\localbox` on Windows. List intents with `intents` / `intent show --id …`.
+- **Control plane:** Daemon listens on `control_socket` for newline-delimited JSON (`shell`, dead CLI, `localbox-gui`). Default `localbox.sock` on Unix, `\\.\pipe\localbox` on Windows. List intents with `intents` / `intent show --id …`. Transfer byte progress is exposed via `transfer_progress` (and enriched on `intents` / `intent_show`).
 
 ## Application States
 
@@ -221,6 +225,7 @@ Nodes advertise their capability to peers so that hosts don't waste time pushing
 
 - `localbox monitor` surfaces queue depth, number of dequeuable batches, and peer staleness. It can emit JSON or exit on alert.
 - `localbox status` prints DB snapshots (peers, shares, progress) to quickly debug backpressure.
+- `localbox peer list|quarantine|unquarantine` marks a hostname untrusted immediately (config + DB); connections to/from quarantined peers are refused.
 - Logs go to stdout and `--log-path` with non-blocking writers. Use `RUST_LOG=debug` for verbose tracing.
 - TLS materials reload automatically when cert/key/CA files change.
 
@@ -230,8 +235,8 @@ Nodes advertise their capability to peers so that hosts don't waste time pushing
 - **Peer identity:** A peer's certificate must be issued for the `pc_name` it claims, checked on both inbound and outbound connections. CA trust alone would only prove network membership, not which member. Relaxed only by the explicit `tls_insecure_shared_cert` opt-in, which stamps such peers insecure.
 - **Bootstrap integrity:** Signed invite bundles carry CA + leaf fingerprints. Accepting an invite both verifies the signature and updates `config.toml`, reducing manual trust-store mistakes.
 - **Enrollment:** Tokens are single-use and time-limited, and are proven by an HMAC over the CSR rather than sent in the clear, so an observer cannot reuse one. The CA issues for the name the token authorizes, never the name the CSR requests. The enrolling node installs the result only if the root matches the fingerprint carried in its token, so an interceptor cannot substitute its own CA. Private keys are generated locally and written owner-only.
-- **Disk safety:** All remote writes go through temp files + fsync + atomic rename. Deletes clear staged buffers to prevent resurrecting stale data.
-- **Chunking backpressure:** File data currently buffers in memory until EOF for each file. For very large files consider lowering `max_file_size_bytes` per share or extending the engine with streaming-to-disk staging.
+- **Disk safety:** Inbound file payloads stream into a staging temp file, are hash-checked, then atomically renamed into place (fsync where the real filesystem supports it). Deletes clear pending staging. Failed hash checks discard staging and never leave a partial final file.
+- **Quarantine (no CRL yet):** Leaf expiry remains the long-term decommission path. For immediate removal use `localbox peer quarantine <name>` (also `quarantined_peers` in config.toml); the node refuses dial/accept for that peer until unquarantined.
 - **DoS considerations:** Discovery listens on UDP broadcast; untrusted networks could spam HELLO/Batch traffic. Restrict the discovery subnet and use firewall rules when running outside a trusted LAN.
 - **Performance knobs:** Watcher aggregation can be tuned via `--aggregation-window-ms`. Batch senders have exponential backoff capped at 5 min. Keep an eye on `localbox monitor` for queue explosions.
 
@@ -247,7 +252,7 @@ cargo run -p localbox-gui -- --socket localbox.sock
 cargo run -p localbox-gui -- --socket '\\.\pipe\localbox'
 ```
 
-Optional `--config path/to/config.toml` picks up `control_socket` when `--socket` is left at the default. The Transfers tab lists pending requests and active TransferIntents.
+Optional `--config path/to/config.toml` picks up `control_socket` when `--socket` is left at the default. The Transfers tab lists pending requests and active TransferIntents with byte/batch progress bars. The Status tab shows quarantined peers (manage quarantine via CLI/control plane).
 
 ## Repository Layout
 

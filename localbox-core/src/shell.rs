@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use db::Db;
-use models::AppConfig;
+use models::{AppConfig, TransferProgressRegistry};
 use peering::PeerCommand;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,6 +18,7 @@ pub async fn run_inprocess_shell(
     db: Arc<Mutex<Db>>,
     net_tx: mpsc::Sender<String>,
     cmd_tx: mpsc::Sender<PeerCommand>,
+    progress: Arc<TransferProgressRegistry>,
     token: CancellationToken,
 ) -> Result<()> {
     info!("Interactive shell (in-process). Type 'help' or 'quit'.");
@@ -27,6 +28,7 @@ pub async fn run_inprocess_shell(
         db,
         net_tx,
         peer_cmd_tx: cmd_tx,
+        progress,
     };
     let stdin = std::io::stdin();
     loop {

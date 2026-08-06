@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use db::Db;
-use models::AppConfig;
+use models::{AppConfig, TransferProgressRegistry};
 use peering::PeerCommand;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,6 +18,7 @@ pub async fn run_control_server(
     db: Arc<Mutex<Db>>,
     net_tx: mpsc::Sender<String>,
     cmd_tx: mpsc::Sender<PeerCommand>,
+    progress: Arc<TransferProgressRegistry>,
     token: CancellationToken,
 ) -> Result<()> {
     let path = cfg.control_socket.clone();
@@ -26,6 +27,7 @@ pub async fn run_control_server(
         db,
         net_tx,
         peer_cmd_tx: cmd_tx,
+        progress,
     };
 
     #[cfg(unix)]

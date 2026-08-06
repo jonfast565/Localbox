@@ -13,8 +13,8 @@ use std::time::Duration;
 use db::{Db, JournalOrigin};
 use localbox_peering as peering;
 use models::{
-    AppConfig, ApplicationState, ChangeKind, FileChange, FileMeta, JournalEntry, ShareConfig,
-    ShareContext,
+    AppConfig, ApplicationState, ChangeKind, ConflictPolicy, FileChange, FileMeta, JournalEntry,
+    ShareConfig, ShareContext,
 };
 use peering::PeerManager;
 use sha2::{Digest, Sha256};
@@ -381,15 +381,18 @@ fn test_config(
             root_path: PathBuf::from("/virtual"),
             recursive: true,
             ignore_patterns: Vec::new(),
+            sync_allow: Vec::new(),
             max_file_size_bytes: None,
             // Journal sync is driven explicitly by the tests, not by policy.
             sync: Default::default(),
             pull: Default::default(),
             request_handling: None,
+            conflict: ConflictPolicy::LastWriteWins,
         }],
         app_state: ApplicationState::MirrorHost,
         request_handling: Default::default(),
         peer_policies: Vec::new(),
+        quarantined_peers: Vec::new(),
         control_socket: PathBuf::from("localbox.sock"),
     }
 }

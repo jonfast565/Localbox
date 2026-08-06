@@ -5,7 +5,7 @@ use localbox_db as db;
 use db::{Db, JournalOrigin};
 use models::{
     peer_thread_id, AppConfig, ApplicationState, BatchManifest, ChangeKind, ChatMessageRecord,
-    FileChange, FileMeta, ShareConfig, ShareId, ThreadKind, TransferRequest,
+    ConflictPolicy, FileChange, FileMeta, ShareConfig, ShareId, ThreadKind, TransferRequest,
     WIRE_PROTOCOL_VERSION,
 };
 
@@ -32,14 +32,17 @@ fn test_config(pc_name: &str, share_name: &str) -> AppConfig {
             root_path: PathBuf::from("/share"),
             recursive: true,
             ignore_patterns: Vec::new(),
+            sync_allow: Vec::new(),
             max_file_size_bytes: None,
             sync: Default::default(),
             pull: Default::default(),
             request_handling: None,
+            conflict: ConflictPolicy::LastWriteWins,
         }],
         app_state: ApplicationState::MirrorHost,
         request_handling: Default::default(),
         peer_policies: Vec::new(),
+        quarantined_peers: Vec::new(),
         control_socket: std::path::PathBuf::from("localbox.sock"),
     }
 }
@@ -228,7 +231,48 @@ fn journal_append_and_list() {
 #[test]
 fn schema_version_is_current() {
     let db = Db::open_in_memory().unwrap();
-    assert_eq!(db.schema_version().unwrap(), 7);
+    assert_eq!(db.schema_version().unwrap(), 8);
+}
+
+#[test]
+fn set_peer_quarantined_toggles_flag() {
+    let db = Db::open_in_memory().unwrap();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    db.upsert_peer(
+        "pc-q",
+        "inst-q",
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000),
+        now,
+        "known",
+        5000,
+        0,
+        true,
+    )
+    .unwrap();
+
+    assert!(!db.is_peer_quarantined("pc-q").unwrap());
+    assert!(!db.is_peer_quarantined("pc-q@inst-q").unwrap());
+    assert!(db.set_peer_quarantined("pc-q@inst-q", true).unwrap());
+    assert!(db.is_peer_quarantined("pc-q").unwrap());
+    assert!(db.list_peers().unwrap()[0].quarantined);
+
+    // upsert must not clear quarantined
+    db.upsert_peer(
+        "pc-q",
+        "inst-q",
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001),
+        now + 1,
+        "connected",
+        5001,
+        0,
+        true,
+    )
+    .unwrap();
+    assert!(db.is_peer_quarantined("pc-q@inst-q").unwrap());
+
+    assert!(db.set_peer_quarantined("pc-q", false).unwrap());
+    assert!(!db.is_peer_quarantined("pc-q@inst-q").unwrap());
+    assert!(!db.set_peer_quarantined("missing-peer", true).unwrap());
 }
 
 #[test]
@@ -346,7 +390,7 @@ fn migrates_v4_to_v6_renames_share_journal() {
         .unwrap();
     }
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 7);
+    assert_eq!(db.schema_version().unwrap(), 8);
     assert_eq!(db.journal_entry_count().unwrap(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }

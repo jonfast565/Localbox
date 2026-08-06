@@ -1,8 +1,8 @@
 use clap::Parser;
 use comfy_table::{presets::ASCII_FULL_CONDENSED, Table};
 use localbox_core::config::{
-    init_config_template, validate_app_config, BootstrapCommand, ChatCommand, Cli, Command,
-    StatusSection, DEFAULT_CONFIG_PATH,
+    init_config_template, set_quarantined_peer_in_config, validate_app_config, BootstrapCommand,
+    ChatCommand, Cli, Command, PeerCliCommand, StatusSection, DEFAULT_CONFIG_PATH,
 };
 use localbox_core::control::send_control_request;
 use localbox_core::integrity;
@@ -226,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
                                 "state": p.state,
                                 "prefer_tls": p.prefer_tls,
                                 "last_insecure_seen": p.last_insecure_seen,
+                                "quarantined": p.quarantined,
                             })
                         })
                         .collect()
@@ -403,6 +404,7 @@ async fn main() -> anyhow::Result<()> {
                                 "state",
                                 "prefer_tls",
                                 "last_insecure_seen",
+                                "quarantined",
                             ]);
                             for p in &peers {
                                 peer_table.add_row(vec![
@@ -415,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
                                     p.state.clone(),
                                     p.prefer_tls.to_string(),
                                     p.last_insecure_seen.to_string(),
+                                    p.quarantined.to_string(),
                                 ]);
                             }
                             println!("{peer_table}");
@@ -470,6 +473,79 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Ok(())
+        }
+        Command::Peer(args) => {
+            let cfg = cli.resolve_app_config_allow_empty_shares()?;
+            let db = db::Db::open(&cfg.db_path)?;
+            let config_path = cli
+                .config
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+            match &args.command {
+                PeerCliCommand::List => {
+                    let peers = db.list_peers()?;
+                    if peers.is_empty() {
+                        println!("(no peers)");
+                    } else {
+                        let mut peer_table = Table::new();
+                        peer_table.load_preset(ASCII_FULL_CONDENSED);
+                        peer_table.set_header(vec![
+                            "id",
+                            "peer",
+                            "ip",
+                            "state",
+                            "last_seen",
+                            "quarantined",
+                        ]);
+                        for p in &peers {
+                            peer_table.add_row(vec![
+                                p.id.to_string(),
+                                format!("{}@{}", p.pc_name, p.instance_id),
+                                p.last_ip.clone(),
+                                p.state.clone(),
+                                p.last_seen.to_string(),
+                                p.quarantined.to_string(),
+                            ]);
+                        }
+                        println!("{peer_table}");
+                    }
+                    Ok(())
+                }
+                PeerCliCommand::Quarantine { peer } => {
+                    if !db.set_peer_quarantined(peer, true)? {
+                        anyhow::bail!("peer '{peer}' not found in DB");
+                    }
+                    if set_quarantined_peer_in_config(&config_path, peer, true)? {
+                        println!(
+                            "quarantined {peer} (DB + {})",
+                            config_path.display()
+                        );
+                    } else {
+                        println!(
+                            "quarantined {peer} in DB (already listed in {})",
+                            config_path.display()
+                        );
+                    }
+                    Ok(())
+                }
+                PeerCliCommand::Unquarantine { peer } => {
+                    if !db.set_peer_quarantined(peer, false)? {
+                        anyhow::bail!("peer '{peer}' not found in DB");
+                    }
+                    if set_quarantined_peer_in_config(&config_path, peer, false)? {
+                        println!(
+                            "unquarantined {peer} (DB + {})",
+                            config_path.display()
+                        );
+                    } else {
+                        println!(
+                            "unquarantined {peer} in DB (was not listed in {})",
+                            config_path.display()
+                        );
+                    }
+                    Ok(())
+                }
+            }
         }
         Command::Ca(args) => {
             use localbox_core::config::CaCommand;

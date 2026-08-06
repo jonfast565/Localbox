@@ -19,6 +19,7 @@ pub mod chat;
 pub mod config;
 pub mod intent;
 pub mod peer;
+pub mod progress;
 pub mod share;
 pub mod transfer;
 pub mod wire;
@@ -31,12 +32,16 @@ pub use chat::{
     ChatMessageRecord, ThreadKind, ThreadSummary,
 };
 pub use config::{
-    AppConfig, ApplicationState, PeerPolicy, ShareConfig, TransferMode,
+    peer_keys_match, AppConfig, ApplicationState, ConflictPolicy, PeerPolicy, ShareConfig,
+    TransferMode,
 };
 pub use intent::{
     IntentBasis, IntentKind, IntentOrigin, IntentStatus, TransferIntent,
 };
 pub use peer::{Peer, PeerState};
+pub use progress::{
+    TransferDirection, TransferProgressRegistry, TransferProgressSnapshot,
+};
 pub use share::{ShareContext, ShareId};
 pub use transfer::{
     TransferPushOffer, TransferReply, TransferReplyStatus, TransferRequest,

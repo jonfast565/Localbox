@@ -1,5 +1,5 @@
 use iced::widget::{
-    button, column, container, row, scrollable, text, text_input, Column, Space,
+    button, column, container, progress_bar, row, scrollable, text, text_input, Column, Space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Task, Theme};
 use serde_json::Value;
@@ -23,6 +23,7 @@ pub enum Message {
     InboxLoaded(Result<ControlResponse, String>),
     PendingLoaded(Result<ControlResponse, String>),
     IntentsLoaded(Result<ControlResponse, String>),
+    PeersLoaded(Result<ControlResponse, String>),
     ThreadLoaded(Result<ControlResponse, String>),
     ActionDone(Result<ControlResponse, String>),
     ShareInput(String),
@@ -59,6 +60,7 @@ pub struct App {
     thread_json: String,
     pending_json: String,
     intents_json: String,
+    peers_json: String,
     selected_thread: Option<String>,
 }
 
@@ -81,6 +83,7 @@ impl App {
             thread_json: String::new(),
             pending_json: String::new(),
             intents_json: String::new(),
+            peers_json: String::new(),
             selected_thread: None,
         };
         (app, Task::done(Message::Refresh))
@@ -99,14 +102,27 @@ impl App {
             Message::Refresh => {
                 let sock = self.socket.clone();
                 match self.tab {
-                    Tab::Status => Task::perform(
-                        async move {
-                            client::send_request(&sock, &ControlRequest::Status)
-                                .await
-                                .map_err(|e| e.to_string())
-                        },
-                        Message::StatusLoaded,
-                    ),
+                    Tab::Status => {
+                        let sock2 = self.socket.clone();
+                        Task::batch([
+                            Task::perform(
+                                async move {
+                                    client::send_request(&sock, &ControlRequest::Status)
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                },
+                                Message::StatusLoaded,
+                            ),
+                            Task::perform(
+                                async move {
+                                    client::send_request(&sock2, &ControlRequest::PeerList)
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                },
+                                Message::PeersLoaded,
+                            ),
+                        ])
+                    }
                     Tab::Transfers => {
                         let sock2 = self.socket.clone();
                         let sock3 = self.socket.clone();
@@ -195,6 +211,12 @@ impl App {
             Message::IntentsLoaded(res) => {
                 self.apply_result(res, |app, resp| {
                     app.intents_json = pretty_data(&resp);
+                });
+                Task::none()
+            }
+            Message::PeersLoaded(res) => {
+                self.apply_result(res, |app, resp| {
+                    app.peers_json = pretty_data(&resp);
                 });
                 Task::none()
             }
@@ -344,6 +366,11 @@ impl App {
             Tab::Status => column![
                 text(&self.status_text).size(16).color(theme::TEXT),
                 Space::with_height(8),
+                text("Quarantined peers").size(16).color(theme::TEXT),
+                text(quarantined_summary(&self.peers_json))
+                    .size(13)
+                    .color(theme::MUTED),
+                Space::with_height(8),
                 text("Log").size(14).color(theme::MUTED),
                 scrollable(text(&self.log).size(13).color(theme::MUTED)).height(Length::Fill),
             ]
@@ -376,6 +403,18 @@ impl App {
 }
 
 fn transfers_view(app: &App) -> Element<'_, Message> {
+    let mut intents_col: Column<'_, Message> =
+        column![text("Transfer intents").size(18).color(theme::TEXT)].spacing(8);
+    if let Some(rows) = parse_intent_rows(&app.intents_json) {
+        for row_data in rows {
+            intents_col = intents_col.push(intent_row_view(row_data));
+        }
+    } else {
+        intents_col = intents_col.push(
+            scrollable(text(&app.intents_json).size(13).color(theme::MUTED)).height(160),
+        );
+    }
+
     column![
         text("Manual transfer").size(18).color(theme::TEXT),
         row![
@@ -400,12 +439,135 @@ fn transfers_view(app: &App) -> Element<'_, Message> {
         ]
         .spacing(8)
         .align_y(Alignment::End),
-        text("Transfer intents").size(18).color(theme::TEXT),
-        scrollable(text(&app.intents_json).size(13).color(theme::MUTED)).height(160),
+        scrollable(intents_col).height(220),
         text(&app.log).size(13).color(theme::MUTED),
     ]
     .spacing(10)
     .into()
+}
+
+struct IntentRow {
+    id: String,
+    kind: String,
+    status: String,
+    share: String,
+    pending_batches: i64,
+    bytes_done: u64,
+    bytes_total: u64,
+}
+
+fn parse_intent_rows(raw: &str) -> Option<Vec<IntentRow>> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    let arr = v.as_array()?;
+    let mut out = Vec::new();
+    for item in arr {
+        let id = item
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let kind = item
+            .get("kind")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let status = item
+            .get("status")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let share = item
+            .get("share_name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let pending_batches = item
+            .get("pending_batches")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0);
+        let (bytes_done, bytes_total) = item
+            .get("progress")
+            .and_then(|p| p.as_array())
+            .map(|arr| {
+                let mut done = 0u64;
+                let mut total = 0u64;
+                for e in arr {
+                    done += e.get("bytes_done").and_then(|x| x.as_u64()).unwrap_or(0);
+                    total += e.get("bytes_total").and_then(|x| x.as_u64()).unwrap_or(0);
+                }
+                (done, total)
+            })
+            .unwrap_or((0, 0));
+        out.push(IntentRow {
+            id,
+            kind,
+            status,
+            share,
+            pending_batches,
+            bytes_done,
+            bytes_total,
+        });
+    }
+    Some(out)
+}
+
+fn intent_row_view(row_data: IntentRow) -> Element<'static, Message> {
+    let frac = if row_data.bytes_total > 0 {
+        row_data.bytes_done as f32 / row_data.bytes_total as f32
+    } else if row_data.pending_batches == 0 {
+        1.0
+    } else {
+        0.0
+    };
+    let label = format!(
+        "{} · {} · {} · batches_pending={} · {}/{} bytes",
+        short_id(&row_data.id),
+        row_data.kind,
+        row_data.status,
+        row_data.pending_batches,
+        row_data.bytes_done,
+        row_data.bytes_total
+    );
+    column![
+        text(label).size(13).color(theme::TEXT),
+        text(format!("share {}", row_data.share))
+            .size(12)
+            .color(theme::MUTED),
+        progress_bar(0.0..=1.0, frac).height(8),
+    ]
+    .spacing(4)
+    .into()
+}
+
+fn short_id(id: &str) -> String {
+    if id.len() > 8 {
+        id[..8].to_string()
+    } else {
+        id.to_string()
+    }
+}
+
+fn quarantined_summary(peers_json: &str) -> String {
+    let Ok(v) = serde_json::from_str::<Value>(peers_json) else {
+        return "—".into();
+    };
+    let Some(arr) = v.as_array() else {
+        return "—".into();
+    };
+    let names: Vec<String> = arr
+        .iter()
+        .filter(|p| p.get("quarantined").and_then(|x| x.as_bool()).unwrap_or(false))
+        .filter_map(|p| {
+            let pc = p.get("pc_name")?.as_str()?;
+            let inst = p.get("instance_id")?.as_str()?;
+            Some(format!("{pc}@{inst}"))
+        })
+        .collect();
+    if names.is_empty() {
+        "(none)".into()
+    } else {
+        names.join(", ")
+    }
 }
 
 fn chat_view(app: &App) -> Element<'_, Message> {

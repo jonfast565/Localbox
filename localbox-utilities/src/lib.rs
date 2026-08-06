@@ -22,7 +22,9 @@ pub use disk_utilities::{
     build_meta_with_retry, build_meta_with_retry_limited, build_remote_share_root,
     relative_share_path,
 };
-pub use filesystem::{DirEntry, FileSystem, FsMetadata, RealFileSystem, VirtualFileSystem};
+pub use filesystem::{
+    DirEntry, FileSystem, FsMetadata, RealFileSystem, SyncWrite, VirtualFileSystem,
+};
 pub use net::{DynStream, Net, RealNet, TcpListenerLike, UdpSocketLike, VirtualNet};
 
 /// Guard for the non-blocking file writer so it is not dropped early.
@@ -139,6 +141,22 @@ fn unique_tmp_name(base: &OsStr) -> PathBuf {
         stem = "file".to_string();
     }
     PathBuf::from(format!(".{}.tmp-{}-{}", stem, pid, nonce))
+}
+
+/// Staging path next to `target` for streaming inbound receives.
+pub fn staging_tmp_path(target: &Path) -> PathBuf {
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    parent.join(unique_tmp_name(
+        target.file_name().unwrap_or_else(|| OsStr::new("file")),
+    ))
+}
+
+/// True when a relative path looks like a Localbox staging temp file.
+pub fn is_staging_tmp_name(file_name: &str) -> bool {
+    file_name.starts_with('.') && file_name.contains(".tmp-")
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {

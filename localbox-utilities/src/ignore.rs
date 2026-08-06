@@ -77,9 +77,25 @@ pub fn is_ignored_path(path: &Path, ignore_patterns: &[String]) -> bool {
     is_ignored_rel_path(&path.to_string_lossy(), ignore_patterns)
 }
 
+/// True when `rel_path` is eligible for sync: not ignored, and either the
+/// allowlist is empty or the path matches at least one allow pattern.
+pub fn is_path_allowed(rel_path: &str, sync_allow: &[String], ignore_patterns: &[String]) -> bool {
+    if is_ignored_rel_path(rel_path, ignore_patterns) {
+        return false;
+    }
+    if sync_allow.is_empty() {
+        return true;
+    }
+    let rel = normalize_path_str(rel_path);
+    sync_allow.iter().any(|p| {
+        let pat = normalize_pattern(p);
+        glob_match(&pat, &rel)
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_ignored_rel_path;
+    use super::{is_ignored_rel_path, is_path_allowed};
 
     #[test]
     fn matches_simple_globs() {
@@ -92,5 +108,15 @@ mod tests {
         assert!(is_ignored_rel_path(".git/index", &patterns));
         assert!(is_ignored_rel_path("Thumbs.db", &patterns));
         assert!(!is_ignored_rel_path("a/b/c.txt", &patterns));
+    }
+
+    #[test]
+    fn path_allowed_respects_allow_and_ignore() {
+        let allow = vec!["public/*".to_string()];
+        let ignore = vec!["public/secret.txt".to_string()];
+        assert!(is_path_allowed("public/a.txt", &allow, &ignore));
+        assert!(!is_path_allowed("private/a.txt", &allow, &ignore));
+        assert!(!is_path_allowed("public/secret.txt", &allow, &ignore));
+        assert!(is_path_allowed("anywhere.txt", &[], &[]));
     }
 }

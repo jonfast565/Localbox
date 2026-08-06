@@ -235,7 +235,7 @@ fn update_tls_peer_fingerprints(
 mod tests {
     use super::*;
     use crate::runtime::{generate_tls_materials, persist_tls_materials};
-    use models::{ApplicationState, ShareConfig};
+    use models::{ApplicationState, ConflictPolicy, ShareConfig};
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tempfile::Builder;
@@ -418,14 +418,17 @@ mod tests {
                 root_path: share_root,
                 recursive: true,
                 ignore_patterns: Vec::new(),
+                sync_allow: Vec::new(),
                 max_file_size_bytes: None,
                 sync: Default::default(),
                 pull: Default::default(),
                 request_handling: None,
+                conflict: ConflictPolicy::LastWriteWins,
             }],
             app_state: ApplicationState::MirrorHost,
             request_handling: Default::default(),
             peer_policies: Vec::new(),
+            quarantined_peers: Vec::new(),
             control_socket: root.join(format!("{node}.sock")),
         };
 

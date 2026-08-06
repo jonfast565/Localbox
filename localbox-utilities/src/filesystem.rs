@@ -1,7 +1,8 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions};
 use std::io;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -20,6 +21,17 @@ pub struct DirEntry {
     pub metadata: FsMetadata,
 }
 
+/// Writable file handle that can be synced before rename/finalize.
+pub trait SyncWrite: Write + Send {
+    fn sync_all(&mut self) -> io::Result<()>;
+}
+
+impl SyncWrite for File {
+    fn sync_all(&mut self) -> io::Result<()> {
+        File::sync_all(self)
+    }
+}
+
 pub trait FileSystem: Send + Sync {
     fn metadata(&self, path: &Path) -> io::Result<FsMetadata>;
     fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;
@@ -27,6 +39,8 @@ pub trait FileSystem: Send + Sync {
     fn write(&self, path: &Path, data: &[u8]) -> io::Result<()>;
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>>;
+    /// Open (or create) a file truncated for streaming writes.
+    fn open_write_trunc(&self, path: &Path) -> io::Result<Box<dyn SyncWrite>>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn as_any(&self) -> &dyn Any;
@@ -85,7 +99,21 @@ impl FileSystem for RealFileSystem {
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
-        let f = std::fs::File::open(path)?;
+        let f = File::open(path)?;
+        Ok(Box::new(f))
+    }
+
+    fn open_write_trunc(&self, path: &Path) -> io::Result<Box<dyn SyncWrite>> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
         Ok(Box::new(f))
     }
 
@@ -335,6 +363,44 @@ impl FileSystem for VirtualFileSystem {
         Ok(Box::new(std::io::Cursor::new(data)))
     }
 
+    fn open_write_trunc(&self, path: &Path) -> io::Result<Box<dyn SyncWrite>> {
+        let norm = Self::normalize(path);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            self.ensure_parent(&mut inner, &norm)?;
+            let now = SystemTime::now();
+            inner.nodes.insert(
+                norm.clone(),
+                VNode::File {
+                    data: Vec::new(),
+                    modified: now,
+                },
+            );
+            if let Some(parent) = norm.parent() {
+                let parent_norm = Self::normalize(parent);
+                inner
+                    .children
+                    .entry(parent_norm.clone())
+                    .or_default()
+                    .insert(
+                        norm.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                        norm.clone(),
+                    );
+                inner
+                    .nodes
+                    .entry(parent_norm)
+                    .or_insert(VNode::Dir { modified: now });
+            }
+        }
+        Ok(Box::new(VirtualFileWrite {
+            inner: Arc::clone(&self.inner),
+            path: norm,
+        }))
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let from_norm = Self::normalize(from);
@@ -404,5 +470,41 @@ impl FileSystem for VirtualFileSystem {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+struct VirtualFileWrite {
+    inner: Arc<Mutex<VirtualFsInner>>,
+    path: PathBuf,
+}
+
+impl Write for VirtualFileWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.nodes.get_mut(&self.path) {
+            Some(VNode::File { data, modified }) => {
+                data.extend_from_slice(buf);
+                *modified = SystemTime::now();
+                Ok(buf.len())
+            }
+            Some(VNode::Dir { .. }) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("{} is a directory", self.path.display()),
+            )),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} not found", self.path.display()),
+            )),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl SyncWrite for VirtualFileWrite {
+    fn sync_all(&mut self) -> io::Result<()> {
+        self.flush()
     }
 }

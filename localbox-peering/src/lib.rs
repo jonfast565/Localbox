@@ -2,17 +2,18 @@
 
 use anyhow::Result;
 use db::Db;
-use models::{AppConfig, ShareContext, ShareId, WireMessage};
+use models::{AppConfig, ShareContext, ShareId, TransferProgressRegistry, WireMessage};
 use time::OffsetDateTime;
 use tls::ManagedTls;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::{self, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use utilities::{FileSystem, Net};
+use utilities::{FileSystem, Net, SyncWrite};
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,12 +28,14 @@ type DbHandle = Arc<Mutex<Db>>;
 type SharedWriters = Arc<Mutex<Vec<(i64, Arc<tokio::sync::Mutex<writer::PeerWriter>>)>>>;
 type PendingFiles = Arc<Mutex<HashMap<(ShareId, String), InboundFileState>>>;
 
-#[derive(Debug)]
 struct InboundFileState {
     target_path: PathBuf,
-    buffer: Vec<u8>,
+    staging_path: PathBuf,
+    writer: Option<Box<dyn SyncWrite>>,
+    hasher: Sha256,
     expected_offset: u64,
     expected_hash: Option<[u8; 32]>,
+    expected_size: Option<u64>,
 }
 
 pub struct PeerManager {
@@ -44,6 +47,7 @@ pub struct PeerManager {
     net: Arc<dyn Net>,
     shares: Arc<Vec<ShareContext>>,
     share_map: Arc<HashMap<[u8; 16], ShareContext>>,
+    progress: Arc<TransferProgressRegistry>,
 }
 
 impl PeerManager {
@@ -54,6 +58,18 @@ impl PeerManager {
         shares: Vec<ShareContext>,
         fs: Arc<dyn FileSystem>,
         net: Arc<dyn Net>,
+    ) -> Result<Self> {
+        Self::with_progress(cfg, db, net_tx, shares, fs, net, TransferProgressRegistry::new())
+    }
+
+    pub fn with_progress(
+        cfg: AppConfig,
+        db: DbHandle,
+        net_tx: mpsc::Sender<String>,
+        shares: Vec<ShareContext>,
+        fs: Arc<dyn FileSystem>,
+        net: Arc<dyn Net>,
+        progress: Arc<TransferProgressRegistry>,
     ) -> Result<Self> {
         let tls = Arc::new(ManagedTls::new(&cfg, fs.clone())?);
         let shares_arc = Arc::new(shares);
@@ -67,7 +83,12 @@ impl PeerManager {
             net,
             shares: shares_arc,
             share_map,
+            progress,
         })
+    }
+
+    pub fn progress(&self) -> Arc<TransferProgressRegistry> {
+        Arc::clone(&self.progress)
     }
 
     pub async fn run(
@@ -101,20 +122,27 @@ impl PeerManager {
             self.fs.clone(),
             self.net.clone(),
             pending_files.clone(),
+            Arc::clone(&self.progress),
             token.clone(),
         );
         let listener = self.spawn_tcp_listener(
             connections.clone(),
             pending_files.clone(),
             tls.clone(),
+            Arc::clone(&self.progress),
             token.clone(),
         );
-        let plain_listener =
-            self.spawn_plain_listener(connections.clone(), pending_files.clone(), token.clone());
+        let plain_listener = self.spawn_plain_listener(
+            connections.clone(),
+            pending_files.clone(),
+            Arc::clone(&self.progress),
+            token.clone(),
+        );
         let sender = self.spawn_outbox_worker(
             connections.clone(),
             self.share_map.clone(),
             self.fs.clone(),
+            Arc::clone(&self.progress),
             net_rx,
             token.clone(),
         );
@@ -152,6 +180,7 @@ impl PeerManager {
         connections: SharedWriters,
         pending_files: PendingFiles,
         tls: Arc<ManagedTls>,
+        progress: Arc<TransferProgressRegistry>,
         token: tokio_util::sync::CancellationToken,
     ) -> JoinHandle<()> {
         let cfg = self.cfg.clone();
@@ -185,6 +214,7 @@ impl PeerManager {
                                 let tls = tls.clone();
                                 let fs = fs.clone();
                                 let net = net.clone();
+                                let progress = Arc::clone(&progress);
                                 tokio::spawn(async move {
                                     let tls_acceptor = tls.acceptor().await;
                                     if let Err(e) =
@@ -199,6 +229,7 @@ impl PeerManager {
                                             tls_acceptor,
                                             fs,
                                             net,
+                                            progress,
                                         )
                                         .await
                                     {
@@ -221,6 +252,7 @@ impl PeerManager {
         &self,
         connections: SharedWriters,
         pending_files: PendingFiles,
+        progress: Arc<TransferProgressRegistry>,
         token: tokio_util::sync::CancellationToken,
     ) -> JoinHandle<()> {
         let cfg = self.cfg.clone();
@@ -253,6 +285,7 @@ impl PeerManager {
                                 let pending_files = pending_files.clone();
                                 let fs = fs.clone();
                                 let net = net.clone();
+                                let progress = Arc::clone(&progress);
                                 tokio::spawn(async move {
                                     if let Err(e) = connection::handle_plain_connection(
                                             stream,
@@ -264,6 +297,7 @@ impl PeerManager {
                                             pending_files,
                                             fs,
                                         net,
+                                        progress,
                                     )
                                     .await
                                     {
@@ -287,6 +321,7 @@ impl PeerManager {
         connections: SharedWriters,
         share_map: Arc<HashMap<[u8; 16], ShareContext>>,
         fs: Arc<dyn FileSystem>,
+        progress: Arc<TransferProgressRegistry>,
         mut net_rx: mpsc::Receiver<String>,
         token: CancellationToken,
     ) -> JoinHandle<()> {
@@ -322,8 +357,6 @@ impl PeerManager {
 
                 for item in due {
                     let msg = WireMessage::Batch(item.manifest.clone());
-                    let file_payloads =
-                        prepare_file_payloads(&share_map, &item.manifest, fs.clone()).await;
                     let max_seq = item
                         .manifest
                         .changes
@@ -358,8 +391,44 @@ impl PeerManager {
                             );
                             continue;
                         }
-                        if let Err(e) =
-                            send_file_chunks(&mut guard, &item.manifest, &file_payloads).await
+                        let share_name = share_map
+                            .get(&item.manifest.share_id.0)
+                            .map(|s| s.share_name.clone())
+                            .unwrap_or_else(|| "unknown".into());
+                        let bytes_total: u64 = item
+                            .manifest
+                            .changes
+                            .iter()
+                            .filter_map(|c| c.meta.as_ref())
+                            .filter(|m| !m.deleted)
+                            .map(|m| m.size)
+                            .sum();
+                        let files_total = item
+                            .manifest
+                            .changes
+                            .iter()
+                            .filter(|c| {
+                                !matches!(c.kind, models::ChangeKind::Delete)
+                                    && c.meta.as_ref().map(|m| !m.deleted).unwrap_or(false)
+                            })
+                            .count() as u64;
+                        progress.begin_outbound(
+                            item.intent_id.as_deref(),
+                            &item.batch_id,
+                            item.peer_id,
+                            &share_name,
+                            files_total,
+                            bytes_total,
+                        );
+                        if let Err(e) = send_file_chunks(
+                            &mut guard,
+                            &item.manifest,
+                            &share_map,
+                            fs.clone(),
+                            Arc::clone(&progress),
+                            item.intent_id.as_deref(),
+                        )
+                        .await
                         {
                             any_fail = true;
                             warn!(
@@ -422,75 +491,6 @@ fn map_shares_by_id(shares: &[ShareContext]) -> HashMap<[u8; 16], ShareContext> 
 
 const FILE_CHUNK_SIZE: usize = 128 * 1024;
 
-async fn prepare_file_payloads(
-    share_map: &HashMap<[u8; 16], ShareContext>,
-    manifest: &models::BatchManifest,
-    fs: Arc<dyn FileSystem>,
-) -> Vec<Option<Arc<Vec<u8>>>> {
-    let mut out = Vec::with_capacity(manifest.changes.len());
-    let Some(share_ctx) = share_map.get(&manifest.share_id.0) else {
-        warn!(
-            share_id = ?manifest.share_id.0,
-            "Share not registered locally; cannot stream file contents"
-        );
-        out.resize(manifest.changes.len(), None);
-        return out;
-    };
-
-    for change in &manifest.changes {
-        if !matches!(change.kind, models::ChangeKind::Delete) {
-            let Some(meta) = &change.meta else {
-                out.push(None);
-                continue;
-            };
-            if meta.deleted {
-                out.push(None);
-                continue;
-            }
-            let full_path = share_ctx.root_path.join(&change.path);
-            match read_file_async(fs.clone(), full_path.clone()).await {
-                Ok(bytes) => {
-                    let computed = hash_bytes(&bytes);
-                    if computed != meta.hash {
-                        warn!(
-                            path = %change.path,
-                            share = %share_ctx.share_name,
-                            "File hash changed before send (recorded {:?}, current {:?}); sending latest bytes",
-                            meta.hash,
-                            computed,
-                        );
-                    }
-                    out.push(Some(Arc::new(bytes)));
-                }
-                Err(e) => {
-                    warn!(
-                        path = %change.path,
-                        share = %share_ctx.share_name,
-                        error = %e,
-                        "Failed to read file for outbound transfer"
-                    );
-                    out.push(None);
-                }
-            }
-        } else {
-            out.push(None);
-        }
-    }
-
-    out
-}
-
-async fn read_file_async(fs: Arc<dyn FileSystem>, path: PathBuf) -> std::io::Result<Vec<u8>> {
-    task::spawn_blocking(move || fs.read(&path))
-        .await
-        .unwrap_or_else(|e| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ))
-        })
-}
-
 pub(crate) fn hash_bytes(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -500,17 +500,54 @@ pub(crate) fn hash_bytes(data: &[u8]) -> [u8; 32] {
     out
 }
 
+fn finalize_hasher(hasher: Sha256) -> [u8; 32] {
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 async fn send_file_chunks(
     writer: &mut writer::PeerWriter,
     manifest: &models::BatchManifest,
-    payloads: &[Option<Arc<Vec<u8>>>],
+    share_map: &HashMap<[u8; 16], ShareContext>,
+    fs: Arc<dyn FileSystem>,
+    progress: Arc<TransferProgressRegistry>,
+    intent_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    for (change, payload) in manifest.changes.iter().zip(payloads.iter()) {
-        let Some(data_arc) = payload else {
+    let Some(share_ctx) = share_map.get(&manifest.share_id.0) else {
+        warn!(
+            share_id = ?manifest.share_id.0,
+            "Share not registered locally; cannot stream file contents"
+        );
+        return Ok(());
+    };
+
+    for change in &manifest.changes {
+        if matches!(change.kind, models::ChangeKind::Delete) {
+            continue;
+        }
+        let Some(meta) = &change.meta else {
             continue;
         };
-        let data = data_arc.as_ref();
-        if data.is_empty() {
+        if meta.deleted {
+            continue;
+        }
+        let full_path = share_ctx.root_path.join(&change.path);
+        let file_len = match fs.metadata(&full_path) {
+            Ok(md) => md.len,
+            Err(e) => {
+                warn!(
+                    path = %change.path,
+                    share = %share_ctx.share_name,
+                    error = %e,
+                    "Failed to stat file for outbound transfer"
+                );
+                continue;
+            }
+        };
+
+        if file_len == 0 {
             let chunk = models::FileChunk {
                 protocol_version: models::WIRE_PROTOCOL_VERSION,
                 batch_id: manifest.batch_id.clone(),
@@ -521,24 +558,84 @@ async fn send_file_chunks(
                 eof: true,
             };
             writer.send(&WireMessage::FileChunk(chunk)).await?;
+            progress.add_outbound_bytes(intent_id, &manifest.batch_id, 0, true);
             continue;
         }
-        let mut offset = 0u64;
-        while (offset as usize) < data.len() {
-            let end = ((offset as usize) + FILE_CHUNK_SIZE).min(data.len());
-            let chunk_bytes = data[offset as usize..end].to_vec();
-            let eof = end >= data.len();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<(u64, Vec<u8>, bool)>>(2);
+        let path = full_path.clone();
+        let fs_read = fs.clone();
+        let expected_len = file_len;
+        task::spawn_blocking(move || {
+            let mut reader = match fs_read.open_read(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            };
+            let mut offset = 0u64;
+            let mut buf = vec![0u8; FILE_CHUNK_SIZE];
+            while offset < expected_len {
+                let want = ((expected_len - offset) as usize).min(FILE_CHUNK_SIZE);
+                let mut filled = 0usize;
+                while filled < want {
+                    match reader.read(&mut buf[filled..want]) {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(e) => {
+                            let _ = tx.blocking_send(Err(e));
+                            return;
+                        }
+                    }
+                }
+                if filled == 0 {
+                    let _ = tx.blocking_send(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "short read while streaming file",
+                    )));
+                    return;
+                }
+                let data = buf[..filled].to_vec();
+                let next = offset + filled as u64;
+                let eof = next >= expected_len;
+                if tx.blocking_send(Ok((offset, data, eof))).is_err() {
+                    return;
+                }
+                offset = next;
+                if eof {
+                    break;
+                }
+            }
+        });
+
+        let mut hasher = Sha256::new();
+        while let Some(item) = rx.recv().await {
+            let (offset, data, eof) = item?;
+            let n = data.len() as u64;
+            hasher.update(&data);
             let chunk = models::FileChunk {
                 protocol_version: models::WIRE_PROTOCOL_VERSION,
                 batch_id: manifest.batch_id.clone(),
                 share_id: manifest.share_id,
                 path: change.path.clone(),
                 offset,
-                data: chunk_bytes,
+                data,
                 eof,
             };
             writer.send(&WireMessage::FileChunk(chunk)).await?;
-            offset = end as u64;
+            progress.add_outbound_bytes(intent_id, &manifest.batch_id, n, eof);
+        }
+
+        let computed = finalize_hasher(hasher);
+        if computed != meta.hash {
+            warn!(
+                path = %change.path,
+                share = %share_ctx.share_name,
+                "File hash changed during send (recorded {:?}, current {:?})",
+                meta.hash,
+                computed,
+            );
         }
     }
     Ok(())

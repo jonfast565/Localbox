@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-const DB_SCHEMA_VERSION: i32 = 7;
+const DB_SCHEMA_VERSION: i32 = 8;
 
 pub struct Db {
     conn: Connection,
@@ -41,6 +41,7 @@ pub struct PeerRow {
     pub state: String,
     pub prefer_tls: bool,
     pub last_insecure_seen: i64,
+    pub quarantined: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +125,7 @@ impl Db {
                 state        TEXT NOT NULL,
                 prefer_tls   INTEGER NOT NULL DEFAULT 1,
                 last_insecure_seen INTEGER NOT NULL DEFAULT 0,
+                quarantined  INTEGER NOT NULL DEFAULT 0,
                 UNIQUE (pc_name, instance_id)
             );
 
@@ -519,6 +521,15 @@ impl Db {
             )?;
         }
 
+        if current < 8 {
+            if !self.has_column("peers", "quarantined")? {
+                self.conn.execute(
+                    "ALTER TABLE peers ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+        }
+
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {DB_SCHEMA_VERSION};"))?;
 
@@ -560,6 +571,8 @@ impl Db {
                 root_path: sc.root_path.clone(),
                 recursive: sc.recursive,
                 ignore_patterns: sc.ignore_patterns.clone(),
+                sync_allow: sc.sync_allow.clone(),
+                conflict: sc.conflict,
                 max_file_size_bytes: sc.max_file_size_bytes,
                 index,
             });
@@ -833,6 +846,25 @@ impl Db {
             params![peer_id, when_ts],
         )?;
         Ok(())
+    }
+
+    /// Set the quarantined flag for a peer. Returns `false` if the peer is not found.
+    pub fn set_peer_quarantined(&self, peer_key: &str, quarantined: bool) -> Result<bool> {
+        let Some(peer) = self.find_peer_by_key(peer_key)? else {
+            return Ok(false);
+        };
+        self.conn.execute(
+            "UPDATE peers SET quarantined = ?2 WHERE id = ?1",
+            params![peer.id, quarantined as i64],
+        )?;
+        Ok(true)
+    }
+
+    pub fn is_peer_quarantined(&self, peer_key: &str) -> Result<bool> {
+        Ok(self
+            .find_peer_by_key(peer_key)?
+            .map(|p| p.quarantined)
+            .unwrap_or(false))
     }
 
     pub fn set_peer_shares(&self, peer_id: i64, shares: &[String]) -> Result<()> {
@@ -1297,7 +1329,8 @@ impl Db {
     pub fn list_peers(&self) -> Result<Vec<PeerRow>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, pc_name, instance_id, last_ip, last_port, last_tls_port, last_plain_port, last_seen, state, prefer_tls, last_insecure_seen
+            SELECT id, pc_name, instance_id, last_ip, last_port, last_tls_port, last_plain_port,
+                   last_seen, state, prefer_tls, last_insecure_seen, quarantined
             FROM peers
             ORDER BY last_seen DESC
             "#,
@@ -1318,6 +1351,10 @@ impl Db {
                     v != 0
                 },
                 last_insecure_seen: row.get(10)?,
+                quarantined: {
+                    let v: i64 = row.get(11)?;
+                    v != 0
+                },
             })
         })?;
         let mut out = Vec::new();
@@ -2192,7 +2229,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, pc_name, instance_id, last_ip, last_port, last_tls_port, last_plain_port,
-                   last_seen, state, prefer_tls, last_insecure_seen
+                   last_seen, state, prefer_tls, last_insecure_seen, quarantined
             FROM peers
             WHERE id = ?1
             "#,
@@ -2214,6 +2251,10 @@ impl Db {
                     v != 0
                 },
                 last_insecure_seen: row.get(10)?,
+                quarantined: {
+                    let v: i64 = row.get(11)?;
+                    v != 0
+                },
             }))
         } else {
             Ok(None)

@@ -1,7 +1,7 @@
 use localbox_models as models;
 use models::{
     peer_key, peer_thread_id, share_thread_id, AppConfig, ApplicationState, BatchAck,
-    HelloMessage, ShareConfig, ShareId, WireMessage,
+    ConflictPolicy, HelloMessage, ShareConfig, ShareId, WireMessage,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -79,14 +79,17 @@ fn app_config_json_round_trip() {
             root_path: PathBuf::from("/share"),
             recursive: true,
             ignore_patterns: Vec::new(),
+            sync_allow: Vec::new(),
             max_file_size_bytes: None,
             sync: Default::default(),
             pull: Default::default(),
             request_handling: None,
+            conflict: ConflictPolicy::LastWriteWins,
         }],
         app_state: ApplicationState::MirrorHost,
         request_handling: Default::default(),
         peer_policies: Vec::new(),
+        quarantined_peers: Vec::new(),
         control_socket: std::path::PathBuf::from("localbox.sock"),
     };
     let bytes = serde_json::to_vec(&cfg).unwrap();

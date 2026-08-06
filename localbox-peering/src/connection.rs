@@ -1,15 +1,14 @@
 use anyhow::{bail, Context, Result};
 use db::JournalOrigin;
 use models::{
-    AppConfig, ChangeKind, ChatAck, ChatMessage, ChatMessageRecord, FileChange,
+    AppConfig, ChangeKind, ChatAck, ChatMessage, ChatMessageRecord, ConflictPolicy, FileChange,
     FileChunk, FileMeta, HelloMessage, ShareConfig, ShareId, ThreadKind, TransferMode,
-    TransferReply, TransferReplyStatus, TransferRequest, WireMessage,
+    TransferProgressRegistry, TransferReply, TransferReplyStatus, TransferRequest, WireMessage,
 };
 use uuid::Uuid;
 use rustls::ServerName;
 use std::collections::HashSet;
 use std::io::ErrorKind;
-use std::mem;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,10 +19,12 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::Instrument;
 use tracing::{debug, error, info, warn};
 use utilities::disk_utilities::build_remote_share_root;
-use utilities::{write_atomic, DynStream, FileSystem, Net};
+use sha2::{Digest, Sha256};
+use std::io::Write;
+use utilities::{staging_tmp_path, DynStream, FileSystem, Net};
 
 use crate::writer::{recv_framed_message, send_framed_message, PeerWriter};
-use crate::{hash_bytes, DbHandle, InboundFileState, PendingFiles, SharedWriters};
+use crate::{DbHandle, InboundFileState, PendingFiles, SharedWriters};
 use tls::{fingerprint_from_certificates, normalize_fingerprint, verify_peer_cert_name};
 
 pub async fn handle_tls_connection(
@@ -37,6 +38,7 @@ pub async fn handle_tls_connection(
     tls_acceptor: TlsAcceptor,
     fs: Arc<dyn FileSystem>,
     _net: Arc<dyn Net>,
+    progress: Arc<TransferProgressRegistry>,
 ) -> Result<()> {
     let tls_stream = tls_acceptor.accept(stream).await?;
     let mut tls_stream = tls_stream;
@@ -48,6 +50,7 @@ pub async fn handle_tls_connection(
     let peer_fp = fingerprint_from_certificates(peer_certs.as_deref());
     let (remote, resolved_peer_id) =
         perform_handshake(&mut tls_stream, cfg, db, share_names, addr, fs.clone()).await?;
+    refuse_if_quarantined(cfg, db, &remote).await?;
     check_peer_identity(
         cfg,
         db,
@@ -85,6 +88,7 @@ pub async fn handle_tls_connection(
         connections.clone(),
         pending_files,
         fs,
+        progress,
     );
     Ok(())
 }
@@ -99,10 +103,12 @@ pub async fn handle_plain_connection(
     pending_files: PendingFiles,
     fs: Arc<dyn FileSystem>,
     _net: Arc<dyn Net>,
+    progress: Arc<TransferProgressRegistry>,
 ) -> Result<()> {
     warn!("Inbound plaintext peer connection from {addr}");
     let (remote, resolved_peer_id) =
         perform_handshake(&mut stream, cfg, db, share_names, addr, fs.clone()).await?;
+    refuse_if_quarantined(cfg, db, &remote).await?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
     db.lock().await.mark_peer_insecure(resolved_peer_id, now)?;
 
@@ -126,6 +132,7 @@ pub async fn handle_plain_connection(
         connections.clone(),
         pending_files,
         fs,
+        progress,
     );
     Ok(())
 }
@@ -142,6 +149,7 @@ pub async fn connect_to_peer(
     connector: TlsConnector,
     fs: Arc<dyn FileSystem>,
     net: Arc<dyn Net>,
+    progress: Arc<TransferProgressRegistry>,
 ) -> Result<()> {
     let use_tls = if cfg.use_tls_for_peers && peer_tls_addr.port() != 0 {
         true
@@ -187,6 +195,7 @@ pub async fn connect_to_peer(
             fs.clone(),
         )
         .await?;
+        refuse_if_quarantined(cfg, db, &remote).await?;
         // rustls validated the certificate against the address we dialed; this
         // re-checks it against the name the peer claimed in its Hello, which may
         // differ (we can dial by IP) and is what the rest of the engine keys off.
@@ -218,6 +227,7 @@ pub async fn connect_to_peer(
             connections.clone(),
             pending_files,
             fs,
+            progress,
         );
         info!("Established outbound TLS to {}", target_addr);
     } else {
@@ -231,6 +241,7 @@ pub async fn connect_to_peer(
             fs.clone(),
         )
         .await?;
+        refuse_if_quarantined(cfg, db, &remote).await?;
         let now = OffsetDateTime::now_utc().unix_timestamp();
         db.lock().await.mark_peer_insecure(peer_id, now)?;
         let (reader, writer) = split(plain_stream);
@@ -251,6 +262,7 @@ pub async fn connect_to_peer(
             connections.clone(),
             pending_files,
             fs,
+            progress,
         );
         info!("Established outbound plaintext to {}", target_addr);
     }
@@ -328,6 +340,7 @@ fn spawn_incoming_reader<R>(
     connections: SharedWriters,
     pending_files: PendingFiles,
     fs: Arc<dyn FileSystem>,
+    progress: Arc<TransferProgressRegistry>,
 ) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -341,6 +354,7 @@ where
         connections,
         pending_files,
         fs,
+        progress,
     ))
 }
 
@@ -353,6 +367,7 @@ async fn incoming_reader_loop<R>(
     connections: SharedWriters,
     pending_files: PendingFiles,
     fs: Arc<dyn FileSystem>,
+    progress: Arc<TransferProgressRegistry>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -363,11 +378,13 @@ async fn incoming_reader_loop<R>(
             }
             Ok(Some(WireMessage::Batch(b))) => {
                 handle_batch_message(
+                    &cfg,
                     &db,
                     &connections,
                     &pending_files,
                     Arc::clone(&fs),
                     peer_id,
+                    &remote,
                     b,
                 )
                 .await;
@@ -386,7 +403,13 @@ async fn incoming_reader_loop<R>(
                 );
             }
             Ok(Some(WireMessage::FileChunk(chunk))) => {
-                handle_file_chunk_message(chunk, &pending_files, Arc::clone(&fs)).await;
+                handle_file_chunk_message(
+                    chunk,
+                    &pending_files,
+                    Arc::clone(&fs),
+                    Arc::clone(&progress),
+                )
+                .await;
             }
             Ok(Some(WireMessage::TransferRequest(req))) => {
                 handle_transfer_request(&cfg, &db, &connections, peer_id, req).await;
@@ -424,6 +447,9 @@ async fn maybe_auto_pull(
 ) {
     let peer_key = format!("{}@{}", remote.pc_name, remote.instance_id);
     for share_name in &remote.shares {
+        if !cfg.resolve_allow_request(share_name, &peer_key) {
+            continue;
+        }
         if !cfg.resolve_pull_mode(share_name, Some(&peer_key)).is_auto() {
             continue;
         }
@@ -484,6 +510,26 @@ async fn handle_transfer_request(
     req: TransferRequest,
 ) {
     let peer_key = format!("{}@{}", req.from_pc, req.from_instance);
+    if !cfg.resolve_allow_pull(&req.share_name, &peer_key) {
+        info!(
+            request_id = %req.request_id,
+            share = %req.share_name,
+            from = %peer_key,
+            "Inbound transfer request refused by allow_pull ACL"
+        );
+        let reply = TransferReply {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
+            request_id: req.request_id.clone(),
+            status: TransferReplyStatus::Decline,
+            reason: Some("allow_pull=false".into()),
+        };
+        let _ = db
+            .lock()
+            .await
+            .insert_transfer_request(&req, Some(peer_id), "in", "declined");
+        let _ = send_wire_to_peer(connections, peer_id, &WireMessage::TransferReply(reply)).await;
+        return;
+    }
     let _ = db
         .lock()
         .await
@@ -536,6 +582,10 @@ pub async fn fulfill_transfer_request(
     peer_id: i64,
     req: &TransferRequest,
 ) -> Result<()> {
+    let peer_key = format!("{}@{}", req.from_pc, req.from_instance);
+    if !cfg.resolve_allow_pull(&req.share_name, &peer_key) {
+        bail!("allow_pull=false for peer {peer_key}");
+    }
     let shares = db.lock().await.list_shares_table()?;
     let share_row = shares
         .into_iter()
@@ -734,11 +784,13 @@ async fn handle_chat_message(
 }
 
 async fn handle_batch_message(
+    cfg: &AppConfig,
     db: &DbHandle,
     connections: &SharedWriters,
     pending_files: &PendingFiles,
     fs: Arc<dyn FileSystem>,
     peer_id: i64,
+    remote: &HelloMessage,
     batch: models::BatchManifest,
 ) {
     let span = tracing::info_span!(
@@ -748,6 +800,8 @@ async fn handle_batch_message(
         share_id = ?batch.share_id.0
     );
     async move {
+        let peer_key = format!("{}@{}", remote.pc_name, remote.instance_id);
+
         let is_new = db
             .lock()
             .await
@@ -786,6 +840,30 @@ async fn handle_batch_message(
             }
         };
         let share_root = PathBuf::from(share_row.root_path.clone());
+        let share_name = share_row.share_name.clone();
+        let we_own_share = share_row.pc_name == cfg.pc_name;
+
+        if !cfg.resolve_allow_push(&share_name, &peer_key) {
+            warn!(
+                peer = %peer_key,
+                share = %share_name,
+                "Rejecting inbound batch: allow_push=false"
+            );
+            // Still ack so the sender does not retry forever.
+            send_batch_ack(
+                connections,
+                peer_id,
+                &batch.share_id,
+                0,
+                Some(batch.batch_id.clone()),
+            )
+            .await;
+            return;
+        }
+
+        let conflict = cfg.resolve_conflict_policy(&share_name, Some(&peer_key));
+        let sync_allow = cfg.resolve_sync_allow(&share_name, Some(&peer_key));
+        let ignore = cfg.resolve_ignore_patterns(&share_name, Some(&peer_key));
 
         // The basis decides how to read `change.seq` and whether any watermark
         // may move. A journal batch carries real positions in the sender's
@@ -803,6 +881,11 @@ async fn handle_batch_message(
                 continue;
             }
 
+            if !utilities::ignore::is_path_allowed(&change.path, &sync_allow, &ignore) {
+                max_origin_seq = max_origin_seq.max(change.seq);
+                continue;
+            }
+
             let existing = db
                 .lock()
                 .await
@@ -810,13 +893,26 @@ async fn handle_batch_message(
                 .ok()
                 .flatten();
 
-            if !should_apply_change(&change, existing.as_ref()) {
-                continue;
-            }
+            let decision = decide_apply(
+                conflict,
+                we_own_share,
+                &change,
+                existing.as_ref(),
+                &batch.from_node,
+            );
+            let disk_rel_path = match &decision {
+                ApplyDecision::Skip => {
+                    max_origin_seq = max_origin_seq.max(change.seq);
+                    continue;
+                }
+                ApplyDecision::Apply => change.path.clone(),
+                ApplyDecision::KeepBoth(alt) => alt.clone(),
+            };
 
             change.meta = resolve_change_meta(&change, existing.clone());
             if let Some(meta) = &change.meta {
                 let mut meta = meta.clone();
+                meta.path = disk_rel_path.clone();
                 // `version` is the conflict-resolution key in `should_apply`, so
                 // it may only ever be raised from the sender's journal position.
                 // For a snapshot the sender's index version already travels in
@@ -831,23 +927,28 @@ async fn handle_batch_message(
                 change.meta = Some(meta);
             }
             let expected_hash = change.meta.as_ref().map(|m| m.hash);
+            let expected_size = change.meta.as_ref().map(|m| m.size);
+            let wire_path = change.path.clone();
 
             match change.kind {
                 ChangeKind::Delete => {
-                    drop_existing_pending(pending_files, change.share_id, &change.path).await;
-                    apply_delete_to_disk(&share_root, &change.path, fs.as_ref()).await;
+                    drop_existing_pending(pending_files, change.share_id, &wire_path, fs.as_ref())
+                        .await;
+                    apply_delete_to_disk(&share_root, &disk_rel_path, fs.as_ref()).await;
                 }
                 _ => {
                     prepare_pending_file(
-                    pending_files,
-                    change.share_id,
-                    &change.path,
-                    &share_root,
-                    fs.as_ref(),
-                    expected_hash,
-                )
-                .await;
-            }
+                        pending_files,
+                        change.share_id,
+                        &wire_path,
+                        &disk_rel_path,
+                        &share_root,
+                        fs.as_ref(),
+                        expected_hash,
+                        expected_size,
+                    )
+                    .await;
+                }
             }
 
             append_inbound_change(db, peer_id, share_row_id, &change, batch.created_at).await;
@@ -889,12 +990,14 @@ async fn handle_batch_message(
 async fn prepare_pending_file(
     pending_files: &PendingFiles,
     share_id: ShareId,
-    rel_path: &str,
+    wire_path: &str,
+    disk_rel_path: &str,
     share_root: &Path,
     fs: &dyn FileSystem,
     expected_hash: Option<[u8; 32]>,
+    expected_size: Option<u64>,
 ) {
-    let target = share_root.join(rel_path);
+    let target = share_root.join(disk_rel_path);
     if let Some(parent) = target.parent() {
         if let Err(e) = fs.create_dir_all(parent) {
             warn!(
@@ -905,21 +1008,51 @@ async fn prepare_pending_file(
             return;
         }
     }
-    let mut guard = pending_files.lock().await;
-    guard.insert(
-        (share_id, rel_path.to_string()),
-        InboundFileState {
-            target_path: target,
-            buffer: Vec::new(),
-            expected_offset: 0,
-            expected_hash,
-        },
-    );
+    let staging_path = staging_tmp_path(&target);
+    let writer = match fs.open_write_trunc(&staging_path) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!(
+                path = %staging_path.display(),
+                error = %e,
+                "Failed to open staging file for inbound receive"
+            );
+            return;
+        }
+    };
+    // Keyed by wire path so FileChunk messages still match.
+    {
+        let mut guard = pending_files.lock().await;
+        if let Some(prev) = guard.remove(&(share_id, wire_path.to_string())) {
+            drop(prev.writer);
+            let _ = fs.remove_file(&prev.staging_path);
+        }
+        guard.insert(
+            (share_id, wire_path.to_string()),
+            InboundFileState {
+                target_path: target,
+                staging_path,
+                writer: Some(writer),
+                hasher: Sha256::new(),
+                expected_offset: 0,
+                expected_hash,
+                expected_size,
+            },
+        );
+    }
 }
 
-async fn drop_existing_pending(pending_files: &PendingFiles, share_id: ShareId, rel_path: &str) {
+async fn drop_existing_pending(
+    pending_files: &PendingFiles,
+    share_id: ShareId,
+    rel_path: &str,
+    fs: &dyn FileSystem,
+) {
     let mut guard = pending_files.lock().await;
-    guard.remove(&(share_id, rel_path.to_string()));
+    if let Some(prev) = guard.remove(&(share_id, rel_path.to_string())) {
+        drop(prev.writer);
+        let _ = fs.remove_file(&prev.staging_path);
+    }
 }
 
 async fn apply_delete_to_disk(share_root: &Path, rel_path: &str, fs: &dyn FileSystem) {
@@ -939,9 +1072,10 @@ async fn handle_file_chunk_message(
     chunk: FileChunk,
     pending_files: &PendingFiles,
     fs: Arc<dyn FileSystem>,
+    progress: Arc<TransferProgressRegistry>,
 ) {
     let key = (chunk.share_id, chunk.path.clone());
-    let mut completed: Option<(PathBuf, Vec<u8>, Option<[u8; 32]>)> = None;
+    let mut completed: Option<(PathBuf, PathBuf, [u8; 32], Option<[u8; 32]>)> = None;
     {
         let mut guard = pending_files.lock().await;
         if let Some(state) = guard.get_mut(&key) {
@@ -956,17 +1090,75 @@ async fn handle_file_chunk_message(
                 if chunk.offset != 0 {
                     return;
                 }
-                state.buffer.clear();
+                // Restart staging from offset 0.
+                drop(state.writer.take());
+                let _ = fs.remove_file(&state.staging_path);
+                match fs.open_write_trunc(&state.staging_path) {
+                    Ok(w) => state.writer = Some(w),
+                    Err(e) => {
+                        error!(
+                            path = %state.staging_path.display(),
+                            error = %e,
+                            "Failed to reopen staging file after restart"
+                        );
+                        guard.remove(&key);
+                        return;
+                    }
+                }
+                state.hasher = Sha256::new();
                 state.expected_offset = 0;
             }
-            state.buffer.extend_from_slice(&chunk.data);
+            if let Some(w) = state.writer.as_mut() {
+                if let Err(e) = w.write_all(&chunk.data) {
+                    error!(
+                        path = %state.staging_path.display(),
+                        error = %e,
+                        "Failed to write inbound chunk to staging"
+                    );
+                    drop(state.writer.take());
+                    let staging = state.staging_path.clone();
+                    guard.remove(&key);
+                    drop(guard);
+                    let _ = fs.remove_file(&staging);
+                    return;
+                }
+            }
+            state.hasher.update(&chunk.data);
             state.expected_offset = chunk.offset + chunk.data.len() as u64;
+            progress.note_inbound_file(
+                Some(&chunk.batch_id),
+                &chunk.path,
+                state.expected_offset,
+                state.expected_size,
+                chunk.eof,
+            );
             if chunk.eof {
+                if let Some(mut w) = state.writer.take() {
+                    if let Err(e) = w.sync_all() {
+                        error!(
+                            path = %state.staging_path.display(),
+                            error = %e,
+                            "Failed to sync staging file"
+                        );
+                        let staging = state.staging_path.clone();
+                        guard.remove(&key);
+                        drop(guard);
+                        let _ = fs.remove_file(&staging);
+                        return;
+                    }
+                }
                 let target = state.target_path.clone();
-                let data = mem::take(&mut state.buffer);
+                let staging = state.staging_path.clone();
+                let incoming_hash = {
+                    let hasher = std::mem::replace(&mut state.hasher, Sha256::new());
+                    let digest = hasher.finalize();
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&digest);
+                    out
+                };
                 let expected_hash = state.expected_hash;
                 guard.remove(&key);
-                completed = Some((target, data, expected_hash));
+                completed = Some((target, staging, incoming_hash, expected_hash));
             }
         } else {
             warn!(
@@ -977,8 +1169,7 @@ async fn handle_file_chunk_message(
         }
     }
 
-    if let Some((target, data, expected_hash)) = completed {
-        let incoming_hash = hash_bytes(&data);
+    if let Some((target, staging, incoming_hash, expected_hash)) = completed {
         if let Some(expected) = expected_hash {
             if incoming_hash != expected {
                 error!(
@@ -986,44 +1177,48 @@ async fn handle_file_chunk_message(
                     share_id = ?chunk.share_id.0,
                     expected = ?expected,
                     got = ?incoming_hash,
-                    "Inbound file hash mismatch; discarding file"
+                    "Inbound file hash mismatch; discarding staging file"
                 );
+                let _ = fs.remove_file(&staging);
                 return;
             }
         }
 
-        if let Err(e) = write_atomic(fs.as_ref(), &target, &data) {
+        let _ = fs.remove_file(&target);
+        if let Err(e) = fs.rename(&staging, &target) {
             error!(
                 path = %target.display(),
+                staging = %staging.display(),
                 error = %e,
-                "Failed to materialize inbound file"
+                "Failed to finalize inbound file from staging"
             );
-        } else {
-            if let Some(expected) = expected_hash {
-                match utilities::compute_file_hash(fs.as_ref(), &target) {
-                    Ok(on_disk) if on_disk != expected => {
-                        error!(
-                            path = %target.display(),
-                            expected = ?expected,
-                            got = ?on_disk,
-                            "Post-write hash verification failed; removing corrupted file"
-                        );
-                        let _ = fs.remove_file(&target);
-                        return;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(
-                            path = %target.display(),
-                            error = %e,
-                            "Failed to verify hash on disk after write"
-                        );
-                        return;
-                    }
+            let _ = fs.remove_file(&staging);
+            return;
+        }
+        if let Some(expected) = expected_hash {
+            match utilities::compute_file_hash(fs.as_ref(), &target) {
+                Ok(on_disk) if on_disk != expected => {
+                    error!(
+                        path = %target.display(),
+                        expected = ?expected,
+                        got = ?on_disk,
+                        "Post-write hash verification failed; removing corrupted file"
+                    );
+                    let _ = fs.remove_file(&target);
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        path = %target.display(),
+                        error = %e,
+                        "Failed to verify hash on disk after write"
+                    );
+                    return;
                 }
             }
-            info!(path = %target.display(), "Wrote inbound file");
         }
+        info!(path = %target.display(), "Wrote inbound file");
     }
 }
 
@@ -1060,13 +1255,107 @@ async fn send_batch_ack(
     }
 }
 
-fn should_apply_change(change: &FileChange, existing: Option<&FileMeta>) -> bool {
+#[derive(Debug, Clone)]
+enum ApplyDecision {
+    Apply,
+    Skip,
+    KeepBoth(String),
+}
+
+fn conflict_sibling_path(rel_path: &str, from_peer: &str) -> String {
+    let path = Path::new(rel_path);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let name = format!("{stem} (conflict from {from_peer}){ext}");
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            format!("{}/{name}", parent.to_string_lossy())
+        }
+        _ => name,
+    }
+}
+
+fn decide_apply(
+    policy: ConflictPolicy,
+    we_own_share: bool,
+    change: &FileChange,
+    existing: Option<&FileMeta>,
+    from_peer: &str,
+) -> ApplyDecision {
+    match policy {
+        ConflictPolicy::OwnerWins => {
+            if we_own_share {
+                // Owner keeps local truth: only fill missing paths.
+                if existing.is_none() && !matches!(change.kind, ChangeKind::Delete) {
+                    ApplyDecision::Apply
+                } else {
+                    ApplyDecision::Skip
+                }
+            } else {
+                // Mirror of someone else's share: always take owner data.
+                ApplyDecision::Apply
+            }
+        }
+        ConflictPolicy::KeepBoth => {
+            match change.kind {
+                ChangeKind::Delete => {
+                    // Do not delete local data on conflict; only delete when LWW would.
+                    if lww_should_apply_change(change, existing) {
+                        ApplyDecision::Apply
+                    } else {
+                        ApplyDecision::Skip
+                    }
+                }
+                _ => {
+                    let Some(incoming) = change.meta.as_ref() else {
+                        return ApplyDecision::Skip;
+                    };
+                    match existing {
+                        None => ApplyDecision::Apply,
+                        Some(cur) if cur.hash == incoming.hash && !cur.deleted => {
+                            ApplyDecision::Skip
+                        }
+                        Some(_) => ApplyDecision::KeepBoth(conflict_sibling_path(
+                            &change.path,
+                            from_peer,
+                        )),
+                    }
+                }
+            }
+        }
+        ConflictPolicy::LastWriteWins => {
+            if lww_should_apply_change(change, existing) {
+                ApplyDecision::Apply
+            } else {
+                ApplyDecision::Skip
+            }
+        }
+    }
+}
+
+fn lww_should_apply_change(change: &FileChange, existing: Option<&FileMeta>) -> bool {
     match change.kind {
-        ChangeKind::Delete => true,
+        ChangeKind::Delete => match existing {
+            None => true,
+            Some(cur) => {
+                // Prefer delete meta version when present; otherwise treat as apply.
+                change
+                    .meta
+                    .as_ref()
+                    .map(|m| should_apply_lww(m, Some(cur)))
+                    .unwrap_or(true)
+            }
+        },
         _ => change
             .meta
             .as_ref()
-            .map(|m| should_apply(m, existing))
+            .map(|m| should_apply_lww(m, existing))
             .unwrap_or(false),
     }
 }
@@ -1153,7 +1442,7 @@ async fn append_inbound_change(
     Some(local_seq)
 }
 
-fn should_apply(incoming: &FileMeta, existing: Option<&FileMeta>) -> bool {
+fn should_apply_lww(incoming: &FileMeta, existing: Option<&FileMeta>) -> bool {
     match existing {
         None => true,
         Some(cur) => {
@@ -1203,16 +1492,7 @@ async fn ensure_remote_shares(
             continue;
         }
 
-        let share_cfg = ShareConfig {
-            name: share_name.clone(),
-            root_path: share_root,
-            recursive: true,
-            ignore_patterns: Vec::new(),
-            max_file_size_bytes: None,
-            sync: Default::default(),
-            pull: Default::default(),
-            request_handling: None,
-        };
+        let share_cfg = ShareConfig::new(share_name.clone(), share_root, true);
         let share_id = ShareId::new(share_name, &remote.pc_name);
         if let Err(e) = db
             .lock()
@@ -1257,6 +1537,18 @@ async fn check_peer_identity(
     }
 }
 
+async fn refuse_if_quarantined(cfg: &AppConfig, db: &DbHandle, remote: &HelloMessage) -> Result<()> {
+    let key = format!("{}@{}", remote.pc_name, remote.instance_id);
+    if cfg.is_peer_quarantined(&key) || cfg.is_peer_quarantined(&remote.pc_name) {
+        bail!("peer {key} is quarantined (config)");
+    }
+    let locked = db.lock().await;
+    if locked.is_peer_quarantined(&key)? || locked.is_peer_quarantined(&remote.pc_name)? {
+        bail!("peer {key} is quarantined (db)");
+    }
+    Ok(())
+}
+
 fn ensure_peer_fingerprint(
     cfg: &AppConfig,
     peer_name: &str,
@@ -1290,4 +1582,120 @@ fn ensure_peer_fingerprint(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod conflict_tests {
+    use super::*;
+    use models::ShareId;
+
+    fn meta(path: &str, version: i64, hash_byte: u8) -> FileMeta {
+        FileMeta {
+            path: path.into(),
+            size: 1,
+            mtime: 10,
+            hash: [hash_byte; 32],
+            version,
+            deleted: false,
+        }
+    }
+
+    fn change(kind: ChangeKind, path: &str, version: i64, hash_byte: u8) -> FileChange {
+        FileChange {
+            seq: version,
+            share_id: ShareId::new("s", "pc"),
+            path: path.into(),
+            kind,
+            meta: Some(meta(path, version, hash_byte)),
+        }
+    }
+
+    #[test]
+    fn lww_prefers_higher_version() {
+        let incoming = change(ChangeKind::Modify, "a.txt", 2, 1);
+        let existing = meta("a.txt", 1, 2);
+        assert!(matches!(
+            decide_apply(
+                ConflictPolicy::LastWriteWins,
+                true,
+                &incoming,
+                Some(&existing),
+                "bob"
+            ),
+            ApplyDecision::Apply
+        ));
+        let older = change(ChangeKind::Modify, "a.txt", 1, 1);
+        let newer = meta("a.txt", 2, 2);
+        assert!(matches!(
+            decide_apply(
+                ConflictPolicy::LastWriteWins,
+                true,
+                &older,
+                Some(&newer),
+                "bob"
+            ),
+            ApplyDecision::Skip
+        ));
+    }
+
+    #[test]
+    fn lww_delete_respects_version() {
+        let mut del = change(ChangeKind::Delete, "a.txt", 1, 0);
+        del.kind = ChangeKind::Delete;
+        let existing = meta("a.txt", 5, 1);
+        assert!(matches!(
+            decide_apply(
+                ConflictPolicy::LastWriteWins,
+                true,
+                &del,
+                Some(&existing),
+                "bob"
+            ),
+            ApplyDecision::Skip
+        ));
+    }
+
+    #[test]
+    fn owner_wins_blocks_inbound_on_owned_share() {
+        let incoming = change(ChangeKind::Modify, "a.txt", 9, 1);
+        let existing = meta("a.txt", 1, 2);
+        assert!(matches!(
+            decide_apply(
+                ConflictPolicy::OwnerWins,
+                true,
+                &incoming,
+                Some(&existing),
+                "bob"
+            ),
+            ApplyDecision::Skip
+        ));
+        assert!(matches!(
+            decide_apply(
+                ConflictPolicy::OwnerWins,
+                false,
+                &incoming,
+                Some(&existing),
+                "bob"
+            ),
+            ApplyDecision::Apply
+        ));
+    }
+
+    #[test]
+    fn keep_both_writes_sibling() {
+        let incoming = change(ChangeKind::Modify, "dir/a.txt", 1, 1);
+        let existing = meta("dir/a.txt", 1, 2);
+        match decide_apply(
+            ConflictPolicy::KeepBoth,
+            true,
+            &incoming,
+            Some(&existing),
+            "bob",
+        ) {
+            ApplyDecision::KeepBoth(p) => {
+                assert_eq!(p, "dir/a (conflict from bob).txt");
+            }
+            other => panic!("expected KeepBoth, got {other:?}"),
+        }
+    }
 }

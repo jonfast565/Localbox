@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use db::Db;
 use models::{
-    AppConfig, ApplicationState, ChangeKind, FileChange, FileMeta, ShareConfig, ShareContext,
+    AppConfig, ApplicationState, ChangeKind, ConflictPolicy, FileChange, FileMeta, ShareConfig,
+    ShareContext,
 };
 use localbox_peering as peering;
 use peering::PeerManager;
@@ -770,14 +771,17 @@ fn test_config_with_state(
             root_path: PathBuf::from("/virtual"),
             recursive: true,
             ignore_patterns: Vec::new(),
+            sync_allow: Vec::new(),
             max_file_size_bytes: None,
             sync: Default::default(),
             pull: Default::default(),
             request_handling: None,
+            conflict: ConflictPolicy::LastWriteWins,
         }],
         app_state,
         request_handling: Default::default(),
         peer_policies: Vec::new(),
+        quarantined_peers: Vec::new(),
         control_socket: std::path::PathBuf::from("localbox.sock"),
     }
 }

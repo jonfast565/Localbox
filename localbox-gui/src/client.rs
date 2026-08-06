@@ -57,6 +57,16 @@ pub enum ControlRequest {
     ChatRead {
         thread: String,
     },
+    TransferProgress {
+        intent_id: Option<String>,
+    },
+    PeerList,
+    PeerQuarantine {
+        peer: String,
+    },
+    PeerUnquarantine {
+        peer: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

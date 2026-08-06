@@ -31,6 +31,136 @@ pub const DEFAULT_CA_VALIDITY_DAYS: u32 = 3650;
 /// a decommissioned machine stops being trusted when its certificate expires.
 pub const DEFAULT_LEAF_VALIDITY_DAYS: u32 = 365;
 
+/// Default lifetime for the network root.
+pub const DEFAULT_CA_VALIDITY: CertLifetime = CertLifetime::days(DEFAULT_CA_VALIDITY_DAYS);
+/// Default lifetime for an issued node certificate.
+pub const DEFAULT_LEAF_VALIDITY: CertLifetime = CertLifetime::days(DEFAULT_LEAF_VALIDITY_DAYS);
+
+/// How long a certificate remains valid after it is issued.
+///
+/// Parsed from strings like `365d`, `24h`, `30m`, `90s`, or compounds such as
+/// `1h30m`. A bare integer is treated as days so existing `--days N` invocations
+/// keep working.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CertLifetime(Duration);
+
+impl CertLifetime {
+    /// Build a lifetime of exactly `days` days. Panics if `days` is zero.
+    pub const fn days(days: u32) -> Self {
+        assert!(days > 0, "certificate lifetime must be positive");
+        Self(Duration::days(days as i64))
+    }
+
+    /// Build a lifetime of exactly `hours` hours. Panics if `hours` is zero.
+    pub const fn hours(hours: u32) -> Self {
+        assert!(hours > 0, "certificate lifetime must be positive");
+        Self(Duration::hours(hours as i64))
+    }
+
+    /// The underlying [`time::Duration`].
+    pub const fn as_duration(self) -> Duration {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CertLifetime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut secs = self.0.whole_seconds();
+        if secs <= 0 {
+            return f.write_str("0s");
+        }
+        let days = secs / 86_400;
+        secs %= 86_400;
+        let hours = secs / 3_600;
+        secs %= 3_600;
+        let mins = secs / 60;
+        secs %= 60;
+        if days > 0 {
+            write!(f, "{days}d")?;
+        }
+        if hours > 0 {
+            write!(f, "{hours}h")?;
+        }
+        if mins > 0 {
+            write!(f, "{mins}m")?;
+        }
+        if secs > 0 || (days == 0 && hours == 0 && mins == 0) {
+            write!(f, "{secs}s")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for CertLifetime {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        parse_cert_lifetime(raw)
+    }
+}
+
+/// Parse a certificate lifetime from a human-readable duration string.
+pub fn parse_cert_lifetime(raw: &str) -> Result<CertLifetime, String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err("certificate lifetime must not be empty".into());
+    }
+
+    // Bare integers stay days-compatible with the old `--days N` flag.
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        let days: u32 = s
+            .parse()
+            .map_err(|_| format!("certificate lifetime '{s}' is not a valid day count"))?;
+        if days == 0 {
+            return Err("certificate lifetime must be positive".into());
+        }
+        return Ok(CertLifetime::days(days));
+    }
+
+    let mut total = Duration::ZERO;
+    let mut rest = s;
+    while !rest.is_empty() {
+        let Some(unit_at) = rest.find(|c: char| !c.is_ascii_digit()) else {
+            return Err(format!(
+                "certificate lifetime '{s}' is missing a unit (use d, h, m, or s)"
+            ));
+        };
+        if unit_at == 0 {
+            return Err(format!(
+                "certificate lifetime '{s}' is not a valid duration (examples: 365d, 24h, 30m, 90s)"
+            ));
+        }
+        let amount: i64 = rest[..unit_at]
+            .parse()
+            .map_err(|_| format!("certificate lifetime '{s}' has an invalid amount"))?;
+        if amount < 0 {
+            return Err("certificate lifetime must be positive".into());
+        }
+        let unit = rest.as_bytes()[unit_at];
+        let piece = match unit {
+            b'd' | b'D' => Duration::days(amount),
+            b'h' | b'H' => Duration::hours(amount),
+            b'm' | b'M' => Duration::minutes(amount),
+            b's' | b'S' => Duration::seconds(amount),
+            _ => {
+                return Err(format!(
+                    "unknown unit '{}' in certificate lifetime '{s}' (use d, h, m, or s)",
+                    unit as char
+                ))
+            }
+        };
+        total = total
+            .checked_add(piece)
+            .ok_or_else(|| format!("certificate lifetime '{s}' overflows"))?;
+        rest = &rest[unit_at + 1..];
+    }
+
+    if total.is_zero() || total.is_negative() {
+        return Err("certificate lifetime must be positive".into());
+    }
+    Ok(CertLifetime(total))
+}
+
 const CA_CERT_FILE: &str = "ca.cert.pem";
 const CA_KEY_FILE: &str = "ca.key.pem";
 
@@ -83,7 +213,7 @@ pub fn validate_node_name(name: &str) -> Result<()> {
 }
 
 /// Create a new network root CA.
-pub fn generate_network_ca(name: &str, validity_days: u32) -> Result<NetworkCa> {
+pub fn generate_network_ca(name: &str, validity: CertLifetime) -> Result<NetworkCa> {
     let mut params = CertificateParams::default();
     params.alg = &PKCS_ECDSA_P256_SHA256;
     params.key_pair = Some(KeyPair::generate(&PKCS_ECDSA_P256_SHA256)?);
@@ -99,7 +229,7 @@ pub fn generate_network_ca(name: &str, validity_days: u32) -> Result<NetworkCa> 
         KeyUsagePurpose::CrlSign,
     ];
     params.use_authority_key_identifier_extension = true;
-    let (not_before, not_after) = validity_window(validity_days)?;
+    let (not_before, not_after) = validity_window(validity)?;
     params.not_before = not_before;
     params.not_after = not_after;
 
@@ -233,7 +363,7 @@ pub fn sign_node_csr(
     ca: &CaSigner,
     csr_pem: &str,
     node_name: &str,
-    validity_days: u32,
+    validity: CertLifetime,
 ) -> Result<String> {
     validate_node_name(node_name)?;
     // from_pem verifies the request's self-signature, which is the proof that the
@@ -257,7 +387,7 @@ pub fn sign_node_csr(
         ExtendedKeyUsagePurpose::ServerAuth,
         ExtendedKeyUsagePurpose::ClientAuth,
     ];
-    let (not_before, not_after) = validity_window(validity_days)?;
+    let (not_before, not_after) = validity_window(validity)?;
     csr.params.not_before = not_before;
     csr.params.not_after = not_after;
 
@@ -351,9 +481,9 @@ pub struct SharedBundle {
 /// as any node. Nodes installing it must also set `tls_insecure_shared_cert`,
 /// without which they will reject each other for exactly that reason. Prefer
 /// per-node enrollment unless the convenience is genuinely worth this.
-pub fn issue_shared_bundle(ca: &CaSigner, name: &str, validity_days: u32) -> Result<SharedBundle> {
+pub fn issue_shared_bundle(ca: &CaSigner, name: &str, validity: CertLifetime) -> Result<SharedBundle> {
     let csr = generate_node_csr(name)?;
-    let chain_pem = sign_node_csr(ca, &csr.csr_pem, name, validity_days)?;
+    let chain_pem = sign_node_csr(ca, &csr.csr_pem, name, validity)?;
     Ok(SharedBundle {
         chain_pem,
         key_pem: csr.key_pem,
@@ -414,17 +544,18 @@ pub fn pin_ca_in_config(config_path: &Path, fingerprint: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn validity_window(days: u32) -> Result<(OffsetDateTime, OffsetDateTime)> {
-    if days == 0 {
-        bail!("validity must be at least one day");
+fn validity_window(validity: CertLifetime) -> Result<(OffsetDateTime, OffsetDateTime)> {
+    let lifetime = validity.as_duration();
+    if lifetime.is_zero() || lifetime.is_negative() {
+        bail!("validity must be positive");
     }
     let now = OffsetDateTime::now_utc();
     // Backdate slightly so a node whose clock is a little behind the issuer does
     // not reject a certificate that was just minted for it.
     let not_before = now - Duration::hours(1);
     let not_after = now
-        .checked_add(Duration::days(i64::from(days)))
-        .ok_or_else(|| anyhow!("validity of {days} days overflows the certificate date range"))?;
+        .checked_add(lifetime)
+        .ok_or_else(|| anyhow!("validity of {validity} overflows the certificate date range"))?;
     Ok((not_before, not_after))
 }
 
@@ -444,11 +575,42 @@ mod tests {
     }
 
     #[test]
+    fn parses_lifetime_units_and_compounds() {
+        assert_eq!(
+            parse_cert_lifetime("365").unwrap(),
+            CertLifetime::days(365)
+        );
+        assert_eq!(
+            parse_cert_lifetime("24h").unwrap(),
+            CertLifetime::hours(24)
+        );
+        assert_eq!(
+            parse_cert_lifetime("30m").unwrap().as_duration(),
+            Duration::minutes(30)
+        );
+        assert_eq!(
+            parse_cert_lifetime("90s").unwrap().as_duration(),
+            Duration::seconds(90)
+        );
+        assert_eq!(
+            parse_cert_lifetime("1h30m").unwrap().as_duration(),
+            Duration::hours(1) + Duration::minutes(30)
+        );
+        assert_eq!(parse_cert_lifetime("1d").unwrap().to_string(), "1d");
+        assert_eq!(parse_cert_lifetime("90s").unwrap().to_string(), "1m30s");
+        assert!(parse_cert_lifetime("0").is_err());
+        assert!(parse_cert_lifetime("0s").is_err());
+        assert!(parse_cert_lifetime("10x").is_err());
+        assert!(parse_cert_lifetime("").is_err());
+    }
+
+    #[test]
     fn signed_leaf_is_bound_to_the_authorized_name() {
-        let ca = generate_network_ca("test-net", DEFAULT_CA_VALIDITY_DAYS).expect("generate CA");
+        let ca = generate_network_ca("test-net", DEFAULT_CA_VALIDITY).expect("generate CA");
         let signer = CaSigner::from_pem(&ca.cert_pem, &ca.key_pem).expect("load CA signer");
         let csr = generate_node_csr("node-a").expect("generate CSR");
-        let chain = sign_node_csr(&signer, &csr.csr_pem, "node-a", 30).expect("sign CSR");
+        let chain = sign_node_csr(&signer, &csr.csr_pem, "node-a", CertLifetime::days(30))
+            .expect("sign CSR");
 
         let certs = chain_certs(&chain);
         assert_eq!(certs.len(), 2, "chain should carry the leaf and the root");
@@ -460,11 +622,12 @@ mod tests {
 
     #[test]
     fn csr_cannot_choose_its_own_identity() {
-        let ca = generate_network_ca("test-net", DEFAULT_CA_VALIDITY_DAYS).expect("generate CA");
+        let ca = generate_network_ca("test-net", DEFAULT_CA_VALIDITY).expect("generate CA");
         let signer = CaSigner::from_pem(&ca.cert_pem, &ca.key_pem).expect("load CA signer");
         // A machine asks to be called "victim"; the CA authorizes it as "attacker".
         let csr = generate_node_csr("victim").expect("generate CSR");
-        let chain = sign_node_csr(&signer, &csr.csr_pem, "attacker", 30).expect("sign CSR");
+        let chain = sign_node_csr(&signer, &csr.csr_pem, "attacker", CertLifetime::days(30))
+            .expect("sign CSR");
 
         let certs = chain_certs(&chain);
         verify_peer_cert_name(Some(&certs), "attacker").expect("leaf binds to the authorized name");
@@ -474,11 +637,12 @@ mod tests {
 
     #[test]
     fn chain_from_a_different_ca_is_rejected() {
-        let ca = generate_network_ca("test-net", 3650).expect("generate CA");
-        let other = generate_network_ca("other-net", 3650).expect("generate other CA");
+        let ca = generate_network_ca("test-net", DEFAULT_CA_VALIDITY).expect("generate CA");
+        let other = generate_network_ca("other-net", DEFAULT_CA_VALIDITY).expect("generate other CA");
         let signer = CaSigner::from_pem(&ca.cert_pem, &ca.key_pem).expect("load CA signer");
         let csr = generate_node_csr("node-a").expect("generate CSR");
-        let chain = sign_node_csr(&signer, &csr.csr_pem, "node-a", 30).expect("sign CSR");
+        let chain = sign_node_csr(&signer, &csr.csr_pem, "node-a", CertLifetime::days(30))
+            .expect("sign CSR");
 
         let err = chain_matches_ca(&chain, &other.fingerprint)
             .expect_err("a chain from another root must be refused");
@@ -490,9 +654,10 @@ mod tests {
 
     #[test]
     fn a_shared_bundle_carries_no_per_node_identity() {
-        let ca = generate_network_ca("test-net", DEFAULT_CA_VALIDITY_DAYS).expect("generate CA");
+        let ca = generate_network_ca("test-net", DEFAULT_CA_VALIDITY).expect("generate CA");
         let signer = CaSigner::from_pem(&ca.cert_pem, &ca.key_pem).expect("load CA signer");
-        let bundle = issue_shared_bundle(&signer, "localbox-shared", 30).expect("issue bundle");
+        let bundle =
+            issue_shared_bundle(&signer, "localbox-shared", CertLifetime::days(30)).expect("issue bundle");
 
         // It chains to the network root, so the issuer check still passes...
         chain_matches_ca(&bundle.chain_pem, &ca.fingerprint).expect("bundle must chain to the CA");

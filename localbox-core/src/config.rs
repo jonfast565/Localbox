@@ -387,9 +387,14 @@ pub struct CaProvisionSharedArgs {
     #[arg(long, default_value = "localbox-shared")]
     pub name: String,
 
-    /// Certificate lifetime in days
-    #[arg(long, default_value_t = tls::DEFAULT_LEAF_VALIDITY_DAYS)]
-    pub days: u32,
+    /// Certificate lifetime (e.g. 365d, 24h, 30m, 90s); bare numbers mean days
+    #[arg(
+        long,
+        visible_alias = "days",
+        value_name = "DURATION",
+        default_value_t = tls::DEFAULT_LEAF_VALIDITY
+    )]
+    pub lifetime: tls::CertLifetime,
 
     /// Overwrite existing files in the output directory
     #[arg(long)]
@@ -421,9 +426,14 @@ pub struct CaServeArgs {
     #[arg(long, value_name = "ADDR")]
     pub listen: Option<SocketAddr>,
 
-    /// Lifetime in days for certificates issued through enrollment
-    #[arg(long, default_value_t = tls::DEFAULT_LEAF_VALIDITY_DAYS)]
-    pub days: u32,
+    /// Lifetime for certificates issued through enrollment (e.g. 365d, 24h, 30m, 90s)
+    #[arg(
+        long,
+        visible_alias = "days",
+        value_name = "DURATION",
+        default_value_t = tls::DEFAULT_LEAF_VALIDITY
+    )]
+    pub lifetime: tls::CertLifetime,
 }
 
 #[derive(Debug, Args)]
@@ -455,9 +465,14 @@ pub struct CaInitArgs {
     #[arg(long, default_value = DEFAULT_CA_NAME)]
     pub name: String,
 
-    /// Root certificate lifetime in days
-    #[arg(long, default_value_t = tls::DEFAULT_CA_VALIDITY_DAYS)]
-    pub days: u32,
+    /// Root certificate lifetime (e.g. 3650d, 24h, 30m, 90s); bare numbers mean days
+    #[arg(
+        long,
+        visible_alias = "days",
+        value_name = "DURATION",
+        default_value_t = tls::DEFAULT_CA_VALIDITY
+    )]
+    pub lifetime: tls::CertLifetime,
 
     /// Replace an existing CA (invalidates every certificate it has issued)
     #[arg(long)]
@@ -508,9 +523,14 @@ pub struct CaSignArgs {
     #[arg(long, value_name = "PATH")]
     pub out: PathBuf,
 
-    /// Certificate lifetime in days
-    #[arg(long, default_value_t = tls::DEFAULT_LEAF_VALIDITY_DAYS)]
-    pub days: u32,
+    /// Certificate lifetime (e.g. 365d, 24h, 30m, 90s); bare numbers mean days
+    #[arg(
+        long,
+        visible_alias = "days",
+        value_name = "DURATION",
+        default_value_t = tls::DEFAULT_LEAF_VALIDITY
+    )]
+    pub lifetime: tls::CertLifetime,
 
     /// Overwrite an existing file at --out
     #[arg(long)]

@@ -18,6 +18,6 @@ fn main() -> iced::Result {
     let args = Args::parse();
     iced::application(app::App::title, app::App::update, app::App::view)
         .theme(app::App::theme)
-        .window_size(Size::new(960.0, 640.0))
+        .window_size(Size::new(1100.0, 720.0))
         .run_with(move || app::App::new(args.socket.clone()))
 }

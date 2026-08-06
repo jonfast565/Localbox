@@ -194,7 +194,7 @@ pub fn issue_token(ca_dir: &Path, node_name: &str, ttl_secs: i64) -> Result<Enro
 pub async fn serve(
     ca_dir: &Path,
     listen: SocketAddr,
-    validity_days: u32,
+    validity: ca::CertLifetime,
     token: CancellationToken,
 ) -> Result<()> {
     let paths = CaPaths::in_dir(ca_dir);
@@ -229,7 +229,7 @@ pub async fn serve(
                 let store_lock = store_lock.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_enrollment(stream, &signer, &store_path, &store_lock, validity_days)
+                        handle_enrollment(stream, &signer, &store_path, &store_lock, validity)
                             .await
                     {
                         warn!(peer = %peer, error = %e, "Enrollment request failed");
@@ -247,7 +247,7 @@ async fn handle_enrollment(
     signer: &CaSigner,
     store_path: &Path,
     store_lock: &Mutex<()>,
-    validity_days: u32,
+    validity: ca::CertLifetime,
 ) -> Result<()> {
     let request: EnrollRequest = read_message(&mut stream).await?;
     if request.version != ENROLL_VERSION {
@@ -275,7 +275,7 @@ async fn handle_enrollment(
         }
     };
 
-    let chain = ca::sign_node_csr(signer, &request.csr_pem, &node_name, validity_days)?;
+    let chain = ca::sign_node_csr(signer, &request.csr_pem, &node_name, validity)?;
     {
         let _guard = store_lock.lock().await;
         mark_used(&request.token_id, store_path)?;
@@ -441,7 +441,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ca::{generate_network_ca, write_network_ca, DEFAULT_CA_VALIDITY_DAYS};
+    use crate::ca::{generate_network_ca, write_network_ca, DEFAULT_CA_VALIDITY};
     use tempfile::TempDir;
 
     /// `Enrolled` and `EnrollToken` deliberately have no `Debug` impl (they carry
@@ -456,7 +456,7 @@ mod tests {
     fn ca_dir() -> (TempDir, PathBuf) {
         let tmp = TempDir::new().expect("create tempdir");
         let dir = tmp.path().to_path_buf();
-        let ca = generate_network_ca("test-net", DEFAULT_CA_VALIDITY_DAYS).expect("generate CA");
+        let ca = generate_network_ca("test-net", DEFAULT_CA_VALIDITY).expect("generate CA");
         write_network_ca(&CaPaths::in_dir(&dir), &ca, false).expect("write CA");
         (tmp, dir)
     }
@@ -471,7 +471,7 @@ mod tests {
         let dir = dir.to_path_buf();
         let child = token.clone();
         tokio::spawn(async move {
-            let _ = serve(&dir, addr, 30, child).await;
+            let _ = serve(&dir, addr, ca::CertLifetime::days(30), child).await;
         });
         // Wait for the listener to come up.
         for _ in 0..100 {

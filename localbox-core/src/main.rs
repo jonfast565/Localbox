@@ -553,7 +553,7 @@ async fn main() -> anyhow::Result<()> {
                 CaCommand::Init(init) => {
                     let paths = tls::CaPaths::in_dir(&init.dir);
                     std::fs::create_dir_all(&init.dir)?;
-                    let ca = tls::generate_network_ca(&init.name, init.days)?;
+                    let ca = tls::generate_network_ca(&init.name, init.lifetime)?;
                     tls::ca::write_network_ca(&paths, &ca, init.force)?;
                     println!("Created network CA in {}", init.dir.display());
                     println!("  cert: {}", paths.cert_path.display());
@@ -613,11 +613,12 @@ async fn main() -> anyhow::Result<()> {
                     let signer = tls::load_ca_signer(&paths)?;
                     let csr_pem = std::fs::read_to_string(&sign.csr)
                         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", sign.csr.display()))?;
-                    let chain = tls::sign_node_csr(&signer, &csr_pem, &sign.name, sign.days)?;
+                    let chain =
+                        tls::sign_node_csr(&signer, &csr_pem, &sign.name, sign.lifetime)?;
                     write_file_atomic(&sign.out, chain.as_bytes())?;
                     println!(
-                        "Signed a {}-day certificate for '{}' -> {}",
-                        sign.days,
+                        "Signed a {} certificate for '{}' -> {}",
+                        sign.lifetime,
                         sign.name,
                         sign.out.display()
                     );
@@ -655,13 +656,13 @@ async fn main() -> anyhow::Result<()> {
                         }
                     });
                     println!("Serving enrollment on {listen} (Ctrl-C to stop)");
-                    tls::enroll::serve(&serve.dir, listen, serve.days, cancel).await
+                    tls::enroll::serve(&serve.dir, listen, serve.lifetime, cancel).await
                 }
                 CaCommand::ProvisionShared(shared) => {
                     let paths = tls::CaPaths::in_dir(&shared.dir);
                     let signer = tls::load_ca_signer(&paths)?;
                     let bundle =
-                        tls::ca::issue_shared_bundle(&signer, &shared.name, shared.days)?;
+                        tls::ca::issue_shared_bundle(&signer, &shared.name, shared.lifetime)?;
 
                     std::fs::create_dir_all(&shared.out_dir)?;
                     let chain_out = shared.out_dir.join("shared.chain.pem");

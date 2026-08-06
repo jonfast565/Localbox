@@ -153,11 +153,11 @@ localbox ca install --chain b.chain.pem --key b.key.pem --pin
 The CA always issues for the name **it** was told, ignoring whatever the CSR asks
 for, so a request cannot choose its own identity.
 
-**Operational notes.** There is no CRL. Prefer short leaf lifetimes (default 365
-days, `--days` to change) and re-enroll, and use `localbox peer quarantine` to
-block a hostname immediately without waiting for expiry. Compromise of the root
-key compromises the network, so keep it on one administrative machine rather
-than on every node.
+**Operational notes.** There is no CRL. Prefer short leaf lifetimes (default
+`365d`, `--lifetime` to change; accepts `d`/`h`/`m`/`s`, e.g. `24h` or `30m`)
+and re-enroll, and use `localbox peer quarantine` to block a hostname
+immediately without waiting for expiry. Compromise of the root key compromises
+the network, so keep it on one administrative machine rather than on every node.
 
 ### Peer identity
 

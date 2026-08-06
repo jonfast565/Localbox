@@ -7,8 +7,9 @@ pub mod workflow;
 pub use bootstrap::{accept_invite, issue_invite, AcceptResult};
 pub use ca::{
     chain_matches_ca, generate_network_ca, generate_node_csr, install_node_materials,
-    load_ca_signer, sign_node_csr, validate_node_name, CaPaths, CaSigner, InstallResult, NetworkCa,
-    NodeCsr, DEFAULT_CA_VALIDITY_DAYS, DEFAULT_LEAF_VALIDITY_DAYS,
+    load_ca_signer, parse_cert_lifetime, sign_node_csr, validate_node_name, CaPaths, CaSigner,
+    CertLifetime, InstallResult, NetworkCa, NodeCsr, DEFAULT_CA_VALIDITY, DEFAULT_CA_VALIDITY_DAYS,
+    DEFAULT_LEAF_VALIDITY, DEFAULT_LEAF_VALIDITY_DAYS,
 };
 pub use enroll::{issue_token, EnrollToken, Enrolled, DEFAULT_ENROLL_PORT, DEFAULT_TOKEN_TTL_SECS};
 pub use runtime::{

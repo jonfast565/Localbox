@@ -762,6 +762,7 @@ fn test_config_with_state(
         tls_ca_cert_path: tls.ca.clone(),
         tls_pinned_ca_fingerprints: Vec::new(),
         tls_peer_fingerprints: std::collections::HashMap::new(),
+            tls_insecure_shared_cert: false,
         remote_share_root: PathBuf::from("remote"),
         shares: vec![ShareConfig {
             name: share_name.to_string(),
@@ -769,8 +770,14 @@ fn test_config_with_state(
             recursive: true,
             ignore_patterns: Vec::new(),
             max_file_size_bytes: None,
+            push: Default::default(),
+            pull: Default::default(),
+            request_handling: None,
         }],
         app_state,
+        request_handling: Default::default(),
+        peer_policies: Vec::new(),
+        control_socket: std::path::PathBuf::from("localbox.sock"),
     }
 }
 
@@ -813,7 +820,7 @@ async fn enqueue_sample_batch(
         changes: vec![change],
     };
     let db_guard = db.lock().await;
-    db_guard.enqueue_outbound_batch(&manifest, None).unwrap();
+    db_guard.enqueue_outbound_batch(&manifest, None, None).unwrap();
     let _ = net_tx.try_send(manifest.batch_id);
 }
 
@@ -856,7 +863,7 @@ async fn enqueue_batch_with_seq(
         changes: vec![change],
     };
     let db_guard = db.lock().await;
-    db_guard.enqueue_outbound_batch(&manifest, None).unwrap();
+    db_guard.enqueue_outbound_batch(&manifest, None, None).unwrap();
     let _ = net_tx.try_send(manifest.batch_id);
 }
 

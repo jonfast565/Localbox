@@ -21,3 +21,4 @@ rcgen = "0.12"
 sha2 = "0.10"
 tracing = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4"] }

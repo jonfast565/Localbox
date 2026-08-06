@@ -118,6 +118,7 @@ fn proto_wire_message_round_trip() {
         protocol_version: models::WIRE_PROTOCOL_VERSION,
         share_id: ShareId::new("shareA", "pc-one"),
         upto_seq: 42,
+        batch_id: Some("batch-1".into()),
     });
     let bytes = encode_wire_message_proto(&ack).unwrap();
     let decoded = decode_wire_message_proto(&bytes).unwrap();
@@ -131,6 +132,8 @@ fn proto_wire_message_round_trip() {
 fn proto_file_chunk_round_trip() {
     let share_id = ShareId::new("shareA", "pc-one");
     let chunk = FileChunk {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
+        batch_id: "batch-1".into(),
         share_id,
         path: "a.txt".to_string(),
         offset: 0,

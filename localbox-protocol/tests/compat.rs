@@ -57,6 +57,7 @@ fn serde_round_trip_includes_protocol_version() {
         protocol_version: models::WIRE_PROTOCOL_VERSION,
         share_id: ShareId::new("shareA", "pc-one"),
         upto_seq: 1,
+        batch_id: None,
     });
     let bytes = serde_json::to_vec(&ack).unwrap();
     let parsed = parse_wire_message(&bytes).unwrap();

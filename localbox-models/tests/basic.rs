@@ -1,6 +1,7 @@
 use localbox_models as models;
 use models::{
-    AppConfig, ApplicationState, BatchAck, HelloMessage, ShareConfig, ShareId, WireMessage,
+    peer_key, peer_thread_id, share_thread_id, AppConfig, ApplicationState, BatchAck,
+    HelloMessage, ShareConfig, ShareId, WireMessage,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -44,6 +45,7 @@ fn wire_message_json_round_trip() {
         protocol_version: models::WIRE_PROTOCOL_VERSION,
         share_id: ShareId::new("shareA", "pc-one"),
         upto_seq: 123,
+        batch_id: None,
     });
     let bytes = serde_json::to_vec(&ack).unwrap();
     let decoded: WireMessage = serde_json::from_slice(&bytes).unwrap();
@@ -70,6 +72,7 @@ fn app_config_json_round_trip() {
         tls_ca_cert_path: PathBuf::from("ca.pem"),
         tls_pinned_ca_fingerprints: Vec::new(),
         tls_peer_fingerprints: std::collections::HashMap::new(),
+            tls_insecure_shared_cert: false,
         remote_share_root: PathBuf::from("remote"),
         shares: vec![ShareConfig {
             name: "shareA".to_string(),
@@ -77,8 +80,14 @@ fn app_config_json_round_trip() {
             recursive: true,
             ignore_patterns: Vec::new(),
             max_file_size_bytes: None,
+            push: Default::default(),
+            pull: Default::default(),
+            request_handling: None,
         }],
         app_state: ApplicationState::MirrorHost,
+        request_handling: Default::default(),
+        peer_policies: Vec::new(),
+        control_socket: std::path::PathBuf::from("localbox.sock"),
     };
     let bytes = serde_json::to_vec(&cfg).unwrap();
     let decoded: AppConfig = serde_json::from_slice(&bytes).unwrap();
@@ -96,4 +105,20 @@ fn app_config_json_round_trip() {
     assert_eq!(cfg.shares[0].root_path, decoded.shares[0].root_path);
     assert_eq!(cfg.shares[0].recursive, decoded.shares[0].recursive);
     assert_eq!(cfg.app_state, decoded.app_state);
+}
+
+#[test]
+fn peer_thread_id_is_deterministic_and_order_independent() {
+    let a = peer_key("alice", "1");
+    let b = peer_key("bob", "2");
+    let t1 = peer_thread_id(&a, &b);
+    let t2 = peer_thread_id(&b, &a);
+    assert_eq!(t1, t2);
+    assert_ne!(t1, peer_thread_id(&a, &peer_key("carol", "1")));
+}
+
+#[test]
+fn share_thread_id_is_deterministic() {
+    assert_eq!(share_thread_id("docs"), share_thread_id("docs"));
+    assert_ne!(share_thread_id("docs"), share_thread_id("pics"));
 }

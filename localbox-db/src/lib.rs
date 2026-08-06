@@ -1,19 +1,23 @@
 #![allow(dead_code)]
 
-use models::{AppConfig, ChangeKind, FileChange, FileMeta, ShareConfig, ShareContext, ShareId};
+use models::{
+    AppConfig, ChangeKind, ChatMessageRecord, FileChange, FileMeta, IntentBasis, IntentKind,
+    IntentOrigin, IntentStatus, ShareConfig, ShareContext, ShareId, ThreadKind, ThreadSummary,
+    TransferIntent, TransferRequest,
+};
 use rusqlite::{params, types::Type, Connection, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-const DB_SCHEMA_VERSION: i32 = 3;
+const DB_SCHEMA_VERSION: i32 = 6;
 
 pub struct Db {
     conn: Connection,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRow {
     pub id: i64,
     pub pc_name: String,
@@ -28,7 +32,7 @@ pub struct PeerRow {
     pub last_insecure_seen: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareRow {
     pub id: i64,
     pub share_name: String,
@@ -147,6 +151,21 @@ impl Db {
                 change_count   INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS transfer_intents (
+                id            TEXT PRIMARY KEY,
+                kind          TEXT NOT NULL,
+                origin        TEXT NOT NULL,
+                status        TEXT NOT NULL,
+                share_name    TEXT NOT NULL,
+                share_id      BLOB NOT NULL,
+                peer_id       INTEGER REFERENCES peers(id),
+                basis_json    TEXT NOT NULL,
+                request_id    TEXT,
+                last_error    TEXT,
+                created_at    INTEGER NOT NULL,
+                updated_at    INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS outbound_queue (
                 batch_uuid      TEXT PRIMARY KEY,
                 share_id        BLOB NOT NULL,
@@ -156,7 +175,8 @@ impl Db {
                 status          TEXT NOT NULL DEFAULT 'pending',
                 last_error      TEXT,
                 next_attempt_at INTEGER NOT NULL,
-                peer_id         INTEGER REFERENCES peers(id)
+                peer_id         INTEGER REFERENCES peers(id),
+                intent_id       TEXT REFERENCES transfer_intents(id)
             );
 
             CREATE TABLE IF NOT EXISTS inbound_batches (
@@ -164,7 +184,7 @@ impl Db {
                 received_at INTEGER NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS change_log (
+            CREATE TABLE IF NOT EXISTS share_journal (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 share_id      INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
                 seq           INTEGER NOT NULL,
@@ -190,6 +210,43 @@ impl Db {
             CREATE TABLE IF NOT EXISTS share_progress (
                 share_id       INTEGER NOT NULL UNIQUE REFERENCES shares(id) ON DELETE CASCADE,
                 last_seq_applied INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_threads (
+                id            TEXT PRIMARY KEY,
+                kind          TEXT NOT NULL,
+                peer_key      TEXT,
+                share_name    TEXT,
+                title         TEXT NOT NULL,
+                updated_at    INTEGER NOT NULL,
+                unread_count  INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id                 TEXT PRIMARY KEY,
+                thread_id          TEXT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+                from_peer          TEXT NOT NULL,
+                body               TEXT NOT NULL,
+                attachment_share   TEXT,
+                attachment_path    TEXT,
+                created_at         INTEGER NOT NULL,
+                direction          TEXT NOT NULL,
+                status             TEXT NOT NULL DEFAULT 'sent'
+            );
+
+            CREATE TABLE IF NOT EXISTS transfer_requests (
+                request_id     TEXT PRIMARY KEY,
+                peer_id        INTEGER REFERENCES peers(id) ON DELETE SET NULL,
+                share_name     TEXT NOT NULL,
+                share_id       BLOB,
+                paths_json     TEXT NOT NULL DEFAULT '[]',
+                since_seq      INTEGER NOT NULL DEFAULT 0,
+                from_pc        TEXT NOT NULL,
+                from_instance  TEXT NOT NULL,
+                direction      TEXT NOT NULL,
+                status         TEXT NOT NULL DEFAULT 'pending',
+                reason         TEXT,
+                created_at     INTEGER NOT NULL
             );
         "#,
         )?;
@@ -247,6 +304,134 @@ impl Db {
             if has_last_http_port {
                 self.conn
                     .execute("UPDATE peers SET last_plain_port = last_http_port", [])?;
+            }
+        }
+
+        if current < 4 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS chat_threads (
+                    id            TEXT PRIMARY KEY,
+                    kind          TEXT NOT NULL,
+                    peer_key      TEXT,
+                    share_name    TEXT,
+                    title         TEXT NOT NULL,
+                    updated_at    INTEGER NOT NULL,
+                    unread_count  INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id                 TEXT PRIMARY KEY,
+                    thread_id          TEXT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+                    from_peer          TEXT NOT NULL,
+                    body               TEXT NOT NULL,
+                    attachment_share   TEXT,
+                    attachment_path    TEXT,
+                    created_at         INTEGER NOT NULL,
+                    direction          TEXT NOT NULL,
+                    status             TEXT NOT NULL DEFAULT 'sent'
+                );
+                CREATE TABLE IF NOT EXISTS transfer_requests (
+                    request_id     TEXT PRIMARY KEY,
+                    peer_id        INTEGER REFERENCES peers(id) ON DELETE SET NULL,
+                    share_name     TEXT NOT NULL,
+                    share_id       BLOB,
+                    paths_json     TEXT NOT NULL DEFAULT '[]',
+                    since_seq      INTEGER NOT NULL DEFAULT 0,
+                    from_pc        TEXT NOT NULL,
+                    from_instance  TEXT NOT NULL,
+                    direction      TEXT NOT NULL,
+                    status         TEXT NOT NULL DEFAULT 'pending',
+                    reason         TEXT,
+                    created_at     INTEGER NOT NULL
+                );
+                "#,
+            )?;
+        }
+
+        if current < 5 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS transfer_intents (
+                    id            TEXT PRIMARY KEY,
+                    kind          TEXT NOT NULL,
+                    origin        TEXT NOT NULL,
+                    status        TEXT NOT NULL,
+                    share_name    TEXT NOT NULL,
+                    share_id      BLOB NOT NULL,
+                    peer_id       INTEGER REFERENCES peers(id),
+                    basis_json    TEXT NOT NULL,
+                    request_id    TEXT,
+                    last_error    TEXT,
+                    created_at    INTEGER NOT NULL,
+                    updated_at    INTEGER NOT NULL
+                );
+                "#,
+            )?;
+            let mut stmt = self.conn.prepare("PRAGMA table_info(outbound_queue)")?;
+            let mut rows = stmt.query([])?;
+            let mut has_intent_id = false;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                if name == "intent_id" {
+                    has_intent_id = true;
+                    break;
+                }
+            }
+            drop(rows);
+            drop(stmt);
+            if !has_intent_id {
+                self.conn.execute(
+                    "ALTER TABLE outbound_queue ADD COLUMN intent_id TEXT REFERENCES transfer_intents(id)",
+                    [],
+                )?;
+            }
+        }
+
+        if current < 6 {
+            // Rename ShareJournal table (was change_log). CREATE IF NOT EXISTS may already
+            // have made an empty share_journal alongside the legacy table.
+            let has_old: bool = self
+                .conn
+                .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='change_log'")?
+                .exists([])?;
+            let has_new: bool = self
+                .conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='share_journal'",
+                )?
+                .exists([])?;
+            if has_old && has_new {
+                self.conn.execute_batch(
+                    r#"
+                    INSERT OR IGNORE INTO share_journal
+                      (id, share_id, seq, path, kind, size, mtime, hash, version, deleted, created_at)
+                    SELECT id, share_id, seq, path, kind, size, mtime, hash, version, deleted, created_at
+                    FROM change_log;
+                    DROP TABLE change_log;
+                    "#,
+                )?;
+            } else if has_old && !has_new {
+                self.conn
+                    .execute("ALTER TABLE change_log RENAME TO share_journal", [])?;
+            } else if !has_new {
+                self.conn.execute_batch(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS share_journal (
+                        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                        share_id      INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+                        seq           INTEGER NOT NULL,
+                        path          TEXT NOT NULL,
+                        kind          TEXT NOT NULL,
+                        size          INTEGER,
+                        mtime         INTEGER,
+                        hash          BLOB,
+                        version       INTEGER,
+                        deleted       INTEGER NOT NULL,
+                        created_at    INTEGER NOT NULL,
+                        UNIQUE (share_id, seq)
+                    );
+                    "#,
+                )?;
             }
         }
 
@@ -610,16 +795,24 @@ impl Db {
         &self,
         manifest: &models::BatchManifest,
         peer_id: Option<i64>,
+        intent_id: Option<&str>,
     ) -> Result<()> {
         let payload = serde_json::to_vec(manifest).expect("serialize manifest");
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         self.conn.execute(
             r#"
             INSERT OR IGNORE INTO outbound_queue
-              (batch_uuid, share_id, payload, created_at, attempts, status, last_error, next_attempt_at, peer_id)
-            VALUES (?1, ?2, ?3, ?4, 0, 'pending', NULL, ?4, ?5)
+              (batch_uuid, share_id, payload, created_at, attempts, status, last_error, next_attempt_at, peer_id, intent_id)
+            VALUES (?1, ?2, ?3, ?4, 0, 'pending', NULL, ?4, ?5, ?6)
             "#,
-            params![manifest.batch_id, &manifest.share_id.0[..], payload, now, peer_id],
+            params![
+                manifest.batch_id,
+                &manifest.share_id.0[..],
+                payload,
+                now,
+                peer_id,
+                intent_id
+            ],
         )?;
         Ok(())
     }
@@ -631,7 +824,7 @@ impl Db {
     ) -> Result<Vec<OutboundQueueItem>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT batch_uuid, payload, attempts, peer_id
+            SELECT batch_uuid, payload, attempts, peer_id, intent_id
             FROM outbound_queue
             WHERE status != 'sent' AND next_attempt_at <= ?1
             ORDER BY created_at ASC
@@ -643,6 +836,7 @@ impl Db {
             let payload: Vec<u8> = row.get(1)?;
             let attempts: i64 = row.get(2)?;
             let peer_id: Option<i64> = row.get(3)?;
+            let intent_id: Option<String> = row.get(4)?;
             let manifest: models::BatchManifest =
                 serde_json::from_slice(&payload).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -656,6 +850,7 @@ impl Db {
                 manifest,
                 attempts,
                 peer_id,
+                intent_id,
             })
         })?;
         let mut out = Vec::new();
@@ -708,7 +903,7 @@ impl Db {
     pub fn next_change_seq(&self, share_row_id: i64) -> Result<i64> {
         let mut stmt = self
             .conn
-            .prepare("SELECT COALESCE(MAX(seq), 0) + 1 FROM change_log WHERE share_id = ?1")?;
+            .prepare("SELECT COALESCE(MAX(seq), 0) + 1 FROM share_journal WHERE share_id = ?1")?;
         let next: i64 = stmt.query_row(params![share_row_id], |row| row.get(0))?;
         Ok(next)
     }
@@ -738,7 +933,7 @@ impl Db {
 
         self.conn.execute(
             r#"
-            INSERT INTO change_log
+            INSERT INTO share_journal
               (share_id, seq, path, kind, size, mtime, hash, version, deleted, created_at)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
@@ -786,7 +981,7 @@ impl Db {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT seq, path, kind, size, mtime, hash, version, deleted
-            FROM change_log
+            FROM share_journal
             WHERE share_id = ?1 AND seq > ?2
             ORDER BY seq ASC
             LIMIT ?3
@@ -1029,11 +1224,854 @@ impl Db {
         Ok(n)
     }
 
-    pub fn change_log_total(&self) -> Result<i64> {
-        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM change_log")?;
+    pub fn share_journal_total(&self) -> Result<i64> {
+        let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM share_journal")?;
         let n: i64 = stmt.query_row([], |row| row.get(0))?;
         Ok(n)
     }
+
+    /// Backward-compatible alias for [`Self::share_journal_total`].
+    pub fn change_log_total(&self) -> Result<i64> {
+        self.share_journal_total()
+    }
+
+    pub fn find_peer_by_key(&self, peer_key: &str) -> Result<Option<PeerRow>> {
+        let (pc, inst) = match peer_key.split_once('@') {
+            Some((pc, inst)) => (pc.to_string(), Some(inst.to_string())),
+            None => (peer_key.to_string(), None),
+        };
+        let peers = self.list_peers()?;
+        Ok(peers.into_iter().find(|p| {
+            if let Some(inst) = &inst {
+                p.pc_name == pc && p.instance_id == *inst
+            } else {
+                p.pc_name == pc
+            }
+        }))
+    }
+
+    pub fn ensure_chat_thread(
+        &self,
+        id: &str,
+        kind: ThreadKind,
+        peer_key: Option<&str>,
+        share_name: Option<&str>,
+        title: &str,
+        updated_at: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO chat_threads (id, kind, peer_key, share_name, title, updated_at, unread_count)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                updated_at = MAX(chat_threads.updated_at, excluded.updated_at)
+            "#,
+            params![
+                id,
+                kind.as_str(),
+                peer_key,
+                share_name,
+                title,
+                updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_chat_message(&self, msg: &ChatMessageRecord, bump_unread: bool) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT OR IGNORE INTO chat_messages
+              (id, thread_id, from_peer, body, attachment_share, attachment_path, created_at, direction, status)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                msg.id,
+                msg.thread_id,
+                msg.from_peer,
+                msg.body,
+                msg.attachment_share,
+                msg.attachment_path,
+                msg.created_at,
+                msg.direction,
+                msg.status
+            ],
+        )?;
+        self.conn.execute(
+            "UPDATE chat_threads SET updated_at = MAX(updated_at, ?2) WHERE id = ?1",
+            params![msg.thread_id, msg.created_at],
+        )?;
+        if bump_unread {
+            self.conn.execute(
+                "UPDATE chat_threads SET unread_count = unread_count + 1 WHERE id = ?1",
+                params![msg.thread_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_inbox(&self) -> Result<Vec<ThreadSummary>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, kind, peer_key, share_name, title, updated_at, unread_count
+            FROM chat_threads
+            ORDER BY updated_at DESC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let kind_s: String = row.get(1)?;
+            Ok(ThreadSummary {
+                id: row.get(0)?,
+                kind: ThreadKind::parse(&kind_s).unwrap_or(ThreadKind::Peer),
+                peer_key: row.get(2)?,
+                share_name: row.get(3)?,
+                title: row.get(4)?,
+                updated_at: row.get(5)?,
+                unread_count: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_thread_messages(
+        &self,
+        thread_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ChatMessageRecord>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, thread_id, from_peer, body, attachment_share, attachment_path,
+                   created_at, direction, status
+            FROM chat_messages
+            WHERE thread_id = ?1
+            ORDER BY created_at ASC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt.query_map(params![thread_id, limit as i64], |row| {
+            Ok(ChatMessageRecord {
+                id: row.get(0)?,
+                thread_id: row.get(1)?,
+                from_peer: row.get(2)?,
+                body: row.get(3)?,
+                attachment_share: row.get(4)?,
+                attachment_path: row.get(5)?,
+                created_at: row.get(6)?,
+                direction: row.get(7)?,
+                status: row.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_thread_read(&self, thread_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_threads SET unread_count = 0 WHERE id = ?1",
+            params![thread_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_transfer_request(
+        &self,
+        req: &TransferRequest,
+        peer_id: Option<i64>,
+        direction: &str,
+        status: &str,
+    ) -> Result<()> {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let paths_json = serde_json::to_string(&req.paths).unwrap_or_else(|_| "[]".into());
+        let share_id = req.share_id.0.to_vec();
+        let since = req.since_seq;
+        self.conn.execute(
+            r#"
+            INSERT OR REPLACE INTO transfer_requests
+              (request_id, peer_id, share_name, share_id, paths_json, since_seq,
+               from_pc, from_instance, direction, status, reason, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11)
+            "#,
+            params![
+                req.request_id,
+                peer_id,
+                req.share_name,
+                share_id,
+                paths_json,
+                since,
+                req.from_pc,
+                req.from_instance,
+                direction,
+                status,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_pending_transfer_requests(&self) -> Result<Vec<PendingTransferRequest>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT request_id, peer_id, share_name, share_id, paths_json, since_seq,
+                   from_pc, from_instance, direction, status, reason, created_at
+            FROM transfer_requests
+            WHERE status = 'pending' AND direction = 'in'
+            ORDER BY created_at ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let share_id_blob: Option<Vec<u8>> = row.get(3)?;
+            let paths_json: String = row.get(4)?;
+            let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+            let share_id = share_id_blob.and_then(|b| {
+                if b.len() == 16 {
+                    let mut arr = [0u8; 16];
+                    arr.copy_from_slice(&b);
+                    Some(ShareId(arr))
+                } else {
+                    None
+                }
+            });
+            Ok(PendingTransferRequest {
+                request_id: row.get(0)?,
+                peer_id: row.get(1)?,
+                share_name: row.get(2)?,
+                share_id,
+                paths,
+                since_seq: row.get(5)?,
+                from_pc: row.get(6)?,
+                from_instance: row.get(7)?,
+                direction: row.get(8)?,
+                status: row.get(9)?,
+                reason: row.get(10)?,
+                created_at: row.get(11)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_transfer_request(&self, request_id: &str) -> Result<Option<PendingTransferRequest>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT request_id, peer_id, share_name, share_id, paths_json, since_seq,
+                   from_pc, from_instance, direction, status, reason, created_at
+            FROM transfer_requests
+            WHERE request_id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![request_id])?;
+        if let Some(row) = rows.next()? {
+            let share_id_blob: Option<Vec<u8>> = row.get(3)?;
+            let paths_json: String = row.get(4)?;
+            let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+            let share_id = share_id_blob.and_then(|b| {
+                if b.len() == 16 {
+                    let mut arr = [0u8; 16];
+                    arr.copy_from_slice(&b);
+                    Some(ShareId(arr))
+                } else {
+                    None
+                }
+            });
+            Ok(Some(PendingTransferRequest {
+                request_id: row.get(0)?,
+                peer_id: row.get(1)?,
+                share_name: row.get(2)?,
+                share_id,
+                paths,
+                since_seq: row.get(5)?,
+                from_pc: row.get(6)?,
+                from_instance: row.get(7)?,
+                direction: row.get(8)?,
+                status: row.get(9)?,
+                reason: row.get(10)?,
+                created_at: row.get(11)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn update_transfer_request_status(
+        &self,
+        request_id: &str,
+        status: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE transfer_requests SET status = ?2, reason = ?3 WHERE request_id = ?1",
+            params![request_id, status, reason],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_transfer_request(&self, request_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM transfer_requests WHERE request_id = ?1",
+            params![request_id],
+        )?;
+        Ok(())
+    }
+
+    /* Transfer intents */
+
+    fn row_to_transfer_intent(row: &rusqlite::Row<'_>) -> Result<TransferIntent> {
+        let share_id_blob: Vec<u8> = row.get(5)?;
+        let mut arr = [0u8; 16];
+        let len = share_id_blob.len().min(16);
+        arr[..len].copy_from_slice(&share_id_blob[..len]);
+        let basis_json: String = row.get(7)?;
+        let basis: IntentBasis = serde_json::from_str(&basis_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(basis_json.len(), Type::Text, Box::new(e))
+        })?;
+        let kind_s: String = row.get(1)?;
+        let origin_s: String = row.get(2)?;
+        let status_s: String = row.get(3)?;
+        Ok(TransferIntent {
+            id: row.get(0)?,
+            kind: IntentKind::parse(&kind_s).unwrap_or(IntentKind::Push),
+            origin: IntentOrigin::parse(&origin_s).unwrap_or(IntentOrigin::User),
+            status: IntentStatus::parse(&status_s).unwrap_or(IntentStatus::Pending),
+            share_name: row.get(4)?,
+            share_id: ShareId(arr),
+            peer_id: row.get(6)?,
+            basis,
+            request_id: row.get(8)?,
+            last_error: row.get(9)?,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
+        })
+    }
+
+    pub fn insert_transfer_intent(&self, intent: &TransferIntent) -> Result<()> {
+        let basis_json = serde_json::to_string(&intent.basis).expect("serialize basis");
+        self.conn.execute(
+            r#"
+            INSERT INTO transfer_intents
+              (id, kind, origin, status, share_name, share_id, peer_id, basis_json,
+               request_id, last_error, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+            params![
+                intent.id,
+                intent.kind.as_str(),
+                intent.origin.as_str(),
+                intent.status.as_str(),
+                intent.share_name,
+                &intent.share_id.0[..],
+                intent.peer_id,
+                basis_json,
+                intent.request_id,
+                intent.last_error,
+                intent.created_at,
+                intent.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_transfer_intent(&self, id: &str) -> Result<Option<TransferIntent>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, kind, origin, status, share_name, share_id, peer_id, basis_json,
+                   request_id, last_error, created_at, updated_at
+            FROM transfer_intents
+            WHERE id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Self::row_to_transfer_intent(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn update_transfer_intent_status(
+        &self,
+        id: &str,
+        status: IntentStatus,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        self.conn.execute(
+            r#"
+            UPDATE transfer_intents
+            SET status = ?2, last_error = ?3, updated_at = ?4
+            WHERE id = ?1
+            "#,
+            params![id, status.as_str(), last_error, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_transfer_intents(
+        &self,
+        statuses: Option<&[IntentStatus]>,
+        limit: usize,
+    ) -> Result<Vec<TransferIntent>> {
+        let mut sql = String::from(
+            r#"
+            SELECT id, kind, origin, status, share_name, share_id, peer_id, basis_json,
+                   request_id, last_error, created_at, updated_at
+            FROM transfer_intents
+            "#,
+        );
+        let status_params: Vec<String> = statuses
+            .filter(|s| !s.is_empty())
+            .map(|s| s.iter().map(|st| st.as_str().to_string()).collect())
+            .unwrap_or_default();
+        if !status_params.is_empty() {
+            let placeholders: Vec<String> = (1..=status_params.len())
+                .map(|i| format!("?{i}"))
+                .collect();
+            sql.push_str(" WHERE status IN (");
+            sql.push_str(&placeholders.join(","));
+            sql.push(')');
+        }
+        sql.push_str(&format!(
+            " ORDER BY created_at DESC LIMIT {}",
+            limit.max(1)
+        ));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut out = Vec::new();
+        if status_params.is_empty() {
+            let rows = stmt.query_map([], |row| Self::row_to_transfer_intent(row))?;
+            for row in rows {
+                out.push(row?);
+            }
+        } else {
+            let refs: Vec<&dyn rusqlite::types::ToSql> = status_params
+                .iter()
+                .map(|s| s as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows = stmt.query_map(refs.as_slice(), |row| Self::row_to_transfer_intent(row))?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_outbound_intent_id(&self, batch_uuid: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT intent_id FROM outbound_queue WHERE batch_uuid = ?1")?;
+        match stmt.query_row(params![batch_uuid], |row| row.get::<_, Option<String>>(0)) {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Pending (not yet sent) outbound batches for an intent.
+    pub fn count_pending_batches_for_intent(&self, intent_id: &str) -> Result<i64> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COUNT(*) FROM outbound_queue WHERE intent_id = ?1 AND status != 'sent'",
+        )?;
+        stmt.query_row(params![intent_id], |row| row.get(0))
+    }
+
+    /// All outbound batches for an intent (any status).
+    pub fn count_batches_for_intent(&self, intent_id: &str) -> Result<i64> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM outbound_queue WHERE intent_id = ?1")?;
+        stmt.query_row(params![intent_id], |row| row.get(0))
+    }
+
+    pub fn max_change_seq(&self, share_row_id: i64) -> Result<i64> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COALESCE(MAX(seq), 0) FROM share_journal WHERE share_id = ?1")?;
+        stmt.query_row(params![share_row_id], |row| row.get(0))
+    }
+
+    /// Create a TransferIntent and enqueue outbound batches (Snapshot or JournalRange).
+    /// Returns (intent_id, batch_ids). Does not bump peer_progress.
+    pub fn create_and_materialize_intent(
+        &self,
+        kind: IntentKind,
+        origin: IntentOrigin,
+        share_name: &str,
+        share_id: ShareId,
+        peer_id: Option<i64>,
+        basis: IntentBasis,
+        request_id: Option<&str>,
+        from_node: &str,
+    ) -> Result<(String, Vec<String>)> {
+        const MAX_CHANGES_PER_BATCH: usize = 256;
+        const MAX_OUTBOUND_QUEUE_DEPTH: i64 = 50_000;
+
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let intent_id = uuid::Uuid::new_v4().to_string();
+        let intent = TransferIntent {
+            id: intent_id.clone(),
+            kind,
+            origin,
+            status: IntentStatus::Pending,
+            share_name: share_name.to_string(),
+            share_id,
+            peer_id,
+            basis: basis.clone(),
+            request_id: request_id.map(|s| s.to_string()),
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.insert_transfer_intent(&intent)?;
+
+        let share_row_id = self.get_share_row_id_by_share_id(&share_id)?;
+        let changes = match &basis {
+            IntentBasis::Snapshot { paths } => {
+                self.snapshot_changes(share_row_id, share_id, paths)?
+            }
+            IntentBasis::JournalRange { from_seq, to_seq } => {
+                let mut all = Vec::new();
+                let mut start = *from_seq;
+                while start < *to_seq {
+                    let chunk =
+                        self.list_changes_since(share_row_id, start, MAX_CHANGES_PER_BATCH)?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    let mut advanced = false;
+                    for mut ch in chunk {
+                        if ch.seq > *to_seq {
+                            break;
+                        }
+                        ch.share_id = share_id;
+                        start = ch.seq;
+                        all.push(ch);
+                        advanced = true;
+                    }
+                    if !advanced {
+                        break;
+                    }
+                }
+                all
+            }
+        };
+
+        if changes.is_empty() {
+            self.update_transfer_intent_status(
+                &intent_id,
+                IntentStatus::Failed,
+                Some("no changes to materialize"),
+            )?;
+            return Ok((intent_id, Vec::new()));
+        }
+
+        let depth = self.outbound_queue_depth().unwrap_or(0);
+        if depth >= MAX_OUTBOUND_QUEUE_DEPTH {
+            self.update_transfer_intent_status(
+                &intent_id,
+                IntentStatus::Failed,
+                Some("outbound queue full"),
+            )?;
+            return Ok((intent_id, Vec::new()));
+        }
+
+        let mut batch_ids = Vec::new();
+        for chunk in changes.chunks(MAX_CHANGES_PER_BATCH) {
+            let batch_id = uuid::Uuid::new_v4().to_string();
+            let manifest = models::BatchManifest {
+                protocol_version: models::WIRE_PROTOCOL_VERSION,
+                batch_id: batch_id.clone(),
+                share_id,
+                from_node: from_node.to_string(),
+                created_at: now,
+                changes: chunk.to_vec(),
+            };
+            self.enqueue_outbound_batch(&manifest, peer_id, Some(&intent_id))?;
+            batch_ids.push(batch_id);
+        }
+
+        self.update_transfer_intent_status(&intent_id, IntentStatus::Materialized, None)?;
+        Ok((intent_id, batch_ids))
+    }
+
+    fn snapshot_changes(
+        &self,
+        share_row_id: i64,
+        share_id: ShareId,
+        paths: &[String],
+    ) -> Result<Vec<FileChange>> {
+        let metas = if paths.is_empty() {
+            self.list_file_metas(share_row_id)?
+        } else {
+            let mut out = Vec::new();
+            for p in paths {
+                if let Some(m) = self.get_file_meta(share_row_id, p)? {
+                    out.push(m);
+                }
+            }
+            out
+        };
+        let mut changes = Vec::with_capacity(metas.len());
+        for meta in metas {
+            let kind = if meta.deleted {
+                ChangeKind::Delete
+            } else if meta.version <= 1 {
+                ChangeKind::Create
+            } else {
+                ChangeKind::Modify
+            };
+            let meta_opt = if meta.deleted {
+                None
+            } else {
+                Some(meta.clone())
+            };
+            changes.push(FileChange {
+                seq: 0,
+                share_id,
+                path: meta.path,
+                kind,
+                meta: meta_opt,
+            });
+        }
+        Ok(changes)
+    }
+
+    /// After a batch is successfully sent: mark intent InFlight; bump last_seq_sent only for SyncCatchup.
+    pub fn on_outbound_batch_sent(
+        &self,
+        batch_id: &str,
+        peer_id: i64,
+        share_id: &ShareId,
+        max_seq: i64,
+    ) -> Result<()> {
+        self.mark_outbound_sent(batch_id)?;
+        let intent_id = self.get_outbound_intent_id(batch_id)?;
+        let Some(intent_id) = intent_id else {
+            // Legacy queue rows without intent: preserve old watermark behavior.
+            if max_seq > 0 {
+                if let Ok(share_row_id) = self.get_share_row_id_by_share_id(share_id) {
+                    let _ = self.bump_last_seq_sent(peer_id, share_row_id, max_seq);
+                }
+            }
+            return Ok(());
+        };
+        if let Some(intent) = self.get_transfer_intent(&intent_id)? {
+            if intent.kind.updates_peer_progress() && max_seq > 0 {
+                if let Ok(share_row_id) = self.get_share_row_id_by_share_id(share_id) {
+                    let _ = self.bump_last_seq_sent(peer_id, share_row_id, max_seq);
+                }
+            }
+            let pending = self.count_pending_batches_for_intent(&intent_id)?;
+            if pending == 0 && !intent.kind.updates_peer_progress() {
+                // Snapshot / Push / PullFulfill: complete on send (no watermark wait).
+                self.update_transfer_intent_status(&intent_id, IntentStatus::Acked, None)?;
+            } else {
+                self.update_transfer_intent_status(&intent_id, IntentStatus::InFlight, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// On BatchAck: bump last_seq_acked only for SyncCatchup; mark intents Acked when drained.
+    pub fn on_batch_ack(
+        &self,
+        peer_id: i64,
+        share_id: &ShareId,
+        upto_seq: i64,
+        batch_id: Option<&str>,
+    ) -> Result<()> {
+        let mut intent_ids = Vec::new();
+        if let Some(bid) = batch_id {
+            if let Some(id) = self.get_outbound_intent_id(bid)? {
+                intent_ids.push(id);
+            }
+        }
+        if intent_ids.is_empty() {
+            let mut stmt = self.conn.prepare(
+                r#"
+                SELECT DISTINCT intent_id
+                FROM outbound_queue
+                WHERE peer_id = ?1 AND share_id = ?2 AND intent_id IS NOT NULL AND status = 'sent'
+                "#,
+            )?;
+            let rows = stmt.query_map(params![peer_id, &share_id.0[..]], |row| {
+                row.get::<_, String>(0)
+            })?;
+            for row in rows {
+                intent_ids.push(row?);
+            }
+        }
+
+        if intent_ids.is_empty() {
+            // Legacy outbound rows without intents: keep prior watermark behavior.
+            if let Ok(share_row_id) = self.get_share_row_id_by_share_id(share_id) {
+                let _ = self.bump_last_seq_acked(peer_id, share_row_id, upto_seq);
+            }
+            return Ok(());
+        }
+
+        let mut bumped = false;
+        for id in &intent_ids {
+            if let Some(intent) = self.get_transfer_intent(id)? {
+                if intent.kind.updates_peer_progress() && !bumped {
+                    if let Ok(share_row_id) = self.get_share_row_id_by_share_id(share_id) {
+                        let _ = self.bump_last_seq_acked(peer_id, share_row_id, upto_seq);
+                        bumped = true;
+                    }
+                }
+                let pending = self.count_pending_batches_for_intent(id)?;
+                if pending == 0
+                    && matches!(
+                        intent.status,
+                        IntentStatus::Materialized | IntentStatus::InFlight
+                    )
+                {
+                    self.update_transfer_intent_status(id, IntentStatus::Acked, None)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn list_intent_ids_for_sent_batches(
+        &self,
+        peer_id: i64,
+        share_id: &ShareId,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT DISTINCT intent_id
+            FROM outbound_queue
+            WHERE peer_id = ?1 AND share_id = ?2 AND intent_id IS NOT NULL
+            "#,
+        )?;
+        let rows = stmt.query_map(params![peer_id, &share_id.0[..]], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn update_chat_message_status(&self, message_id: &str, status: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_messages SET status = ?2 WHERE id = ?1",
+            params![message_id, status],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_peer(&self, peer_id: i64) -> Result<Option<PeerRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, pc_name, instance_id, last_ip, last_port, last_tls_port, last_plain_port,
+                   last_seen, state, prefer_tls, last_insecure_seen
+            FROM peers
+            WHERE id = ?1
+            "#,
+        )?;
+        let mut rows = stmt.query(params![peer_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(PeerRow {
+                id: row.get(0)?,
+                pc_name: row.get(1)?,
+                instance_id: row.get(2)?,
+                last_ip: row.get(3)?,
+                last_port: row.get(4)?,
+                last_tls_port: row.get(5)?,
+                last_plain_port: row.get(6)?,
+                last_seen: row.get(7)?,
+                state: row.get(8)?,
+                prefer_tls: {
+                    let v: i64 = row.get(9)?;
+                    v != 0
+                },
+                last_insecure_seen: row.get(10)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // Aliases matching the control-plane / docs naming.
+
+    pub fn ensure_thread(
+        &self,
+        id: &str,
+        kind: ThreadKind,
+        peer_key: Option<&str>,
+        share_name: Option<&str>,
+        title: &str,
+        updated_at: i64,
+    ) -> Result<()> {
+        self.ensure_chat_thread(id, kind, peer_key, share_name, title, updated_at)
+    }
+
+    pub fn insert_message(&self, msg: &ChatMessageRecord, bump_unread: bool) -> Result<()> {
+        self.insert_chat_message(msg, bump_unread)
+    }
+
+    pub fn list_messages(&self, thread_id: &str, limit: usize) -> Result<Vec<ChatMessageRecord>> {
+        self.list_thread_messages(thread_id, limit)
+    }
+
+    pub fn insert_pending_request(
+        &self,
+        req: &TransferRequest,
+        peer_id: Option<i64>,
+        direction: &str,
+        status: &str,
+    ) -> Result<()> {
+        self.insert_transfer_request(req, peer_id, direction, status)
+    }
+
+    pub fn list_pending_requests(&self) -> Result<Vec<PendingTransferRequest>> {
+        self.list_pending_transfer_requests()
+    }
+
+    pub fn get_pending_request(&self, request_id: &str) -> Result<Option<PendingTransferRequest>> {
+        self.get_transfer_request(request_id)
+    }
+
+    pub fn update_pending_request_status(
+        &self,
+        request_id: &str,
+        status: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.update_transfer_request_status(request_id, status, reason)
+    }
+
+    pub fn delete_pending_request(&self, request_id: &str) -> Result<()> {
+        self.delete_transfer_request(request_id)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingTransferRequest {
+    pub request_id: String,
+    pub peer_id: Option<i64>,
+    pub share_name: String,
+    pub share_id: Option<ShareId>,
+    pub paths: Vec<String>,
+    pub since_seq: i64,
+    pub from_pc: String,
+    pub from_instance: String,
+    pub direction: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1042,4 +2080,5 @@ pub struct OutboundQueueItem {
     pub manifest: models::BatchManifest,
     pub attempts: i64,
     pub peer_id: Option<i64>,
+    pub intent_id: Option<String>,
 }

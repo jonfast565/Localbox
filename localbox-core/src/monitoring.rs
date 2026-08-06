@@ -46,7 +46,7 @@ pub fn run_monitor(cfg: &AppConfig, opts: &MonitorOptions) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         } else {
             println!(
-                "[{}] queue_depth={} due_now={} peers={} change_log={}",
+                "[{}] queue_depth={} due_now={} peers={} share_journal={}",
                 snapshot.timestamp,
                 snapshot.queue_depth,
                 snapshot.queue_due_now,

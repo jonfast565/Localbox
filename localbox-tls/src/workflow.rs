@@ -15,14 +15,26 @@ pub struct CertFingerprint {
 }
 
 pub fn fingerprints_for_pem_file(path: &Path) -> Result<Vec<CertFingerprint>> {
-    read_cert_der_from_pem(path)?
-        .into_iter()
-        .map(|der| {
-            let fp = fingerprint_hex(&der);
-            Ok(CertFingerprint {
-                fingerprint: fp,
-                der,
-            })
+    let ders = read_cert_der_from_pem(path)?;
+    Ok(fingerprints_for_ders(ders))
+}
+
+/// Fingerprint every certificate in a PEM blob held in memory.
+pub fn fingerprints_from_pem_str(pem: &str) -> Result<Vec<CertFingerprint>> {
+    let mut reader = BufReader::new(std::io::Cursor::new(pem.as_bytes()));
+    let certs = rustls_pemfile::certs(&mut reader)
+        .map_err(|e| anyhow!("failed to parse PEM certs: {e}"))?;
+    if certs.is_empty() {
+        bail!("no certificates found in the supplied PEM data");
+    }
+    Ok(fingerprints_for_ders(certs))
+}
+
+fn fingerprints_for_ders(ders: Vec<Vec<u8>>) -> Vec<CertFingerprint> {
+    ders.into_iter()
+        .map(|der| CertFingerprint {
+            fingerprint: fingerprint_hex(&der),
+            der,
         })
         .collect()
 }
@@ -59,9 +71,19 @@ pub fn export_ca_from_chain_pem(cert_chain_path: &Path, out_path: &Path) -> Resu
 pub fn import_ca_into_trust_store(trust_store_path: &Path, input_pem_path: &Path) -> Result<usize> {
     let input_pem = fs::read_to_string(input_pem_path)
         .with_context(|| format!("failed to read {}", input_pem_path.display()))?;
-    let blocks = extract_pem_cert_blocks(&input_pem);
+    import_ca_pem_into_trust_store(trust_store_path, &input_pem).with_context(|| {
+        format!(
+            "failed to import CA certificates from {}",
+            input_pem_path.display()
+        )
+    })
+}
+
+/// Append CA certificates held in memory to a trust store, deduped by fingerprint.
+pub fn import_ca_pem_into_trust_store(trust_store_path: &Path, input_pem: &str) -> Result<usize> {
+    let blocks = extract_pem_cert_blocks(input_pem);
     if blocks.is_empty() {
-        bail!("no PEM certificates found in {}", input_pem_path.display());
+        bail!("no PEM certificates found in the supplied CA data");
     }
 
     let mut existing_fps: HashSet<String> = read_trust_store_fingerprints(trust_store_path)?
@@ -69,12 +91,9 @@ pub fn import_ca_into_trust_store(trust_store_path: &Path, input_pem_path: &Path
         .map(|s| normalize_fingerprint(&s))
         .collect();
 
-    let input_fps = fingerprints_for_pem_file(input_pem_path)?;
+    let input_fps = fingerprints_from_pem_str(input_pem)?;
     if input_fps.len() != blocks.len() {
-        bail!(
-            "PEM parse mismatch for {} (cert blocks != parsed certs)",
-            input_pem_path.display()
-        );
+        bail!("PEM parse mismatch in the supplied CA data (cert blocks != parsed certs)");
     }
 
     let mut appended = 0usize;
@@ -141,7 +160,7 @@ fn read_cert_der_from_pem(path: &Path) -> Result<Vec<Vec<u8>>> {
     Ok(certs)
 }
 
-fn extract_pem_cert_blocks(pem_text: &str) -> Vec<String> {
+pub(crate) fn extract_pem_cert_blocks(pem_text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = pem_text;
     loop {

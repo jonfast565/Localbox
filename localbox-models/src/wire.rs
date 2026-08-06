@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::change::{BatchManifest, FileChunk};
+use crate::chat::{ChatAck, ChatMessage};
 use crate::default_wire_protocol_version;
 use crate::share::ShareId;
+use crate::transfer::{TransferPushOffer, TransferReply, TransferRequest};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloMessage {
@@ -29,6 +31,9 @@ pub struct BatchAck {
     pub protocol_version: u16,
     pub share_id: ShareId,
     pub upto_seq: i64,
+    /// Optional link to the acked `BatchManifest.batch_id` (empty/absent = legacy).
+    #[serde(default)]
+    pub batch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +42,11 @@ pub enum WireMessage {
     Batch(BatchManifest),
     BatchAck(BatchAck),
     FileChunk(FileChunk),
+    TransferRequest(TransferRequest),
+    TransferReply(TransferReply),
+    TransferPushOffer(TransferPushOffer),
+    ChatMessage(ChatMessage),
+    ChatAck(ChatAck),
 }
 
 pub fn wire_message_protocol_version(msg: &WireMessage) -> u16 {
@@ -44,7 +54,12 @@ pub fn wire_message_protocol_version(msg: &WireMessage) -> u16 {
         WireMessage::Hello(h) => h.protocol_version,
         WireMessage::Batch(b) => b.protocol_version,
         WireMessage::BatchAck(a) => a.protocol_version,
-        WireMessage::FileChunk(_) => crate::WIRE_PROTOCOL_VERSION,
+        WireMessage::FileChunk(c) => c.protocol_version,
+        WireMessage::TransferRequest(r) => r.protocol_version,
+        WireMessage::TransferReply(r) => r.protocol_version,
+        WireMessage::TransferPushOffer(o) => o.protocol_version,
+        WireMessage::ChatMessage(m) => m.protocol_version,
+        WireMessage::ChatAck(a) => a.protocol_version,
     }
 }
 

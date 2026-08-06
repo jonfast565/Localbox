@@ -1,15 +1,22 @@
 use clap::Parser;
 use comfy_table::{presets::ASCII_FULL_CONDENSED, Table};
 use localbox_core::config::{
-    init_config_template, validate_app_config, BootstrapCommand, Cli, Command, StatusSection,
-    DEFAULT_CONFIG_PATH,
+    init_config_template, validate_app_config, BootstrapCommand, ChatCommand, Cli, Command,
+    StatusSection, DEFAULT_CONFIG_PATH,
 };
-use localbox_core::monitoring;
+use localbox_core::control::send_control_request;
 use localbox_core::integrity;
+use localbox_core::monitoring;
+use localbox_core::service::ControlRequest;
+use localbox_core::shell::run_attached_shell;
 use localbox_core::Engine;
+use peering::PeerCommand;
 use serde_json::json;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use tls::{self, bootstrap, workflow};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use utilities::{copy_file_atomic, write_file_atomic, RealFileSystem};
 
 #[tokio::main]
@@ -20,8 +27,94 @@ async fn main() -> anyhow::Result<()> {
             let cfg = cli.resolve_app_config_with_overrides(run_args)?;
             validate_app_config(&cfg)?;
             let engine = Engine::new(cfg)?;
-            engine.run().await
+            if run_args.interactive {
+                let (cmd_tx, cmd_rx) = mpsc::channel::<PeerCommand>(256);
+                let token = CancellationToken::new();
+                engine
+                    .run_with_peer_commands(token, cmd_tx, cmd_rx, true)
+                    .await
+            } else {
+                engine.run().await
+            }
         }
+        Command::Shell(args) | Command::Interactive(args) => {
+            let sock = resolve_control_socket(&cli, args.socket.clone())?;
+            run_attached_shell(sock).await
+        }
+        Command::Push(args) => {
+            let sock = resolve_control_socket(&cli, args.socket.clone())?;
+            let resp = send_control_request(
+                &sock,
+                &ControlRequest::Push {
+                    share: args.share.clone(),
+                    peer: args.peer.clone(),
+                    path: args.path.clone(),
+                },
+            )
+            .await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
+            }
+        }
+        Command::Pull(args) | Command::Request(args) => {
+            let sock = resolve_control_socket(&cli, args.socket.clone())?;
+            let resp = send_control_request(
+                &sock,
+                &ControlRequest::Request {
+                    share: args.share.clone(),
+                    peer: args.peer.clone(),
+                    path: args.path.clone(),
+                },
+            )
+            .await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
+            }
+        }
+        Command::Reply(args) => {
+            let sock = resolve_control_socket(&cli, args.socket.clone())?;
+            let accept = args.action == "accept";
+            let resp = send_control_request(
+                &sock,
+                &ControlRequest::Reply {
+                    id: args.id.clone(),
+                    accept,
+                    reason: args.reason.clone(),
+                },
+            )
+            .await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
+            }
+        }
+        Command::Intents(args) => {
+            let sock = resolve_control_socket(&cli, args.socket.clone())?;
+            let req = if let Some(id) = &args.id {
+                ControlRequest::IntentShow { id: id.clone() }
+            } else {
+                ControlRequest::Intents {
+                    all: args.all,
+                    limit: args.limit,
+                }
+            };
+            let resp = send_control_request(&sock, &req).await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
+            }
+        }
+        Command::Chat(args) => handle_chat_command(&cli, args).await,
         Command::Init(args) => {
             let path = cli
                 .config
@@ -378,6 +471,261 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::Ca(args) => {
+            use localbox_core::config::CaCommand;
+            match &args.command {
+                CaCommand::Init(init) => {
+                    let paths = tls::CaPaths::in_dir(&init.dir);
+                    std::fs::create_dir_all(&init.dir)?;
+                    let ca = tls::generate_network_ca(&init.name, init.days)?;
+                    tls::ca::write_network_ca(&paths, &ca, init.force)?;
+                    println!("Created network CA in {}", init.dir.display());
+                    println!("  cert: {}", paths.cert_path.display());
+                    println!("  key:  {} (keep this on this machine only)", paths.key_path.display());
+                    println!("  fingerprint: {}", ca.fingerprint);
+                    println!();
+                    println!("Pin this root on every node:");
+                    println!("  tls_pinned_ca_fingerprints = [\"{}\"]", ca.fingerprint);
+                    Ok(())
+                }
+                CaCommand::Show(show) => {
+                    let paths = tls::CaPaths::in_dir(&show.dir);
+                    let (_, fingerprint) = tls::ca::read_ca_cert(&paths)?;
+                    println!("cert:        {}", paths.cert_path.display());
+                    println!("fingerprint: {fingerprint}");
+                    println!(
+                        "key present: {}",
+                        if paths.key_path.exists() { "yes" } else { "no" }
+                    );
+                    Ok(())
+                }
+                CaCommand::Request(req) => {
+                    let cfg = cli.resolve_app_config_allow_empty_shares()?;
+                    let name = req.name.clone().unwrap_or_else(|| cfg.pc_name.clone());
+                    for path in [&req.csr_out, &req.key_out] {
+                        if path.exists() && !req.force {
+                            anyhow::bail!(
+                                "{} already exists (pass --force to overwrite)",
+                                path.display()
+                            );
+                        }
+                    }
+                    let csr = tls::generate_node_csr(&name)?;
+                    write_file_atomic(&req.csr_out, csr.csr_pem.as_bytes())?;
+                    if req.key_out.exists() {
+                        std::fs::remove_file(&req.key_out)?;
+                    }
+                    utilities::write_secret_file_atomic(&req.key_out, csr.key_pem.as_bytes())?;
+                    println!("Generated a certificate request for '{name}'");
+                    println!("  csr: {}", req.csr_out.display());
+                    println!("  key: {} (never send this anywhere)", req.key_out.display());
+                    println!();
+                    println!("Send only the CSR to the CA machine, then run there:");
+                    println!(
+                        "  localbox ca sign --csr <csr> --name {name} --out {name}.chain.pem"
+                    );
+                    Ok(())
+                }
+                CaCommand::Sign(sign) => {
+                    if sign.out.exists() && !sign.force {
+                        anyhow::bail!(
+                            "{} already exists (pass --force to overwrite)",
+                            sign.out.display()
+                        );
+                    }
+                    let paths = tls::CaPaths::in_dir(&sign.dir);
+                    let signer = tls::load_ca_signer(&paths)?;
+                    let csr_pem = std::fs::read_to_string(&sign.csr)
+                        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", sign.csr.display()))?;
+                    let chain = tls::sign_node_csr(&signer, &csr_pem, &sign.name, sign.days)?;
+                    write_file_atomic(&sign.out, chain.as_bytes())?;
+                    println!(
+                        "Signed a {}-day certificate for '{}' -> {}",
+                        sign.days,
+                        sign.name,
+                        sign.out.display()
+                    );
+                    println!("Issued by root {}", signer.fingerprint);
+                    Ok(())
+                }
+                CaCommand::Token(token) => {
+                    let issued = tls::issue_token(&token.dir, &token.name, token.ttl_secs)?;
+                    println!(
+                        "Enrollment token for '{}' (valid {}s, single use):",
+                        token.name, token.ttl_secs
+                    );
+                    println!();
+                    println!("  {}", issued.encode());
+                    println!();
+                    println!("On {}, run:", token.name);
+                    println!(
+                        "  localbox enroll --server <this-host>:{} --token <token> --pin",
+                        tls::DEFAULT_ENROLL_PORT
+                    );
+                    Ok(())
+                }
+                CaCommand::Serve(serve) => {
+                    let listen = serve.listen.unwrap_or_else(|| {
+                        SocketAddr::new(
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                            tls::DEFAULT_ENROLL_PORT,
+                        )
+                    });
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let shutdown = cancel.clone();
+                    tokio::spawn(async move {
+                        if tokio::signal::ctrl_c().await.is_ok() {
+                            shutdown.cancel();
+                        }
+                    });
+                    println!("Serving enrollment on {listen} (Ctrl-C to stop)");
+                    tls::enroll::serve(&serve.dir, listen, serve.days, cancel).await
+                }
+                CaCommand::ProvisionShared(shared) => {
+                    let paths = tls::CaPaths::in_dir(&shared.dir);
+                    let signer = tls::load_ca_signer(&paths)?;
+                    let bundle =
+                        tls::ca::issue_shared_bundle(&signer, &shared.name, shared.days)?;
+
+                    std::fs::create_dir_all(&shared.out_dir)?;
+                    let chain_out = shared.out_dir.join("shared.chain.pem");
+                    let key_out = shared.out_dir.join("shared.key.pem");
+                    let ca_out = shared.out_dir.join("ca.cert.pem");
+                    for path in [&chain_out, &key_out, &ca_out] {
+                        if path.exists() && !shared.force {
+                            anyhow::bail!(
+                                "{} already exists (pass --force to overwrite)",
+                                path.display()
+                            );
+                        }
+                    }
+                    write_file_atomic(&chain_out, bundle.chain_pem.as_bytes())?;
+                    if key_out.exists() {
+                        std::fs::remove_file(&key_out)?;
+                    }
+                    utilities::write_secret_file_atomic(&key_out, bundle.key_pem.as_bytes())?;
+                    write_file_atomic(&ca_out, bundle.ca_pem.as_bytes())?;
+
+                    println!("Wrote a shared bundle to {}", shared.out_dir.display());
+                    println!("  chain: {}", chain_out.display());
+                    println!("  key:   {}", key_out.display());
+                    println!("  ca:    {} ({})", ca_out.display(), bundle.ca_fingerprint);
+                    println!();
+                    println!("WARNING: every node given this bundle presents the same certificate.");
+                    println!("Peers cannot tell each other apart, and anyone who obtains it can act");
+                    println!("as any node. Prefer `localbox ca token` + `localbox enroll` instead.");
+                    println!();
+                    println!("On each node, copy the bundle over and run:");
+                    println!(
+                        "  localbox ca install --chain shared.chain.pem --key shared.key.pem --pin"
+                    );
+                    println!("then set in config.toml:");
+                    println!("  tls_insecure_shared_cert = true");
+                    Ok(())
+                }
+                CaCommand::Install(install) => {
+                    let cfg = cli.resolve_app_config_allow_empty_shares()?;
+                    let chain = std::fs::read_to_string(&install.chain).map_err(|e| {
+                        anyhow::anyhow!("failed to read {}: {e}", install.chain.display())
+                    })?;
+                    let key = std::fs::read_to_string(&install.key).map_err(|e| {
+                        anyhow::anyhow!("failed to read {}: {e}", install.key.display())
+                    })?;
+                    let ca_pem = tls::ca::ca_pem_from_chain(&chain)?;
+                    let result = tls::install_node_materials(&cfg, &chain, &key, &ca_pem)?;
+                    println!("Installed certificate for this node");
+                    println!(
+                        "  leaf: {} ({})",
+                        cfg.tls_cert_path.display(),
+                        result.leaf_fingerprint
+                    );
+                    println!("  key:  {}", cfg.tls_key_path.display());
+                    println!(
+                        "  trust store: {} ({} CA cert(s) added)",
+                        cfg.tls_ca_cert_path.display(),
+                        result.ca_certs_added
+                    );
+                    if install.pin {
+                        let config_path = cli
+                            .config
+                            .clone()
+                            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+                        if tls::ca::pin_ca_in_config(&config_path, &result.ca_fingerprint)? {
+                            println!(
+                                "  pinned root {} in {}",
+                                result.ca_fingerprint,
+                                config_path.display()
+                            );
+                        } else {
+                            println!("  root {} was already pinned", result.ca_fingerprint);
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        }
+        Command::Enroll(args) => {
+            let cfg = cli.resolve_app_config_allow_empty_shares()?;
+            let server = args
+                .server
+                .to_socket_addrs()
+                .map_err(|e| anyhow::anyhow!("could not resolve {}: {e}", args.server))?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("{} resolved to no addresses", args.server))?;
+
+            let enrolled = tls::enroll::enroll(server, &args.token, &cfg.pc_name).await?;
+            if enrolled.node_name != cfg.pc_name && !args.force {
+                anyhow::bail!(
+                    "the token issued a certificate for '{}' but this machine is '{}'; peers \
+                     identify each other by hostname, so this certificate would be rejected. \
+                     Re-issue with `localbox ca token --name {}` (or pass --force).",
+                    enrolled.node_name,
+                    cfg.pc_name,
+                    cfg.pc_name
+                );
+            }
+
+            let result = tls::install_node_materials(
+                &cfg,
+                &enrolled.chain_pem,
+                &enrolled.key_pem,
+                &enrolled.ca_pem,
+            )?;
+            println!("Enrolled as '{}'", enrolled.node_name);
+            println!(
+                "  leaf: {} ({})",
+                cfg.tls_cert_path.display(),
+                result.leaf_fingerprint
+            );
+            println!("  key:  {}", cfg.tls_key_path.display());
+            println!(
+                "  trust store: {} ({} CA cert(s) added)",
+                cfg.tls_ca_cert_path.display(),
+                result.ca_certs_added
+            );
+            if args.pin {
+                let config_path = cli
+                    .config
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+                if tls::ca::pin_ca_in_config(&config_path, &enrolled.ca_fingerprint)? {
+                    println!(
+                        "  pinned root {} in {}",
+                        enrolled.ca_fingerprint,
+                        config_path.display()
+                    );
+                } else {
+                    println!("  root {} was already pinned", enrolled.ca_fingerprint);
+                }
+            } else {
+                println!();
+                println!(
+                    "Tip: re-run with --pin to restrict trust to this root ({}).",
+                    enrolled.ca_fingerprint
+                );
+            }
+            Ok(())
+        }
         Command::Bootstrap(args) => {
             let cfg = cli.resolve_app_config_allow_empty_shares()?;
             match &args.command {
@@ -605,6 +953,97 @@ async fn main() -> anyhow::Result<()> {
                     println!("Distribute the CA + snippet to peers so they can pin this node.");
                     Ok(())
                 }
+            }
+        }
+    }
+}
+
+fn resolve_control_socket(cli: &Cli, override_sock: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(p) = override_sock {
+        return Ok(p);
+    }
+    let cfg = cli.resolve_app_config_allow_empty_shares()?;
+    Ok(cfg.control_socket)
+}
+
+fn print_control_resp(resp: &localbox_core::service::ControlResponse) {
+    if resp.ok {
+        println!("{}", resp.message);
+        if let Some(data) = &resp.data {
+            println!("{}", serde_json::to_string_pretty(data).unwrap_or_default());
+        }
+    } else {
+        eprintln!("error: {}", resp.message);
+    }
+}
+
+async fn handle_chat_command(
+    cli: &Cli,
+    args: &localbox_core::config::ChatArgs,
+) -> anyhow::Result<()> {
+    match &args.command {
+        ChatCommand::Send(a) => {
+            let sock = resolve_control_socket(cli, a.socket.clone())?;
+            let resp = send_control_request(
+                &sock,
+                &ControlRequest::ChatSend {
+                    peer: a.peer.clone(),
+                    share: a.share.clone(),
+                    thread: a.thread.clone(),
+                    message: a.message.clone(),
+                    file: a.file.clone(),
+                    share_dest: a.share_dest.clone(),
+                },
+            )
+            .await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
+            }
+        }
+        ChatCommand::Inbox(a) | ChatCommand::Threads(a) => {
+            let sock = resolve_control_socket(cli, a.socket.clone())?;
+            let resp = send_control_request(&sock, &ControlRequest::ChatInbox).await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
+            }
+        }
+        ChatCommand::Show(a) => {
+            let sock = resolve_control_socket(cli, a.socket.clone())?;
+            let resp = send_control_request(
+                &sock,
+                &ControlRequest::ChatShow {
+                    thread: a.thread.clone(),
+                    limit: a.limit,
+                },
+            )
+            .await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
+            }
+        }
+        ChatCommand::Read(a) => {
+            let sock = resolve_control_socket(cli, a.socket.clone())?;
+            let resp = send_control_request(
+                &sock,
+                &ControlRequest::ChatRead {
+                    thread: a.thread.clone(),
+                },
+            )
+            .await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
             }
         }
     }

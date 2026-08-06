@@ -1,11 +1,17 @@
 use anyhow::Result;
-use models::{BatchAck, BatchManifest, ChangeKind, FileChange, FileChunk, FileMeta, WireMessage};
+use models::{
+    BatchAck, BatchManifest, ChangeKind, ChatAck, ChatAttachment, ChatMessage, FileChange,
+    FileChunk, FileMeta, ThreadKind, TransferPushOffer, TransferReply, TransferReplyStatus,
+    TransferRequest, WireMessage,
+};
 use prost::Message;
 
 use crate::proto::{
     wire_envelope::Msg as ProtoMsg, BatchAck as ProtoBatchAck, BatchManifest as ProtoBatch,
-    ChangeKind as ProtoChange, FileChange as ProtoFileChange, FileChunk as ProtoFileChunk,
-    FileMeta as ProtoFileMeta, Hello as ProtoHello, WireEnvelope,
+    ChangeKind as ProtoChange, ChatAck as ProtoChatAck, ChatMessage as ProtoChatMessage,
+    FileChange as ProtoFileChange, FileChunk as ProtoFileChunk, FileMeta as ProtoFileMeta,
+    Hello as ProtoHello, TransferPushOffer as ProtoTransferPushOffer,
+    TransferReply as ProtoTransferReply, TransferRequest as ProtoTransferRequest, WireEnvelope,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +161,7 @@ pub fn encode_wire_message_proto(msg: &WireMessage) -> Result<Vec<u8>> {
             msg: Some(ProtoMsg::BatchAck(ProtoBatchAck {
                 share_id: a.share_id.0.to_vec(),
                 upto_seq: a.upto_seq,
+                batch_id: a.batch_id.clone().unwrap_or_default(),
             })),
         },
         WireMessage::FileChunk(chunk) => WireEnvelope {
@@ -164,6 +171,63 @@ pub fn encode_wire_message_proto(msg: &WireMessage) -> Result<Vec<u8>> {
                 offset: chunk.offset,
                 data: chunk.data.clone(),
                 eof: chunk.eof,
+                batch_id: chunk.batch_id.clone(),
+            })),
+        },
+        WireMessage::TransferRequest(r) => WireEnvelope {
+            msg: Some(ProtoMsg::TransferRequest(ProtoTransferRequest {
+                request_id: r.request_id.clone(),
+                share_name: r.share_name.clone(),
+                share_id: r.share_id.0.to_vec(),
+                paths: r.paths.clone(),
+                since_seq: r.since_seq,
+                from_pc: r.from_pc.clone(),
+                from_instance: r.from_instance.clone(),
+            })),
+        },
+        WireMessage::TransferReply(r) => WireEnvelope {
+            msg: Some(ProtoMsg::TransferReply(ProtoTransferReply {
+                request_id: r.request_id.clone(),
+                accepted: matches!(r.status, TransferReplyStatus::Accept),
+                reason: r.reason.clone().unwrap_or_default(),
+            })),
+        },
+        WireMessage::TransferPushOffer(o) => WireEnvelope {
+            msg: Some(ProtoMsg::TransferPushOffer(ProtoTransferPushOffer {
+                offer_id: o.offer_id.clone(),
+                share_name: o.share_name.clone(),
+                share_id: o.share_id.0.to_vec(),
+                paths: o.paths.clone(),
+                from_pc: o.from_pc.clone(),
+                from_instance: o.from_instance.clone(),
+            })),
+        },
+        WireMessage::ChatMessage(m) => WireEnvelope {
+            msg: Some(ProtoMsg::ChatMessage(ProtoChatMessage {
+                thread_id: m.thread_id.clone(),
+                message_id: m.message_id.clone(),
+                thread_kind: m.thread_kind.as_str().to_string(),
+                peer_key: m.peer_key.clone().unwrap_or_default(),
+                share_name: m.share_name.clone().unwrap_or_default(),
+                from_pc: m.from_pc.clone(),
+                from_instance: m.from_instance.clone(),
+                body: m.body.clone(),
+                attachment_share: m
+                    .attachment
+                    .as_ref()
+                    .map(|a| a.share_name.clone())
+                    .unwrap_or_default(),
+                attachment_path: m
+                    .attachment
+                    .as_ref()
+                    .map(|a| a.path.clone())
+                    .unwrap_or_default(),
+                created_at: m.created_at,
+            })),
+        },
+        WireMessage::ChatAck(a) => WireEnvelope {
+            msg: Some(ProtoMsg::ChatAck(ProtoChatAck {
+                message_id: a.message_id.clone(),
             })),
         },
     };
@@ -193,15 +257,95 @@ pub fn decode_wire_message_proto(bytes: &[u8]) -> Result<WireMessage> {
             protocol_version: models::WIRE_PROTOCOL_VERSION,
             share_id: models::ShareId(proto_share_id_to_array(&a.share_id)?),
             upto_seq: a.upto_seq,
+            batch_id: if a.batch_id.is_empty() {
+                None
+            } else {
+                Some(a.batch_id)
+            },
         })),
         Some(ProtoMsg::FileChunk(fc)) => Ok(WireMessage::FileChunk(FileChunk {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
+            batch_id: fc.batch_id,
             share_id: models::ShareId(proto_share_id_to_array(&fc.share_id)?),
             path: fc.path,
             offset: fc.offset,
             data: fc.data,
             eof: fc.eof,
         })),
+        Some(ProtoMsg::TransferRequest(r)) => Ok(WireMessage::TransferRequest(TransferRequest {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
+            request_id: r.request_id,
+            share_name: r.share_name,
+            share_id: if r.share_id.is_empty() {
+                models::ShareId([0u8; 16])
+            } else {
+                models::ShareId(proto_share_id_to_array(&r.share_id)?)
+            },
+            paths: r.paths,
+            since_seq: r.since_seq,
+            from_pc: r.from_pc,
+            from_instance: r.from_instance,
+        })),
+        Some(ProtoMsg::TransferReply(r)) => Ok(WireMessage::TransferReply(TransferReply {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
+            request_id: r.request_id,
+            status: if r.accepted {
+                TransferReplyStatus::Accept
+            } else {
+                TransferReplyStatus::Decline
+            },
+            reason: if r.reason.is_empty() {
+                None
+            } else {
+                Some(r.reason)
+            },
+        })),
+        Some(ProtoMsg::ChatMessage(m)) => {
+            let attachment = match (empty_to_none(m.attachment_share), empty_to_none(m.attachment_path))
+            {
+                (Some(share_name), Some(path)) => Some(ChatAttachment { share_name, path }),
+                _ => None,
+            };
+            Ok(WireMessage::ChatMessage(ChatMessage {
+                protocol_version: models::WIRE_PROTOCOL_VERSION,
+                thread_id: m.thread_id,
+                message_id: m.message_id,
+                thread_kind: ThreadKind::parse(&m.thread_kind).unwrap_or(ThreadKind::Peer),
+                peer_key: empty_to_none(m.peer_key),
+                share_name: empty_to_none(m.share_name),
+                from_pc: m.from_pc,
+                from_instance: m.from_instance,
+                body: m.body,
+                attachment,
+                created_at: m.created_at,
+            }))
+        }
+        Some(ProtoMsg::ChatAck(a)) => Ok(WireMessage::ChatAck(ChatAck {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
+            message_id: a.message_id,
+        })),
+        Some(ProtoMsg::TransferPushOffer(o)) => Ok(WireMessage::TransferPushOffer(TransferPushOffer {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
+            offer_id: o.offer_id,
+            share_name: o.share_name,
+            share_id: if o.share_id.is_empty() {
+                models::ShareId([0u8; 16])
+            } else {
+                models::ShareId(proto_share_id_to_array(&o.share_id)?)
+            },
+            paths: o.paths,
+            from_pc: o.from_pc,
+            from_instance: o.from_instance,
+        })),
         None => anyhow::bail!("empty wire envelope"),
+    }
+}
+
+fn empty_to_none(s: String) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
     }
 }
 
@@ -212,6 +356,7 @@ pub fn encode_file_chunk_proto(chunk: &FileChunk) -> Result<Vec<u8>> {
         offset: chunk.offset,
         data: chunk.data.clone(),
         eof: chunk.eof,
+        batch_id: chunk.batch_id.clone(),
     };
     let env = WireEnvelope {
         msg: Some(ProtoMsg::FileChunk(proto)),
@@ -223,6 +368,8 @@ pub fn decode_file_chunk_proto(bytes: &[u8]) -> Result<FileChunk> {
     let env = WireEnvelope::decode(bytes)?;
     match env.msg {
         Some(ProtoMsg::FileChunk(fc)) => Ok(FileChunk {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
+            batch_id: fc.batch_id,
             share_id: models::ShareId(proto_share_id_to_array(&fc.share_id)?),
             path: fc.path,
             offset: fc.offset,

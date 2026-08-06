@@ -31,6 +31,13 @@ pub struct FileChange {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileChunk {
+    /// Wire protocol version (defaulted for legacy peers).
+    #[serde(default = "default_wire_protocol_version")]
+    pub protocol_version: u16,
+    /// Links payload chunks to the preceding `BatchManifest.batch_id`.
+    /// Empty string = legacy peers that omit the field. Intent ids stay DB-local.
+    #[serde(default)]
+    pub batch_id: String,
     pub share_id: ShareId,
     pub path: String,
     pub offset: u64,

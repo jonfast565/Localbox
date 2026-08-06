@@ -33,6 +33,7 @@ fn pinning_blocks_auto_generation() {
         tls_ca_cert_path: PathBuf::from("trust.pem"),
         tls_pinned_ca_fingerprints: vec!["AA".to_string()],
         tls_peer_fingerprints: std::collections::HashMap::new(),
+            tls_insecure_shared_cert: false,
         remote_share_root: PathBuf::from("remote"),
         shares: vec![ShareConfig {
             name: "s".to_string(),
@@ -40,8 +41,14 @@ fn pinning_blocks_auto_generation() {
             recursive: true,
             ignore_patterns: Vec::new(),
             max_file_size_bytes: None,
+            push: Default::default(),
+            pull: Default::default(),
+            request_handling: None,
         }],
         app_state: ApplicationState::MirrorHost,
+        request_handling: Default::default(),
+        peer_policies: Vec::new(),
+        control_socket: std::path::PathBuf::from("localbox.sock"),
     };
 
     let res = tls::TlsComponents::from_config(&cfg, fs.as_ref());
@@ -93,6 +100,7 @@ fn pinning_allows_matching_ca() {
         tls_ca_cert_path: PathBuf::from("trust.pem"),
         tls_pinned_ca_fingerprints: vec![ca_fp],
         tls_peer_fingerprints: std::collections::HashMap::new(),
+            tls_insecure_shared_cert: false,
         remote_share_root: PathBuf::from("remote"),
         shares: vec![ShareConfig {
             name: "s".to_string(),
@@ -100,8 +108,14 @@ fn pinning_allows_matching_ca() {
             recursive: true,
             ignore_patterns: Vec::new(),
             max_file_size_bytes: None,
+            push: Default::default(),
+            pull: Default::default(),
+            request_handling: None,
         }],
         app_state: ApplicationState::MirrorHost,
+        request_handling: Default::default(),
+        peer_policies: Vec::new(),
+        control_socket: std::path::PathBuf::from("localbox.sock"),
     };
 
     tls::TlsComponents::from_config(&cfg, fs.as_ref()).unwrap();

@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use db::Db;
-use models::{AppConfig, BatchManifest, ChangeKind, FileChange, FileMeta, ShareContext};
+use models::{AppConfig, ChangeKind, FileChange, FileMeta, ShareContext};
+use peering::PeerCommand;
 use notify::{
     event::ModifyKind, event::RenameMode, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
@@ -20,8 +21,6 @@ use tracing::{error, info, warn};
 use utilities::compute_file_hash;
 use utilities::disk_utilities::build_meta_with_retry_limited;
 use utilities::{init_logging, FileSystem, Net, RealFileSystem, RealNet};
-use uuid::Uuid;
-
 const APP_BANNER: &str = r#"
        ,gggg,                                           ,ggggggggggg,                           
       d8" "8I                                    ,dPYb,dP"""88""""""Y8,                         
@@ -127,9 +126,11 @@ impl Engine {
             .map(|s| (s.share_id.0, s.share_name.clone()))
             .collect();
         let share_names: HashMap<[u8; 16], String> = share_labels.clone();
+        let cfg = self.cfg.clone();
 
         tokio::spawn(change_aggregator_task(
             db,
+            cfg,
             agg_window_ms,
             net_tx,
             from_node,
@@ -138,6 +139,22 @@ impl Engine {
             rx,
             token,
         ));
+    }
+
+    pub fn db_handle(&self) -> Arc<Mutex<Db>> {
+        Arc::clone(&self.db)
+    }
+
+    pub fn config(&self) -> &AppConfig {
+        &self.cfg
+    }
+
+    pub fn shares(&self) -> &[ShareContext] {
+        &self.shares
+    }
+
+    pub fn net_tx(&self) -> mpsc::Sender<String> {
+        self.net_tx.clone()
     }
 
     fn start_watchers(&self, token: CancellationToken) {
@@ -161,10 +178,34 @@ impl Engine {
         self.run_with_token(token).await
     }
 
-    pub async fn run_with_token(mut self, token: CancellationToken) -> Result<()> {
+    pub async fn run_with_token(self, token: CancellationToken) -> Result<()> {
+        let (cmd_tx, cmd_rx) = mpsc::channel::<PeerCommand>(256);
+        self.run_inner(token, cmd_rx, Some(cmd_tx), true, None)
+            .await
+    }
+
+    /// Run engine with an existing peer-command channel and optional in-process shell.
+    pub async fn run_with_peer_commands(
+        self,
+        token: CancellationToken,
+        cmd_tx: mpsc::Sender<PeerCommand>,
+        cmd_rx: mpsc::Receiver<PeerCommand>,
+        interactive: bool,
+    ) -> Result<()> {
+        self.run_inner(token, cmd_rx, Some(cmd_tx), true, Some(interactive))
+            .await
+    }
+
+    async fn run_inner(
+        mut self,
+        token: CancellationToken,
+        cmd_rx: mpsc::Receiver<PeerCommand>,
+        cmd_tx: Option<mpsc::Sender<PeerCommand>>,
+        start_control: bool,
+        interactive: Option<bool>,
+    ) -> Result<()> {
         info!("Engine running");
 
-        // Start filesystem watchers for each share
         self.start_watchers(token.clone());
 
         if let Some(rx) = self.change_rx.take() {
@@ -180,7 +221,6 @@ impl Engine {
             self.net.clone(),
         )?;
 
-        // Periodic cleanup of old batches.
         let cleanup_task = tokio::spawn(cleanup_old_batches_task(
             Arc::clone(&self.db),
             token.clone(),
@@ -188,15 +228,74 @@ impl Engine {
 
         let net_rx = self.net_rx.take().expect("net_rx must be present");
 
-        // Run peering (discovery + TCP listener + outbound sender).
-        let peering_task = tokio::spawn(run_peering(peer_mgr, net_rx, token.clone()));
+        let peering_task = {
+            let token = token.clone();
+            tokio::spawn(async move {
+                if let Err(e) = peer_mgr.run_with_commands(net_rx, cmd_rx, token).await {
+                    error!("PeerManager exited with error: {e}");
+                }
+            })
+        };
+
+        let control_task = if start_control {
+            if let Some(cmd_tx) = cmd_tx.clone() {
+                let cfg = self.cfg.clone();
+                let db = Arc::clone(&self.db);
+                let net_tx = self.net_tx.clone();
+                let token = token.clone();
+                Some(tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::control::run_control_server(cfg, db, net_tx, cmd_tx, token).await
+                    {
+                        error!("Control server exited: {e}");
+                    }
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let shell_task = if interactive.unwrap_or(false) {
+            if let Some(cmd_tx) = cmd_tx {
+                let cfg = self.cfg.clone();
+                let db = Arc::clone(&self.db);
+                let net_tx = self.net_tx.clone();
+                let token = token.clone();
+                Some(tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::shell::run_inprocess_shell(cfg, db, net_tx, cmd_tx, token).await
+                    {
+                        error!("Interactive shell exited: {e}");
+                    }
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         tokio::select! {
             _ = token.cancelled() => {
                 info!("Engine cancellation requested");
             }
             _ = async {
-                let _ = tokio::join!(cleanup_task, peering_task);
+                match (control_task, shell_task) {
+                    (Some(c), Some(s)) => {
+                        let _ = tokio::join!(cleanup_task, peering_task, c, s);
+                    }
+                    (Some(c), None) => {
+                        let _ = tokio::join!(cleanup_task, peering_task, c);
+                    }
+                    (None, Some(s)) => {
+                        let _ = tokio::join!(cleanup_task, peering_task, s);
+                    }
+                    (None, None) => {
+                        let _ = tokio::join!(cleanup_task, peering_task);
+                    }
+                }
             } => {}
         }
         Ok(())
@@ -298,12 +397,13 @@ fn group_pending_by_share(pending: &mut Vec<FileChange>) -> HashMap<[u8; 16], Ve
 
 async fn process_share_changes(
     db: &Arc<Mutex<Db>>,
+    cfg: &AppConfig,
     share_names: &HashMap<[u8; 16], String>,
     from_node: &str,
     share_key: [u8; 16],
-    changes: Vec<FileChange>,
+    _changes: Vec<FileChange>,
     net_tx: &mpsc::Sender<String>,
-    created_at: i64,
+    _created_at: i64,
     share_labels: &HashMap<[u8; 16], String>,
 ) {
     let share_id = models::ShareId(share_key);
@@ -315,94 +415,61 @@ async fn process_share_changes(
         .unwrap_or_default();
 
     if peer_ids.is_empty() {
-        enqueue_batch(
-            db,
-            &share_id,
-            from_node,
-            &changes,
-            created_at,
-            None,
-            net_tx,
-            share_labels,
-        )
-        .await;
         return;
     }
 
+    let label = format_share_label(&share_id, share_labels);
     for pid in peer_ids {
-        enqueue_batch(
-            db,
-            &share_id,
-            from_node,
-            &changes,
-            created_at,
-            Some(pid),
-            net_tx,
-            share_labels,
-        )
-        .await;
-    }
-}
-
-async fn enqueue_batch(
-    db: &Arc<Mutex<Db>>,
-    share_id: &models::ShareId,
-    from_node: &str,
-    changes: &[FileChange],
-    created_at: i64,
-    peer_id: Option<i64>,
-    net_tx: &mpsc::Sender<String>,
-    share_labels: &HashMap<[u8; 16], String>,
-) {
-    const MAX_OUTBOUND_QUEUE_DEPTH: i64 = 50_000;
-    const MAX_CHANGES_PER_BATCH: usize = 256;
-
-    let queue_depth = db.lock().await.outbound_queue_depth().unwrap_or(0);
-    if queue_depth >= MAX_OUTBOUND_QUEUE_DEPTH {
-        warn!(
-            "Outbound queue depth {} exceeds limit {}; dropping {} changes for share {:?}",
-            queue_depth,
-            MAX_OUTBOUND_QUEUE_DEPTH,
-            changes.len(),
-            share_id.0
-        );
-        return;
-    }
-
-    let label = format_share_label(share_id, share_labels);
-    for chunk in changes.chunks(MAX_CHANGES_PER_BATCH) {
-        let batch_id = Uuid::new_v4().to_string();
-        let manifest = BatchManifest {
-            protocol_version: models::WIRE_PROTOCOL_VERSION,
-            batch_id: batch_id.clone(),
-            share_id: *share_id,
-            from_node: from_node.to_string(),
-            created_at,
-            changes: chunk.to_vec(),
+        let peer_key = {
+            let guard = db.lock().await;
+            guard.get_peer(pid).ok().flatten().map(|p| {
+                format!("{}@{}", p.pc_name, p.instance_id)
+            })
         };
-
-        if let Err(e) = db.lock().await.enqueue_outbound_batch(&manifest, peer_id) {
-            match peer_id {
-                Some(pid) => error!("Failed to queue batch {batch_id} for peer {pid}: {e}"),
-                None => error!("Failed to queue batch {batch_id} for outbound: {e}"),
-            }
+        if !cfg
+            .resolve_push_mode(&share_name, peer_key.as_deref())
+            .is_auto()
+        {
             continue;
         }
-
-        let _ = net_tx.try_send(batch_id.clone());
-        match peer_id {
-            Some(pid) => info!(
-                "Aggregated {} changes into batch {} for share {} targeting peer {}",
-                chunk.len(),
-                batch_id,
-                label,
-                pid
-            ),
-            None => info!(
-                "Aggregated {} changes into batch {} for share {} (no peers yet)",
-                chunk.len(),
-                batch_id,
-                label
+        let (from_seq, to_seq) = {
+            let guard = db.lock().await;
+            let Ok(share_row_id) = guard.get_share_row_id_by_share_id(&share_id) else {
+                continue;
+            };
+            let (_, last_acked) = guard.get_peer_progress(pid, share_row_id).unwrap_or((0, 0));
+            let max_seq = guard.max_change_seq(share_row_id).unwrap_or(0);
+            (last_acked, max_seq)
+        };
+        if to_seq <= from_seq {
+            continue;
+        }
+        match db.lock().await.create_and_materialize_intent(
+            models::IntentKind::SyncCatchup,
+            models::IntentOrigin::AutoPush,
+            &share_name,
+            share_id,
+            Some(pid),
+            models::IntentBasis::JournalRange { from_seq, to_seq },
+            None,
+            from_node,
+        ) {
+            Ok((intent_id, batch_ids)) => {
+                for bid in &batch_ids {
+                    let _ = net_tx.try_send(bid.clone());
+                }
+                info!(
+                    intent_id = %intent_id,
+                    peer_id = pid,
+                    share = %label,
+                    from_seq,
+                    to_seq,
+                    batches = batch_ids.len(),
+                    "Queued SyncCatchup intent from share journal"
+                );
+            }
+            Err(e) => error!(
+                "Failed SyncCatchup intent for peer {pid} share {label}: {e}"
             ),
         }
     }
@@ -699,6 +766,7 @@ fn watch_share_blocking(
 
 async fn change_aggregator_task(
     db: Arc<Mutex<Db>>,
+    cfg: AppConfig,
     agg_window_ms: u64,
     net_tx: mpsc::Sender<String>,
     from_node: String,
@@ -720,8 +788,9 @@ async fn change_aggregator_task(
                 };
 
                 let label = format_share_label(&change.share_id, &share_labels);
+                // Always persist to ShareJournal; SyncCatchup intents are gated by push policy.
                 if let Some(change) = persist_incoming_change(&db, change).await {
-                    info!("Queued change for share {}: {}", label, change.path);
+                    info!("Logged change for share {}: {}", label, change.path);
                     if pending.len() >= MAX_PENDING_CHANGES {
                         warn!(
                             "Dropping change due to pending buffer limit ({}): {}",
@@ -745,6 +814,7 @@ async fn change_aggregator_task(
                 for (share_key, changes) in per_share {
                     process_share_changes(
                         &db,
+                        &cfg,
                         &share_names,
                         &from_node,
                         share_key,

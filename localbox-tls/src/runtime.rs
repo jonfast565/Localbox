@@ -15,7 +15,9 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use utilities::{write_atomic, FileSystem};
+use webpki::{EndEntityCert, SubjectNameRef};
 
+use std::convert::TryFrom;
 use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -29,8 +31,8 @@ pub struct TlsComponents {
 
 impl TlsComponents {
     pub fn from_config(cfg: &AppConfig, fs: &dyn FileSystem) -> Result<Self> {
-        let (certs, key, ca_store) = match load_tls_from_files(cfg, fs) {
-            Ok(tuple) => tuple,
+        let loaded = match load_tls_from_files(cfg, fs) {
+            Ok(loaded) => loaded,
             Err(e) => {
                 if !cfg.tls_pinned_ca_fingerprints.is_empty() {
                     return Err(e).context(
@@ -45,9 +47,25 @@ impl TlsComponents {
                 if let Err(write_err) = persist_tls_materials(cfg, &generated, fs) {
                     warn!("Could not write generated TLS materials to disk: {write_err}");
                 }
-                (generated.cert_chain, generated.key, generated.ca_store)
+                let ca_ders = {
+                    let mut reader =
+                        BufReader::new(std::io::Cursor::new(generated.ca_pem.as_bytes()));
+                    rustls_pemfile::certs(&mut reader)?
+                };
+                LoadedTls {
+                    certs: generated.cert_chain,
+                    key: generated.key,
+                    ca_store: generated.ca_store,
+                    ca_ders,
+                }
             }
         };
+        let LoadedTls {
+            certs,
+            key,
+            ca_store,
+            ca_ders,
+        } = loaded;
 
         let cipher_suites = [
             cipher_suite::TLS13_AES_256_GCM_SHA384,
@@ -65,12 +83,23 @@ impl TlsComponents {
             .with_single_cert(certs.clone(), key.clone())?;
         server_config.alpn_protocols.push(b"localbox/1".to_vec());
 
-        let mut client_config = ClientConfig::builder()
+        let client_builder = ClientConfig::builder()
             .with_cipher_suites(&cipher_suites)
             .with_kx_groups(kx_groups)
-            .with_protocol_versions(protocol_versions)?
-            .with_root_certificates(ca_store)
-            .with_client_auth_cert(certs, key)?;
+            .with_protocol_versions(protocol_versions)?;
+        let mut client_config = if cfg.tls_insecure_shared_cert {
+            warn!(
+                "tls_insecure_shared_cert is enabled: peer certificates are checked for a \
+                 trusted issuer but NOT for peer identity, so peers cannot be told apart"
+            );
+            client_builder
+                .with_custom_certificate_verifier(Arc::new(SharedCertServerVerifier { ca_ders }))
+                .with_client_auth_cert(certs, key)?
+        } else {
+            client_builder
+                .with_root_certificates(ca_store)
+                .with_client_auth_cert(certs, key)?
+        };
         client_config.alpn_protocols.push(b"localbox/1".to_vec());
 
         Ok(Self {
@@ -111,10 +140,17 @@ fn load_ca_store(path: &std::path::Path, fs: &dyn FileSystem) -> Result<Vec<Vec<
     Ok(certs)
 }
 
-fn load_tls_from_files(
-    cfg: &AppConfig,
-    fs: &dyn FileSystem,
-) -> Result<(Vec<Certificate>, PrivateKey, RootCertStore)> {
+/// TLS material for one node, in the forms rustls and our own checks each need.
+struct LoadedTls {
+    certs: Vec<Certificate>,
+    key: PrivateKey,
+    ca_store: RootCertStore,
+    /// The trusted CA certificates as raw DER, kept for the checks we perform
+    /// ourselves — `RootCertStore` does not hand its anchors back out.
+    ca_ders: Vec<Vec<u8>>,
+}
+
+fn load_tls_from_files(cfg: &AppConfig, fs: &dyn FileSystem) -> Result<LoadedTls> {
     let certs = load_certs(&cfg.tls_cert_path, fs)
         .with_context(|| format!("loading certs from {}", cfg.tls_cert_path.display()))?;
     let key = load_private_key(&cfg.tls_key_path, fs)
@@ -134,7 +170,76 @@ fn load_tls_from_files(
             cfg.tls_ca_cert_path.display()
         );
     }
-    Ok((certs, key, ca_store))
+    Ok(LoadedTls {
+        certs,
+        key,
+        ca_store,
+        ca_ders: ca_certs,
+    })
+}
+
+/// Signature algorithms accepted when validating a peer chain by hand.
+///
+/// Mirrors rustls's own list, which is not public.
+static SUPPORTED_SIG_ALGS: &[&webpki::SignatureAlgorithm] = &[
+    &webpki::ECDSA_P256_SHA256,
+    &webpki::ECDSA_P256_SHA384,
+    &webpki::ECDSA_P384_SHA256,
+    &webpki::ECDSA_P384_SHA384,
+    &webpki::ED25519,
+    &webpki::RSA_PKCS1_2048_8192_SHA256,
+    &webpki::RSA_PKCS1_2048_8192_SHA384,
+    &webpki::RSA_PKCS1_2048_8192_SHA512,
+    &webpki::RSA_PKCS1_3072_8192_SHA384,
+];
+
+/// Verifies that a server's certificate chains to a trusted CA, but does not
+/// require it to be issued for the host being dialed.
+///
+/// This exists solely for `tls_insecure_shared_cert`, where every node presents
+/// the same certificate and so no certificate can carry the right hostname. The
+/// chain is still verified — an untrusted CA is still refused — but the peer's
+/// *identity* is no longer checked, which is the whole reason that mode is
+/// labelled insecure.
+struct SharedCertServerVerifier {
+    ca_ders: Vec<Vec<u8>>,
+}
+
+impl rustls::client::ServerCertVerifier for SharedCertServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &Certificate,
+        intermediates: &[Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        now: SystemTime,
+    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+        use rustls::{CertificateError, Error as TlsError};
+
+        let anchors = self
+            .ca_ders
+            .iter()
+            .map(|der| webpki::TrustAnchor::try_from_cert_der(der))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| TlsError::InvalidCertificate(CertificateError::BadEncoding))?;
+        let cert = EndEntityCert::try_from(end_entity.0.as_slice())
+            .map_err(|_| TlsError::InvalidCertificate(CertificateError::BadEncoding))?;
+        let intermediate_ders: Vec<&[u8]> = intermediates.iter().map(|c| c.0.as_slice()).collect();
+        let time = webpki::Time::try_from(now).map_err(|_| TlsError::FailedToGetCurrentTime)?;
+
+        cert.verify_for_usage(
+            SUPPORTED_SIG_ALGS,
+            &anchors,
+            &intermediate_ders,
+            time,
+            webpki::KeyUsage::server_auth(),
+            &[],
+        )
+        .map_err(|_| TlsError::InvalidCertificate(CertificateError::UnknownIssuer))?;
+
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
 }
 
 pub struct TlsMaterials {
@@ -268,6 +373,33 @@ pub fn fingerprint_from_certificates(certs: Option<&[Certificate]>) -> Option<St
         .map(|cert| fingerprint_hex(&cert.0))
 }
 
+/// Check that a peer's leaf certificate was actually issued for the node name the
+/// peer claims in its handshake.
+///
+/// Trusting a CA only says "this peer is a member of the network"; it says nothing
+/// about *which* member. Without this binding any node holding a certificate from a
+/// trusted CA could announce itself under another node's `pc_name` and receive that
+/// node's shares.
+pub fn verify_peer_cert_name(certs: Option<&[Certificate]>, claimed_name: &str) -> Result<()> {
+    let Some(leaf) = certs.and_then(|chain| chain.first()) else {
+        bail!("peer claiming to be {claimed_name} presented no TLS certificate");
+    };
+    let cert = EndEntityCert::try_from(leaf.0.as_slice())
+        .map_err(|_| anyhow!("peer {claimed_name} presented an unparseable certificate"))?;
+    let subject = SubjectNameRef::try_from_ascii_str(claimed_name).map_err(|_| {
+        anyhow!(
+            "peer name {claimed_name} is not a valid DNS name or IP address, so its \
+             certificate cannot be bound to it; rename the node or re-issue its \
+             certificate with a matching SAN"
+        )
+    })?;
+    cert.verify_is_valid_for_subject_name(subject)
+        .map_err(|_| {
+            anyhow!("peer certificate is not valid for the claimed node name {claimed_name}")
+        })?;
+    Ok(())
+}
+
 fn pin_certs(certs: Vec<Vec<u8>>, pinned: &[String]) -> Result<Vec<Vec<u8>>> {
     let pinned_set: std::collections::HashSet<String> =
         pinned.iter().map(|s| normalize_fingerprint(s)).collect();
@@ -371,5 +503,67 @@ impl ManagedTls {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chain_for(node: &str) -> Vec<Certificate> {
+        generate_tls_materials(node)
+            .expect("generate TLS materials for name-binding test")
+            .cert_chain
+    }
+
+    #[test]
+    fn peer_cert_name_accepts_matching_node_name() {
+        let chain = chain_for("node-a");
+        verify_peer_cert_name(Some(&chain), "node-a")
+            .expect("certificate issued for node-a must verify for node-a");
+    }
+
+    #[test]
+    fn peer_cert_name_rejects_impersonated_node_name() {
+        let chain = chain_for("node-a");
+        let err = verify_peer_cert_name(Some(&chain), "node-b")
+            .expect_err("node-a's certificate must not satisfy a claim of being node-b");
+        assert!(
+            err.to_string()
+                .contains("not valid for the claimed node name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn peer_cert_name_rejects_missing_certificate() {
+        let err = verify_peer_cert_name(None, "node-a")
+            .expect_err("a peer with no certificate must be rejected");
+        assert!(
+            err.to_string().contains("presented no TLS certificate"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn peer_cert_name_accepts_unusual_but_bindable_hostnames() {
+        // Underscores are irregular in DNS but webpki accepts them as presented
+        // names, so hosts named this way keep working.
+        let chain = chain_for("node_a");
+        verify_peer_cert_name(Some(&chain), "node_a")
+            .expect("an underscore hostname should still bind to its certificate");
+    }
+
+    #[test]
+    fn peer_cert_name_rejects_names_that_cannot_be_bound() {
+        // A name that cannot be expressed as a subject name can never be matched
+        // against a SAN, so it must be rejected rather than waved through.
+        let chain = chain_for("node a");
+        let err = verify_peer_cert_name(Some(&chain), "node a")
+            .expect_err("a name that cannot be expressed as a SAN must be rejected");
+        assert!(
+            err.to_string().contains("is not a valid DNS name"),
+            "unexpected error: {err}"
+        );
     }
 }

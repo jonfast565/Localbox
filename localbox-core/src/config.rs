@@ -1,7 +1,9 @@
 use crate::engine::log_banner;
 use anyhow::{anyhow, Context, Result};
 use clap::{error::ErrorKind, Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use models::{AppConfig, ApplicationState, ShareConfig};
+use models::{
+    AppConfig, ApplicationState, PeerPolicy, ShareConfig, TransferMode,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -19,6 +21,9 @@ const DEFAULT_TLS_CERT_PATH: &str = "certs/localbox.cert.pem";
 const DEFAULT_TLS_KEY_PATH: &str = "certs/localbox.key.pem";
 const DEFAULT_TLS_CA_CERT_PATH: &str = "certs/ca.cert.pem";
 const DEFAULT_REMOTE_SHARE_ROOT: &str = "remote-shares";
+const DEFAULT_CONTROL_SOCKET: &str = "localbox.sock";
+const DEFAULT_CA_DIR: &str = "ca";
+const DEFAULT_CA_NAME: &str = "localbox-network-ca";
 pub const DEFAULT_CONFIG_PATH: &str = "config.toml";
 
 #[derive(Debug, Parser)]
@@ -36,6 +41,22 @@ pub struct Cli {
 pub enum Command {
     /// Run the LocalBox engine with the provided overrides
     Run(RunArgs),
+    /// Attach an interactive shell to a running daemon (or use `run --interactive`)
+    Shell(ShellArgs),
+    /// Alias for shell
+    Interactive(ShellArgs),
+    /// Manually push share changes to peers
+    Push(PushArgs),
+    /// Request/pull share changes from a peer
+    Pull(PullArgs),
+    /// Alias for pull (send TransferRequest)
+    Request(PullArgs),
+    /// Accept or decline a pending inbound transfer request
+    Reply(ReplyArgs),
+    /// List transfer intents (outbox)
+    Intents(IntentsArgs),
+    /// Chat with peers / share threads
+    Chat(ChatArgs),
     /// Generate a config.toml template
     Init(InitArgs),
     /// Validate merged configuration (config.toml + CLI overrides)
@@ -46,10 +67,128 @@ pub enum Command {
     Monitor(MonitorArgs),
     /// TLS trust store operations (CA import/export/fingerprints/rotation)
     Tls(TlsArgs),
+    /// Shared network CA: create a root, sign node certificates, install them
+    Ca(CaArgs),
+    /// Join a network by enrolling with a token (no files to copy)
+    Enroll(EnrollArgs),
     /// Create or accept signed bootstrap invites
     Bootstrap(BootstrapArgs),
     /// Show current status (peers, shares, progress, queue depth) from the local DB
     Status(StatusArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ShellArgs {
+    /// Control socket path (defaults to config / localbox.sock)
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct PushArgs {
+    #[arg(long)]
+    pub share: String,
+    #[arg(long)]
+    pub peer: Option<String>,
+    #[arg(long)]
+    pub path: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct PullArgs {
+    #[arg(long)]
+    pub share: String,
+    #[arg(long)]
+    pub peer: String,
+    #[arg(long)]
+    pub path: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ReplyArgs {
+    #[arg(long)]
+    pub id: String,
+    /// accept or decline
+    pub action: String,
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct IntentsArgs {
+    /// Include completed (acked/failed/declined) intents
+    #[arg(long)]
+    pub all: bool,
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Show a single intent by id
+    #[arg(long)]
+    pub id: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ChatArgs {
+    #[command(subcommand)]
+    pub command: ChatCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ChatCommand {
+    Send(ChatSendArgs),
+    Inbox(ChatSocketArgs),
+    Threads(ChatSocketArgs),
+    Show(ChatShowArgs),
+    Read(ChatReadArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ChatSocketArgs {
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ChatSendArgs {
+    #[arg(long)]
+    pub peer: Option<String>,
+    #[arg(long)]
+    pub share: Option<String>,
+    #[arg(long)]
+    pub thread: Option<String>,
+    #[arg(long)]
+    pub message: Option<String>,
+    #[arg(long)]
+    pub file: Option<String>,
+    #[arg(long)]
+    pub share_dest: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ChatShowArgs {
+    #[arg(long)]
+    pub thread: String,
+    #[arg(long)]
+    pub limit: Option<usize>,
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ChatReadArgs {
+    #[arg(long)]
+    pub thread: String,
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -181,6 +320,191 @@ pub struct BootstrapJoinArgs {
     /// Overwrite files / update config entries if they already exist
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CaArgs {
+    #[command(subcommand)]
+    pub command: CaCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CaCommand {
+    /// Create a network root CA (run once, on the machine that will issue certs)
+    Init(CaInitArgs),
+    /// Print the root CA's fingerprint and validity
+    Show(CaShowArgs),
+    /// Generate a private key + CSR on this machine (the key never leaves it)
+    Request(CaRequestArgs),
+    /// Sign a CSR as a named node, using the root CA
+    Sign(CaSignArgs),
+    /// Install a signed chain + key into this node's configured TLS paths
+    Install(CaInstallArgs),
+    /// Mint a single-use enrollment token for one node
+    Token(CaTokenArgs),
+    /// Serve enrollment requests so new machines can enroll with a token
+    Serve(CaServeArgs),
+    /// INSECURE: issue one certificate for every node to share (no per-node identity)
+    ProvisionShared(CaProvisionSharedArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct CaProvisionSharedArgs {
+    /// Directory holding the CA certificate and key
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_CA_DIR)]
+    pub dir: PathBuf,
+
+    /// Directory to write the shared bundle into
+    #[arg(long, value_name = "DIR")]
+    pub out_dir: PathBuf,
+
+    /// Name to put on the shared certificate
+    #[arg(long, default_value = "localbox-shared")]
+    pub name: String,
+
+    /// Certificate lifetime in days
+    #[arg(long, default_value_t = tls::DEFAULT_LEAF_VALIDITY_DAYS)]
+    pub days: u32,
+
+    /// Overwrite existing files in the output directory
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CaTokenArgs {
+    /// Directory holding the CA certificate and key
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_CA_DIR)]
+    pub dir: PathBuf,
+
+    /// Node name this token authorizes (must match that machine's hostname)
+    #[arg(long)]
+    pub name: String,
+
+    /// How long the token stays valid, in seconds
+    #[arg(long, default_value_t = tls::DEFAULT_TOKEN_TTL_SECS)]
+    pub ttl_secs: i64,
+}
+
+#[derive(Debug, Args)]
+pub struct CaServeArgs {
+    /// Directory holding the CA certificate and key
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_CA_DIR)]
+    pub dir: PathBuf,
+
+    /// Address to listen on for enrollment requests
+    #[arg(long, value_name = "ADDR")]
+    pub listen: Option<SocketAddr>,
+
+    /// Lifetime in days for certificates issued through enrollment
+    #[arg(long, default_value_t = tls::DEFAULT_LEAF_VALIDITY_DAYS)]
+    pub days: u32,
+}
+
+#[derive(Debug, Args)]
+pub struct EnrollArgs {
+    /// Enrollment server address, as host:port
+    #[arg(long, value_name = "HOST:PORT")]
+    pub server: String,
+
+    /// The enrollment token issued by `localbox ca token`
+    #[arg(long)]
+    pub token: String,
+
+    /// Also pin the network root's fingerprint in config.toml (recommended)
+    #[arg(long)]
+    pub pin: bool,
+
+    /// Install even if the issued name differs from this machine's hostname
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CaInitArgs {
+    /// Directory to hold the CA certificate and key
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_CA_DIR)]
+    pub dir: PathBuf,
+
+    /// Common name for the root certificate
+    #[arg(long, default_value = DEFAULT_CA_NAME)]
+    pub name: String,
+
+    /// Root certificate lifetime in days
+    #[arg(long, default_value_t = tls::DEFAULT_CA_VALIDITY_DAYS)]
+    pub days: u32,
+
+    /// Replace an existing CA (invalidates every certificate it has issued)
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CaShowArgs {
+    /// Directory holding the CA certificate
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_CA_DIR)]
+    pub dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct CaRequestArgs {
+    /// Node name to request a certificate for (defaults to this machine's hostname)
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Where to write the certificate signing request
+    #[arg(long, value_name = "PATH", default_value = "request.csr.pem")]
+    pub csr_out: PathBuf,
+
+    /// Where to write the newly generated private key
+    #[arg(long, value_name = "PATH", default_value = "request.key.pem")]
+    pub key_out: PathBuf,
+
+    /// Overwrite existing output files
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CaSignArgs {
+    /// Directory holding the CA certificate and key
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_CA_DIR)]
+    pub dir: PathBuf,
+
+    /// Path to the certificate signing request to sign
+    #[arg(long, value_name = "PATH")]
+    pub csr: PathBuf,
+
+    /// Node name to issue the certificate for (the CSR's own claim is ignored)
+    #[arg(long)]
+    pub name: String,
+
+    /// Where to write the signed leaf + CA chain
+    #[arg(long, value_name = "PATH")]
+    pub out: PathBuf,
+
+    /// Certificate lifetime in days
+    #[arg(long, default_value_t = tls::DEFAULT_LEAF_VALIDITY_DAYS)]
+    pub days: u32,
+
+    /// Overwrite an existing file at --out
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct CaInstallArgs {
+    /// Signed certificate chain (leaf followed by the issuing CA)
+    #[arg(long, value_name = "PATH")]
+    pub chain: PathBuf,
+
+    /// Private key matching the leaf in --chain
+    #[arg(long, value_name = "PATH")]
+    pub key: PathBuf,
+
+    /// Also pin the root CA's fingerprint in config.toml
+    #[arg(long)]
+    pub pin: bool,
 }
 
 #[derive(Debug, Args)]
@@ -322,6 +646,14 @@ pub struct RunArgs {
     /// Application state (mirror-only, host-only, mirrorhost, zombie)
     #[arg(long, value_enum)]
     pub app_state: Option<AppStateArg>,
+
+    /// Run engine with an in-process interactive shell (ephemeral host)
+    #[arg(long)]
+    pub interactive: bool,
+
+    /// Unix domain socket path for the control plane
+    #[arg(long, value_name = "PATH")]
+    pub control_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -466,6 +798,10 @@ impl Cli {
             .as_ref()
             .and_then(|c| c.tls_peer_fingerprints.clone())
             .unwrap_or_default();
+        let tls_insecure_shared_cert = file_cfg
+            .as_ref()
+            .and_then(|c| c.tls_insecure_shared_cert)
+            .unwrap_or(false);
 
         let shares = merge_shares(
             file_cfg
@@ -488,6 +824,20 @@ impl Cli {
             return Err(clap_error.into());
         }
 
+        let request_handling = file_cfg
+            .as_ref()
+            .and_then(|c| c.request_handling)
+            .unwrap_or_default();
+        let peer_policies = file_cfg
+            .as_ref()
+            .and_then(|c| c.peer_policies.clone())
+            .unwrap_or_default();
+        let control_socket = run
+            .control_socket
+            .clone()
+            .or_else(|| file_cfg.as_ref().and_then(|c| c.control_socket.clone()))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTROL_SOCKET));
+
         Ok(AppConfig {
             pc_name,
             instance_id,
@@ -506,9 +856,13 @@ impl Cli {
             tls_ca_cert_path,
             tls_pinned_ca_fingerprints,
             tls_peer_fingerprints,
+            tls_insecure_shared_cert,
             remote_share_root,
             shares,
             app_state,
+            request_handling,
+            peer_policies,
+            control_socket,
         })
     }
 }
@@ -559,6 +913,9 @@ impl ShareCli {
             recursive: self.recursive,
             ignore_patterns: Vec::new(),
             max_file_size_bytes: None,
+            push: Default::default(),
+            pull: Default::default(),
+            request_handling: None,
         }
     }
 }
@@ -628,10 +985,16 @@ struct FileConfig {
     tls_ca_cert_path: Option<PathBuf>,
     tls_pinned_ca_fingerprints: Option<Vec<String>>,
     tls_peer_fingerprints: Option<HashMap<String, Vec<String>>>,
+    tls_insecure_shared_cert: Option<bool>,
     use_tls_for_peers: Option<bool>,
     remote_share_root: Option<PathBuf>,
     shares: Option<Vec<FileShareConfig>>,
     app_state: Option<ApplicationState>,
+    #[serde(default)]
+    request_handling: Option<TransferMode>,
+    #[serde(default)]
+    peer_policies: Option<Vec<PeerPolicy>>,
+    control_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -644,6 +1007,12 @@ struct FileShareConfig {
     #[serde(default)]
     ignore_patterns: Vec<String>,
     max_file_size_bytes: Option<u64>,
+    #[serde(default)]
+    push: TransferMode,
+    #[serde(default)]
+    pull: TransferMode,
+    #[serde(default)]
+    request_handling: Option<TransferMode>,
 }
 
 fn default_recursive() -> bool {
@@ -731,6 +1100,9 @@ fn merge_shares(
             recursive: s.recursive,
             ignore_patterns: s.ignore_patterns,
             max_file_size_bytes: s.max_file_size_bytes,
+            push: s.push,
+            pull: s.pull,
+            request_handling: s.request_handling,
         });
     }
 
@@ -743,6 +1115,9 @@ fn merge_shares(
                 recursive: s.recursive,
                 ignore_patterns: existing.ignore_patterns,
                 max_file_size_bytes: existing.max_file_size_bytes,
+                push: existing.push,
+                pull: existing.pull,
+                request_handling: existing.request_handling,
             };
         } else {
             idx_by_name.insert(s.name.clone(), out.len());
@@ -900,13 +1275,35 @@ remote_share_root = "{remote_share_root}"
 #   "11:22:33:...",
 # ]
 
+# INSECURE. Lets every node share one common certificate instead of holding its
+# own. Peers can then no longer tell each other apart -- anyone with the shared
+# bundle can act as any node -- and such connections are recorded as insecure.
+# Only turn this on if convenience genuinely outweighs peer identity for you.
+# tls_insecure_shared_cert = false
+
 # Whether to use TLS when talking to peers (otherwise plaintext)
 use_tls_for_peers = true
+
+# How inbound TransferRequest messages are handled: "manual" | "auto"
+request_handling = "manual"
+
+# Local control socket for `localbox shell` / dead CLI commands
+control_socket = "{control_socket}"
+
+# Optional per-peer transfer overrides:
+# [[peer_policies]]
+# peer = "workstation-b"
+# share = "docs"
+# push = "auto"
+# pull = "manual"
 
 [[shares]]
 name = "docs"
 root_path = "C:/path/to/docs"
 recursive = true
+# push/pull default to "manual" (no automatic transfers)
+push = "manual"
+pull = "manual"
 # ignore_patterns = ["**/.git/**", "**/*.tmp"]
 # max_file_size_bytes = 1073741824 # 1 GiB
 "#,
@@ -920,7 +1317,8 @@ recursive = true
         tls_cert_path = DEFAULT_TLS_CERT_PATH,
         tls_key_path = DEFAULT_TLS_KEY_PATH,
         tls_ca_cert_path = DEFAULT_TLS_CA_CERT_PATH,
-        remote_share_root = DEFAULT_REMOTE_SHARE_ROOT
+        remote_share_root = DEFAULT_REMOTE_SHARE_ROOT,
+        control_socket = DEFAULT_CONTROL_SOCKET
     )
 }
 
@@ -1021,6 +1419,7 @@ mod tests {
             tls_ca_cert_path: PathBuf::from("ca"),
             tls_pinned_ca_fingerprints: Vec::new(),
             tls_peer_fingerprints: HashMap::new(),
+            tls_insecure_shared_cert: false,
             remote_share_root: PathBuf::from("remote"),
             shares: vec![models::ShareConfig {
                 name: "s".to_string(),
@@ -1028,8 +1427,14 @@ mod tests {
                 recursive: true,
                 ignore_patterns: Vec::new(),
                 max_file_size_bytes: None,
+                push: Default::default(),
+                pull: Default::default(),
+                request_handling: None,
             }],
             app_state: ApplicationState::MirrorHost,
+            request_handling: Default::default(),
+            peer_policies: Vec::new(),
+            control_socket: std::path::PathBuf::from("localbox.sock"),
         };
         validate_app_config(&cfg).unwrap();
         std::fs::remove_dir_all(&tmp_dir).unwrap();
@@ -1052,6 +1457,7 @@ mod tests {
             tls_ca_cert_path: PathBuf::from("ca"),
             tls_pinned_ca_fingerprints: Vec::new(),
             tls_peer_fingerprints: HashMap::new(),
+            tls_insecure_shared_cert: false,
             remote_share_root: PathBuf::from("remote"),
             shares: vec![models::ShareConfig {
                 name: "s".to_string(),
@@ -1059,8 +1465,14 @@ mod tests {
                 recursive: true,
                 ignore_patterns: Vec::new(),
                 max_file_size_bytes: None,
+                push: Default::default(),
+                pull: Default::default(),
+                request_handling: None,
             }],
             app_state: ApplicationState::MirrorOnly,
+            request_handling: Default::default(),
+            peer_policies: Vec::new(),
+            control_socket: std::path::PathBuf::from("localbox.sock"),
         };
         validate_app_config(&cfg).unwrap();
     }

@@ -46,6 +46,7 @@ message BatchManifest {
 message BatchAck {
   bytes share_id = 1;
   int64 upto_seq = 2;
+  string batch_id = 3;
 }
 
 message FileChunk {
@@ -54,6 +55,50 @@ message FileChunk {
   uint64 offset = 3;
   bytes data = 4;
   bool eof = 5;
+  string batch_id = 6;
+}
+
+message TransferRequest {
+  string request_id = 1;
+  string share_name = 2;
+  bytes share_id = 3;
+  repeated string paths = 4;
+  int64 since_seq = 5;
+  string from_pc = 6;
+  string from_instance = 7;
+}
+
+message TransferReply {
+  string request_id = 1;
+  bool accepted = 2;
+  string reason = 3;
+}
+
+message TransferPushOffer {
+  string offer_id = 1;
+  string share_name = 2;
+  bytes share_id = 3;
+  repeated string paths = 4;
+  string from_pc = 5;
+  string from_instance = 6;
+}
+
+message ChatMessage {
+  string thread_id = 1;
+  string message_id = 2;
+  string thread_kind = 3;
+  string peer_key = 4;
+  string share_name = 5;
+  string from_pc = 6;
+  string from_instance = 7;
+  string body = 8;
+  string attachment_share = 9;
+  string attachment_path = 10;
+  int64 created_at = 11;
+}
+
+message ChatAck {
+  string message_id = 1;
 }
 
 message WireEnvelope {
@@ -62,5 +107,10 @@ message WireEnvelope {
     BatchManifest batch = 2;
     FileChunk file_chunk = 3;
     BatchAck batch_ack = 4;
+    TransferRequest transfer_request = 5;
+    TransferReply transfer_reply = 6;
+    ChatMessage chat_message = 7;
+    ChatAck chat_ack = 8;
+    TransferPushOffer transfer_push_offer = 9;
   }
 }

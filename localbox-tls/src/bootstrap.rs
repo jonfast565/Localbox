@@ -5,15 +5,14 @@ use models::AppConfig;
 use rand::{rngs::OsRng, RngCore};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, Signature, ECDSA_P256_SHA256_ASN1_SIGNING};
-use webpki::{EndEntityCert, ECDSA_P256_SHA256};
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::fs;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tempfile::NamedTempFile;
 use utilities::write_file_atomic;
+use webpki::{EndEntityCert, ECDSA_P256_SHA256};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InvitePayload {
@@ -140,15 +139,9 @@ pub fn accept_invite(
         .verify_signature(&ECDSA_P256_SHA256, &payload_bytes, &signature)
         .map_err(|_| anyhow!("signature verification failed for invite"))?;
 
-    let ca_added = {
-        let mut tmp = NamedTempFile::new().context("failed to create temp file for CA import")?;
-        tmp.write_all(signed.payload.ca_pem.as_bytes())
-            .context("failed to write CA PEM to temp file")?;
-        tmp.flush()?;
-        tmp.as_file().sync_all()?;
-        workflow::import_ca_into_trust_store(&cfg.tls_ca_cert_path, tmp.path())
-            .context("failed to import CA certificates")?
-    };
+    let ca_added =
+        workflow::import_ca_pem_into_trust_store(&cfg.tls_ca_cert_path, &signed.payload.ca_pem)
+            .context("failed to import CA certificates")?;
 
     let config_updated = update_tls_peer_fingerprints(
         config_path,
@@ -298,8 +291,8 @@ mod tests {
             fingerprint_hex(&host_leaf),
             "invite leaf certificate must match host leaf"
         );
-        let leaf_cert = EndEntityCert::try_from(leaf_der.as_slice())
-            .expect("invite leaf cert must parse");
+        let leaf_cert =
+            EndEntityCert::try_from(leaf_der.as_slice()).expect("invite leaf cert must parse");
         leaf_cert
             .verify_signature(&ECDSA_P256_SHA256, &payload_bytes, &signature)
             .expect("invite signature must verify");
@@ -400,10 +393,8 @@ mod tests {
         let ca_path = root.join(format!("{node}.ca.pem"));
         let share_root = root.join(format!("{node}-share"));
         let remote_root = root.join(format!("{node}-remote"));
-        std::fs::create_dir_all(&share_root)
-            .expect("create share root for sample config");
-        std::fs::create_dir_all(&remote_root)
-            .expect("create remote root for sample config");
+        std::fs::create_dir_all(&share_root).expect("create share root for sample config");
+        std::fs::create_dir_all(&remote_root).expect("create remote root for sample config");
 
         let cfg = AppConfig {
             pc_name: node.to_string(),
@@ -420,6 +411,7 @@ mod tests {
             tls_ca_cert_path: ca_path,
             tls_pinned_ca_fingerprints: Vec::new(),
             tls_peer_fingerprints: HashMap::new(),
+            tls_insecure_shared_cert: false,
             remote_share_root: remote_root,
             shares: vec![ShareConfig {
                 name: "docs".to_string(),
@@ -427,8 +419,14 @@ mod tests {
                 recursive: true,
                 ignore_patterns: Vec::new(),
                 max_file_size_bytes: None,
+                push: Default::default(),
+                pull: Default::default(),
+                request_handling: None,
             }],
             app_state: ApplicationState::MirrorHost,
+            request_handling: Default::default(),
+            peer_policies: Vec::new(),
+            control_socket: root.join(format!("{node}.sock")),
         };
 
         let materials =

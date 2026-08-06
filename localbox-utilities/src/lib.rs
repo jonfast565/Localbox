@@ -174,6 +174,39 @@ pub fn write_file_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Atomically write a file that must stay readable only by its owner.
+///
+/// Used for private keys: the mode is applied to the temp file before any bytes
+/// are written, so the secret is never briefly world-readable.
+pub fn write_secret_file_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(unique_tmp_name(
+        path.file_name().unwrap_or_else(|| OsStr::new("file")),
+    ));
+
+    let mut opts = OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
 /// Generate a unique, process-scoped path under the system temp directory for tests.
 pub fn test_temp_path(prefix: &str) -> PathBuf {
     let nonce = SystemTime::now()

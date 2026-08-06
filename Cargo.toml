@@ -6,7 +6,8 @@ members = [
     "localbox-utilities",
     "localbox-core",
     "localbox-protocol",
-    "localbox-tls"
+    "localbox-tls",
+    "localbox-gui"
 ]
 
 resolver = "2"

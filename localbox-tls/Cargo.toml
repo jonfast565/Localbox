@@ -7,13 +7,14 @@ edition = "2021"
 anyhow = "1"
 models = { package = "localbox-models", path = "../localbox-models" }
 utilities = { package = "localbox-utilities", path = "../localbox-utilities" }
-tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
+tokio = { version = "1", features = ["sync", "rt", "time", "macros", "net", "io-util"] }
 tokio-rustls = "0.24"
 tokio-util = { version = "0.7", features = ["rt"] }
-rustls = "0.21"
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
 rustls-pemfile = "1"
 rustls-webpki = "0.101"
-rcgen = "0.12"
+rcgen = { version = "0.12", features = ["x509-parser"] }
+time = "0.3"
 sha2 = "0.10"
 tracing = "0.1"
 base64 = "0.21"

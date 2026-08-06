@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
 use models::{
-    AppConfig, ChangeKind, FileChange, FileChunk, FileMeta, HelloMessage, ShareConfig, ShareId,
-    WireMessage,
+    AppConfig, ChangeKind, ChatAck, ChatMessage, ChatMessageRecord, FileChange,
+    FileChunk, FileMeta, HelloMessage, ShareConfig, ShareId, ThreadKind, TransferMode,
+    TransferReply, TransferReplyStatus, TransferRequest, WireMessage,
 };
+use uuid::Uuid;
 use rustls::ServerName;
 use std::collections::HashSet;
 use std::io::ErrorKind;
@@ -21,7 +23,7 @@ use utilities::{write_atomic, DynStream, FileSystem, Net};
 
 use crate::writer::{recv_framed_message, send_framed_message, PeerWriter};
 use crate::{hash_bytes, DbHandle, InboundFileState, PendingFiles, SharedWriters};
-use tls::{fingerprint_from_certificates, normalize_fingerprint};
+use tls::{fingerprint_from_certificates, normalize_fingerprint, verify_peer_cert_name};
 
 pub async fn handle_tls_connection(
     stream: DynStream,
@@ -37,9 +39,22 @@ pub async fn handle_tls_connection(
 ) -> Result<()> {
     let tls_stream = tls_acceptor.accept(stream).await?;
     let mut tls_stream = tls_stream;
-    let peer_fp = fingerprint_from_certificates(tls_stream.get_ref().1.peer_certificates());
+    let peer_certs: Option<Vec<_>> = tls_stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .map(|chain| chain.to_vec());
+    let peer_fp = fingerprint_from_certificates(peer_certs.as_deref());
     let (remote, resolved_peer_id) =
         perform_handshake(&mut tls_stream, cfg, db, share_names, addr, fs.clone()).await?;
+    check_peer_identity(
+        cfg,
+        db,
+        resolved_peer_id,
+        &remote.pc_name,
+        peer_certs.as_deref(),
+    )
+    .await?;
     ensure_peer_fingerprint(cfg, &remote.pc_name, peer_fp.as_deref())?;
     if let Some(fp) = peer_fp {
         info!(
@@ -58,8 +73,11 @@ pub async fn handle_tls_connection(
         ));
     }
 
+    maybe_auto_pull(cfg, db, &connections, resolved_peer_id, &remote).await;
+
     let _reader_task = spawn_incoming_reader(
         reader,
+        cfg.clone(),
         db.clone(),
         remote,
         resolved_peer_id,
@@ -96,8 +114,11 @@ pub async fn handle_plain_connection(
         ));
     }
 
+    maybe_auto_pull(cfg, db, &connections, resolved_peer_id, &remote).await;
+
     let _reader_task = spawn_incoming_reader(
         reader,
+        cfg.clone(),
         db.clone(),
         remote,
         resolved_peer_id,
@@ -150,7 +171,12 @@ pub async fn connect_to_peer(
             .or_else(|_| ServerName::try_from(target_addr.ip().to_string().as_str()))
             .context("server name for TLS")?;
         let mut tls_stream = connector.connect(name, tcp).await?;
-        let peer_fp = fingerprint_from_certificates(tls_stream.get_ref().1.peer_certificates());
+        let peer_certs: Option<Vec<_>> = tls_stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .map(|chain| chain.to_vec());
+        let peer_fp = fingerprint_from_certificates(peer_certs.as_deref());
         let (remote, peer_id) = perform_handshake(
             &mut tls_stream,
             cfg,
@@ -160,6 +186,10 @@ pub async fn connect_to_peer(
             fs.clone(),
         )
         .await?;
+        // rustls validated the certificate against the address we dialed; this
+        // re-checks it against the name the peer claimed in its Hello, which may
+        // differ (we can dial by IP) and is what the rest of the engine keys off.
+        check_peer_identity(cfg, db, peer_id, &remote.pc_name, peer_certs.as_deref()).await?;
         ensure_peer_fingerprint(cfg, &remote.pc_name, peer_fp.as_deref())?;
         if let Some(fp) = peer_fp {
             info!(
@@ -177,8 +207,10 @@ pub async fn connect_to_peer(
                 Arc::new(AsyncMutex::new(PeerWriter::Client(writer))),
             ));
         }
+        maybe_auto_pull(cfg, db, &connections, peer_id, &remote).await;
         let _reader_task = spawn_incoming_reader(
             reader,
+            cfg.clone(),
             db.clone(),
             remote,
             peer_id,
@@ -208,8 +240,10 @@ pub async fn connect_to_peer(
                 Arc::new(AsyncMutex::new(PeerWriter::Plain(writer))),
             ));
         }
+        maybe_auto_pull(cfg, db, &connections, peer_id, &remote).await;
         let _reader_task = spawn_incoming_reader(
             reader,
+            cfg.clone(),
             db.clone(),
             remote,
             peer_id,
@@ -286,6 +320,7 @@ async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
 
 fn spawn_incoming_reader<R>(
     reader: R,
+    cfg: AppConfig,
     db: DbHandle,
     remote: HelloMessage,
     peer_id: i64,
@@ -298,6 +333,7 @@ where
 {
     tokio::spawn(incoming_reader_loop(
         reader,
+        cfg,
         db,
         remote,
         peer_id,
@@ -309,6 +345,7 @@ where
 
 async fn incoming_reader_loop<R>(
     mut reader: R,
+    cfg: AppConfig,
     db: DbHandle,
     remote: HelloMessage,
     peer_id: i64,
@@ -336,16 +373,34 @@ async fn incoming_reader_loop<R>(
             }
             Ok(Some(WireMessage::BatchAck(ack))) => {
                 let db_guard = db.lock().await;
-                if let Ok(share_row_id) = db_guard.get_share_row_id_by_share_id(&ack.share_id) {
-                    let _ = db_guard.bump_last_seq_acked(peer_id, share_row_id, ack.upto_seq);
-                }
+                let _ = db_guard.on_batch_ack(
+                    peer_id,
+                    &ack.share_id,
+                    ack.upto_seq,
+                    ack.batch_id.as_deref(),
+                );
                 info!(
-                    "Received ack for share {:?} upto seq {} from {}",
-                    ack.share_id.0, ack.upto_seq, remote.pc_name
+                    "Received ack for share {:?} upto seq {} batch {:?} from {}",
+                    ack.share_id.0, ack.upto_seq, ack.batch_id, remote.pc_name
                 );
             }
             Ok(Some(WireMessage::FileChunk(chunk))) => {
                 handle_file_chunk_message(chunk, &pending_files, Arc::clone(&fs)).await;
+            }
+            Ok(Some(WireMessage::TransferRequest(req))) => {
+                handle_transfer_request(&cfg, &db, &connections, peer_id, req).await;
+            }
+            Ok(Some(WireMessage::TransferReply(reply))) => {
+                handle_transfer_reply(&db, reply).await;
+            }
+            Ok(Some(WireMessage::TransferPushOffer(offer))) => {
+                handle_transfer_push_offer(&cfg, &db, &connections, peer_id, offer).await;
+            }
+            Ok(Some(WireMessage::ChatMessage(msg))) => {
+                handle_chat_message(&cfg, &db, &connections, peer_id, msg).await;
+            }
+            Ok(Some(WireMessage::ChatAck(ack))) => {
+                handle_chat_ack(&db, &ack.message_id).await;
             }
             Ok(None) => {
                 info!("Peer {} disconnected", remote.pc_name);
@@ -357,6 +412,299 @@ async fn incoming_reader_loop<R>(
             }
         }
     }
+}
+
+async fn maybe_auto_pull(
+    cfg: &AppConfig,
+    db: &DbHandle,
+    connections: &SharedWriters,
+    peer_id: i64,
+    remote: &HelloMessage,
+) {
+    let peer_key = format!("{}@{}", remote.pc_name, remote.instance_id);
+    for share_name in &remote.shares {
+        if !cfg.resolve_pull_mode(share_name, Some(&peer_key)).is_auto() {
+            continue;
+        }
+        let share_id = ShareId::new(share_name, &remote.pc_name);
+        let since_seq = {
+            let db = db.lock().await;
+            match db.get_share_row_id_by_share_id(&share_id) {
+                Ok(row_id) => db
+                    .get_peer_progress(peer_id, row_id)
+                    .ok()
+                    .map(|(_, acked)| acked)
+                    .unwrap_or(0),
+                Err(_) => 0,
+            }
+        };
+        let req = TransferRequest {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
+            request_id: Uuid::new_v4().to_string(),
+            share_name: share_name.clone(),
+            share_id,
+            paths: Vec::new(),
+            since_seq,
+            from_pc: cfg.pc_name.clone(),
+            from_instance: cfg.instance_id.clone(),
+        };
+        let _ = db
+            .lock()
+            .await
+            .insert_transfer_request(&req, Some(peer_id), "out", "pending");
+        let msg = WireMessage::TransferRequest(req);
+        let _ = send_wire_to_peer(connections, peer_id, &msg).await;
+        info!(share = %share_name, peer = %peer_key, "Auto-pull TransferRequest sent");
+    }
+}
+
+async fn send_wire_to_peer(
+    connections: &SharedWriters,
+    peer_id: i64,
+    msg: &WireMessage,
+) -> Result<()> {
+    let writer = {
+        let guard = connections.lock().await;
+        guard
+            .iter()
+            .find(|(pid, _)| *pid == peer_id)
+            .map(|(_, w)| Arc::clone(w))
+    };
+    let Some(writer) = writer else {
+        bail!("peer {peer_id} not connected");
+    };
+    let mut g = writer.lock().await;
+    g.send(msg).await?;
+    Ok(())
+}
+
+async fn handle_transfer_request(
+    cfg: &AppConfig,
+    db: &DbHandle,
+    connections: &SharedWriters,
+    peer_id: i64,
+    req: TransferRequest,
+) {
+    let peer_key = format!("{}@{}", req.from_pc, req.from_instance);
+    let _ = db
+        .lock()
+        .await
+        .insert_transfer_request(&req, Some(peer_id), "in", "pending");
+    let handling = cfg.resolve_request_handling(&req.share_name, Some(&peer_key));
+    if handling == TransferMode::Auto {
+        if let Err(e) = fulfill_transfer_request(cfg, db, connections, peer_id, &req).await {
+            warn!(error = %e, "Auto-fulfill transfer request failed");
+            let reply = TransferReply {
+                protocol_version: models::WIRE_PROTOCOL_VERSION,
+                request_id: req.request_id.clone(),
+                status: TransferReplyStatus::Decline,
+                reason: Some(e.to_string()),
+            };
+            let _ = db.lock().await.update_transfer_request_status(
+                &req.request_id,
+                "declined",
+                Some(&e.to_string()),
+            );
+            let _ = send_wire_to_peer(connections, peer_id, &WireMessage::TransferReply(reply))
+                .await;
+        } else {
+            let reply = TransferReply {
+                protocol_version: models::WIRE_PROTOCOL_VERSION,
+                request_id: req.request_id.clone(),
+                status: TransferReplyStatus::Accept,
+                reason: None,
+            };
+            let _ = db
+                .lock()
+                .await
+                .update_transfer_request_status(&req.request_id, "accepted", None);
+            let _ = send_wire_to_peer(connections, peer_id, &WireMessage::TransferReply(reply))
+                .await;
+        }
+    } else {
+        info!(
+            request_id = %req.request_id,
+            share = %req.share_name,
+            from = %peer_key,
+            "Inbound transfer request queued for manual reply"
+        );
+    }
+}
+
+pub async fn fulfill_transfer_request(
+    cfg: &AppConfig,
+    db: &DbHandle,
+    connections: &SharedWriters,
+    peer_id: i64,
+    req: &TransferRequest,
+) -> Result<()> {
+    let shares = db.lock().await.list_shares_table()?;
+    let share_row = shares
+        .into_iter()
+        .find(|s| s.share_name == req.share_name && s.pc_name == cfg.pc_name)
+        .context("local share not found for transfer request")?;
+    let share_id = ShareId::new(&req.share_name, &cfg.pc_name);
+    let basis = if !req.paths.is_empty() {
+        models::IntentBasis::Snapshot {
+            paths: req.paths.clone(),
+        }
+    } else {
+        let max_seq = db.lock().await.max_change_seq(share_row.id).unwrap_or(0);
+        models::IntentBasis::JournalRange {
+            from_seq: req.since_seq,
+            to_seq: max_seq,
+        }
+    };
+    let origin = if cfg
+        .resolve_push_mode(&req.share_name, None)
+        .is_auto()
+    {
+        models::IntentOrigin::AutoPull
+    } else {
+        models::IntentOrigin::Reply
+    };
+    let (_intent_id, batch_ids) = db.lock().await.create_and_materialize_intent(
+        models::IntentKind::PullFulfill,
+        origin,
+        &req.share_name,
+        share_id,
+        Some(peer_id),
+        basis,
+        Some(&req.request_id),
+        &cfg.pc_name,
+    )?;
+    // Wake path is via outbox; best-effort notify if a batch was queued.
+    let _ = connections;
+    let _ = batch_ids;
+    Ok(())
+}
+
+async fn handle_transfer_reply(db: &DbHandle, reply: TransferReply) {
+    let status = match reply.status {
+        TransferReplyStatus::Accept => "accepted",
+        TransferReplyStatus::Decline => "declined",
+    };
+    let _ = db.lock().await.update_transfer_request_status(
+        &reply.request_id,
+        status,
+        reply.reason.as_deref(),
+    );
+    info!(
+        request_id = %reply.request_id,
+        status = status,
+        "Transfer reply received"
+    );
+}
+
+async fn handle_transfer_push_offer(
+    cfg: &AppConfig,
+    db: &DbHandle,
+    connections: &SharedWriters,
+    peer_id: i64,
+    offer: models::TransferPushOffer,
+) {
+    let peer_key = format!("{}@{}", offer.from_pc, offer.from_instance);
+    let as_req = TransferRequest {
+        protocol_version: offer.protocol_version,
+        request_id: offer.offer_id.clone(),
+        share_id: offer.share_id,
+        share_name: offer.share_name.clone(),
+        since_seq: 0,
+        paths: offer.paths.clone(),
+        from_pc: offer.from_pc.clone(),
+        from_instance: offer.from_instance.clone(),
+    };
+    let _ = db
+        .lock()
+        .await
+        .insert_transfer_request(&as_req, Some(peer_id), "in", "pending");
+    if cfg.resolve_pull_mode(&offer.share_name, Some(&peer_key)).is_auto() {
+        let reply = TransferReply {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
+            request_id: offer.offer_id.clone(),
+            status: TransferReplyStatus::Accept,
+            reason: None,
+        };
+        let _ = db
+            .lock()
+            .await
+            .update_transfer_request_status(&offer.offer_id, "accepted", None);
+        let _ = send_wire_to_peer(connections, peer_id, &WireMessage::TransferReply(reply)).await;
+        info!(
+            offer_id = %offer.offer_id,
+            share = %offer.share_name,
+            peer = %peer_key,
+            "Auto-accepted TransferPushOffer (pull=auto)"
+        );
+    } else {
+        info!(
+            offer_id = %offer.offer_id,
+            share = %offer.share_name,
+            peer = %peer_key,
+            "Stored TransferPushOffer for manual pull"
+        );
+    }
+}
+
+async fn handle_chat_ack(db: &DbHandle, message_id: &str) {
+    let _ = db
+        .lock()
+        .await
+        .update_chat_message_status(message_id, "acked");
+    info!(message_id = %message_id, "Chat ack received");
+}
+
+async fn handle_chat_message(
+    _cfg: &AppConfig,
+    db: &DbHandle,
+    connections: &SharedWriters,
+    peer_id: i64,
+    msg: ChatMessage,
+) {
+    let kind = msg.thread_kind;
+    let title = match kind {
+        ThreadKind::Peer => msg
+            .peer_key
+            .clone()
+            .unwrap_or_else(|| format!("{}@{}", msg.from_pc, msg.from_instance)),
+        ThreadKind::Share => msg
+            .share_name
+            .clone()
+            .unwrap_or_else(|| "share".to_string()),
+    };
+    {
+        let db = db.lock().await;
+        let _ = db.ensure_chat_thread(
+            &msg.thread_id,
+            kind,
+            msg.peer_key.as_deref(),
+            msg.share_name.as_deref(),
+            &title,
+            msg.created_at,
+        );
+        let record = ChatMessageRecord {
+            id: msg.message_id.clone(),
+            thread_id: msg.thread_id.clone(),
+            from_peer: format!("{}@{}", msg.from_pc, msg.from_instance),
+            body: msg.body.clone(),
+            attachment_share: msg.attachment.as_ref().map(|a| a.share_name.clone()),
+            attachment_path: msg.attachment.as_ref().map(|a| a.path.clone()),
+            created_at: msg.created_at,
+            direction: "in".into(),
+            status: "received".into(),
+        };
+        let _ = db.insert_chat_message(&record, true);
+    }
+    let ack = ChatAck {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
+        message_id: msg.message_id.clone(),
+    };
+    let _ = send_wire_to_peer(connections, peer_id, &WireMessage::ChatAck(ack)).await;
+    info!(
+        thread = %msg.thread_id,
+        from = %msg.from_pc,
+        "Chat message received"
+    );
 }
 
 async fn handle_batch_message(
@@ -470,9 +818,15 @@ async fn handle_batch_message(
             }
         }
 
-        if max_seq_for_share > 0 {
-            send_batch_ack(connections, peer_id, &batch.share_id, max_seq_for_share).await;
-        }
+        // Always ack so the sender can resolve intent via batch_id (Snapshot uses seq=0).
+        send_batch_ack(
+            connections,
+            peer_id,
+            &batch.share_id,
+            max_seq_for_share,
+            Some(batch.batch_id.clone()),
+        )
+        .await;
     }
     .instrument(span)
     .await;
@@ -624,6 +978,7 @@ async fn send_batch_ack(
     target_peer_id: i64,
     share_id: &models::ShareId,
     upto_seq: i64,
+    batch_id: Option<String>,
 ) {
     let writers: Vec<_> = {
         let guard = connections.lock().await;
@@ -638,6 +993,7 @@ async fn send_batch_ack(
         protocol_version: models::WIRE_PROTOCOL_VERSION,
         share_id: *share_id,
         upto_seq,
+        batch_id,
     });
 
     for writer_arc in writers {
@@ -771,6 +1127,9 @@ async fn ensure_remote_shares(
             recursive: true,
             ignore_patterns: Vec::new(),
             max_file_size_bytes: None,
+            push: Default::default(),
+            pull: Default::default(),
+            request_handling: None,
         };
         let share_id = ShareId::new(share_name, &remote.pc_name);
         if let Err(e) = db
@@ -783,6 +1142,36 @@ async fn ensure_remote_shares(
                 share_name, remote.pc_name
             );
         }
+    }
+}
+
+/// Confirm the peer's certificate was issued for the name it claims.
+///
+/// Trusting a CA establishes that a peer belongs to the network, not which member
+/// it is; without this a node holding any valid certificate could announce itself
+/// under another node's name. When `tls_insecure_shared_cert` is set the network
+/// has deliberately given up per-node identity, so the failure is downgraded to a
+/// warning and the peer is stamped insecure the same way a plaintext one is.
+async fn check_peer_identity(
+    cfg: &AppConfig,
+    db: &DbHandle,
+    peer_id: i64,
+    peer_name: &str,
+    certs: Option<&[rustls::Certificate]>,
+) -> Result<()> {
+    match verify_peer_cert_name(certs, peer_name) {
+        Ok(()) => Ok(()),
+        Err(e) if cfg.tls_insecure_shared_cert => {
+            warn!(
+                peer = %peer_name,
+                error = %e,
+                "Accepting peer without certificate identity (tls_insecure_shared_cert is enabled)"
+            );
+            let now = OffsetDateTime::now_utc().unix_timestamp();
+            db.lock().await.mark_peer_insecure(peer_id, now)?;
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
 }
 

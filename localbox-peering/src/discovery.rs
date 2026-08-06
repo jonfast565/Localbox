@@ -304,22 +304,14 @@ async fn handle_discover(
     );
 
     if accepts_remote_shares {
-        enqueue_bootstrap_if_needed(
+        maybe_enqueue_auto_push(
+            cfg,
             db,
             share_lookup,
             &shares,
             peer_id,
-            &cfg.pc_name,
             pc_name,
-            net_tx.clone(),
-        )
-        .await;
-        enqueue_catchup_if_needed(
-            db,
-            share_lookup,
-            &shares,
-            peer_id,
-            &cfg.pc_name,
+            instance_id,
             net_tx.clone(),
         )
         .await;
@@ -424,22 +416,14 @@ async fn handle_here(
             pc_name, instance_id, peer_addr, shares
         );
         if accepts_remote_shares {
-            enqueue_bootstrap_if_needed(
+            maybe_enqueue_auto_push(
+                cfg,
                 db,
                 share_lookup,
                 &shares,
                 peer_id,
-                &cfg.pc_name,
                 pc_name,
-                net_tx.clone(),
-            )
-            .await;
-            enqueue_catchup_if_needed(
-                db,
-                share_lookup,
-                &shares,
-                peer_id,
-                &cfg.pc_name,
+                instance_id,
                 net_tx.clone(),
             )
             .await;
@@ -583,6 +567,51 @@ fn is_self_peer(cfg: &AppConfig, pc_name: &str, _instance_id: &str) -> bool {
     pc_name == cfg.pc_name
 }
 
+async fn maybe_enqueue_auto_push(
+    cfg: &AppConfig,
+    db: &DbHandle,
+    share_lookup: &Arc<Vec<ShareContext>>,
+    remote_shares: &[String],
+    peer_id: i64,
+    peer_pc: &str,
+    peer_instance: &str,
+    net_tx: Arc<tokio::sync::mpsc::Sender<String>>,
+) {
+    let peer_key = format!("{peer_pc}@{peer_instance}");
+    let auto_shares: Vec<ShareContext> = share_lookup
+        .iter()
+        .filter(|s| cfg.resolve_push_mode(&s.share_name, Some(&peer_key)).is_auto())
+        .cloned()
+        .collect();
+    if auto_shares.is_empty() {
+        info!(
+            peer = %peer_key,
+            "Skipping discovery bootstrap/catch-up; no shares with push=auto"
+        );
+        return;
+    }
+    let filtered = Arc::new(auto_shares);
+    enqueue_bootstrap_if_needed(
+        db,
+        &filtered,
+        remote_shares,
+        peer_id,
+        &cfg.pc_name,
+        peer_pc,
+        net_tx.clone(),
+    )
+    .await;
+    enqueue_catchup_if_needed(
+        db,
+        &filtered,
+        remote_shares,
+        peer_id,
+        &cfg.pc_name,
+        net_tx,
+    )
+    .await;
+}
+
 async fn enqueue_catchup_if_needed(
     db: &DbHandle,
     share_lookup: &Arc<Vec<ShareContext>>,
@@ -597,7 +626,7 @@ async fn enqueue_catchup_if_needed(
             continue;
         }
         let share_row_id = share.id;
-        let (last_sent, _last_acked) =
+        let (_last_sent, last_acked) =
             match db.lock().await.get_peer_progress(peer_id, share_row_id) {
                 Ok(p) => p,
                 Err(e) => {
@@ -608,78 +637,52 @@ async fn enqueue_catchup_if_needed(
                     continue;
                 }
             };
-        let mut start = last_sent;
-        loop {
-            let changes = match db.lock().await.list_changes_since(share_row_id, start, 256) {
-                Ok(ch) => ch,
-                Err(e) => {
-                    warn!(
-                        "Failed to read change log for share {}: {e}",
-                        share.share_name
-                    );
-                    break;
+        let max_seq = match db.lock().await.max_change_seq(share_row_id) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Failed to read share journal for {}: {e}",
+                    share.share_name
+                );
+                continue;
+            }
+        };
+        if max_seq <= last_acked {
+            continue;
+        }
+        match db.lock().await.create_and_materialize_intent(
+            models::IntentKind::SyncCatchup,
+            models::IntentOrigin::AutoPush,
+            &share.share_name,
+            share.share_id,
+            Some(peer_id),
+            models::IntentBasis::JournalRange {
+                from_seq: last_acked,
+                to_seq: max_seq,
+            },
+            None,
+            local_name,
+        ) {
+            Ok((intent_id, batch_ids)) => {
+                for bid in &batch_ids {
+                    let _ = net_tx.try_send(bid.clone());
                 }
-            };
-            if changes.is_empty() {
-                break;
+                info!(
+                    intent_id = %intent_id,
+                    peer_id = peer_id,
+                    share_name = %share.share_name,
+                    from_seq = last_acked,
+                    to_seq = max_seq,
+                    batches = batch_ids.len(),
+                    "Queued SyncCatchup catch-up intent"
+                );
             }
-            let mut fixed_changes = Vec::with_capacity(changes.len());
-            let mut max_seq = start;
-            for mut ch in changes {
-                ch.share_id = share.share_id;
-                max_seq = max_seq.max(ch.seq);
-                fixed_changes.push(ch);
-            }
-
-            let batch_id = format!(
-                "catchup-{}-{}-{}-{}",
-                peer_id,
-                share.share_name,
-                start + 1,
-                max_seq
-            );
-            let manifest = models::BatchManifest {
-                protocol_version: models::WIRE_PROTOCOL_VERSION,
-                batch_id: batch_id.clone(),
-                share_id: share.share_id,
-                from_node: local_name.to_string(),
-                created_at: OffsetDateTime::now_utc().unix_timestamp(),
-                changes: fixed_changes,
-            };
-            match db
-                .lock()
-                .await
-                .enqueue_outbound_batch(&manifest, Some(peer_id))
-            {
-                Ok(_) => {
-                    let _ = db
-                        .lock()
-                        .await
-                        .bump_last_seq_sent(peer_id, share_row_id, max_seq);
-                    let _ = net_tx.try_send(batch_id.clone());
-                    info!(
-                        batch_id = %batch_id,
-                        peer_id = peer_id,
-                        share_name = %share.share_name,
-                        upto_seq = max_seq,
-                        "Queued catch-up batch"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        batch_id = %batch_id,
-                        peer_id = peer_id,
-                        error = %e,
-                        "Failed to enqueue catch-up batch"
-                    );
-                    break;
-                }
-            }
-
-            if max_seq <= start {
-                break;
-            }
-            start = max_seq;
+            Err(e) => warn!(
+                peer_id = peer_id,
+                share_name = %share.share_name,
+                error = %e,
+                "Failed to enqueue SyncCatchup catch-up intent"
+            ),
         }
     }
 }
@@ -699,61 +702,51 @@ async fn enqueue_bootstrap_if_needed(
             continue;
         }
 
-        let changes_raw = match db.lock().await.list_changes_since(share.id, 0, 10_000) {
-            Ok(m) => m,
+        let max_seq = match db.lock().await.max_change_seq(share.id) {
+            Ok(s) => s,
             Err(e) => {
                 warn!(
-                    "Failed to load change log for bootstrap of share {}: {e}",
+                    "Failed to load share journal for bootstrap of share {}: {e}",
                     share.share_name
                 );
                 continue;
             }
         };
-        let mut changes: Vec<models::FileChange> = Vec::with_capacity(changes_raw.len());
-        let mut max_seq = 0;
-        for mut ch in changes_raw {
-            ch.share_id = share.share_id;
-            max_seq = max_seq.max(ch.seq);
-            changes.push(ch);
-        }
-        if changes.is_empty() {
+        if max_seq <= 0 {
             continue;
         }
 
-        let batch_id = format!("bootstrap-{}-{}", peer_id, share.share_name);
-        let manifest = models::BatchManifest {
-            protocol_version: models::WIRE_PROTOCOL_VERSION,
-            batch_id: batch_id.clone(),
-            share_id: share.share_id,
-            from_node: local_name.to_string(),
-            created_at: OffsetDateTime::now_utc().unix_timestamp(),
-            changes,
-        };
-
-        let enq = db
-            .lock()
-            .await
-            .enqueue_outbound_batch(&manifest, Some(peer_id));
-        match enq {
-            Ok(_) => {
-                let _ = db
-                    .lock()
-                    .await
-                    .bump_last_seq_sent(peer_id, share.id, max_seq);
-                let _ = net_tx.try_send(batch_id.clone());
+        match db.lock().await.create_and_materialize_intent(
+            models::IntentKind::SyncCatchup,
+            models::IntentOrigin::AutoPush,
+            &share.share_name,
+            share.share_id,
+            Some(peer_id),
+            models::IntentBasis::JournalRange {
+                from_seq: 0,
+                to_seq: max_seq,
+            },
+            None,
+            local_name,
+        ) {
+            Ok((intent_id, batch_ids)) => {
+                for bid in &batch_ids {
+                    let _ = net_tx.try_send(bid.clone());
+                }
                 info!(
-                    batch_id = %batch_id,
+                    intent_id = %intent_id,
                     peer_id = peer_id,
                     share_name = %share.share_name,
                     remote_pc_name = %remote_name,
-                    "Queued bootstrap batch"
+                    batches = batch_ids.len(),
+                    "Queued SyncCatchup bootstrap intent"
                 );
             }
             Err(e) => warn!(
-                batch_id = %batch_id,
                 peer_id = peer_id,
+                share_name = %share.share_name,
                 error = %e,
-                "Failed to enqueue bootstrap batch"
+                "Failed to enqueue SyncCatchup bootstrap intent"
             ),
         }
     }

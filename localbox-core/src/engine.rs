@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use db::Db;
+use db::{Db, JournalOrigin};
 use models::{AppConfig, ChangeKind, FileChange, FileMeta, ShareContext};
 use peering::PeerCommand;
 use notify::{
@@ -80,7 +80,7 @@ impl Engine {
         let mut db_raw = db_raw;
         let shares = db_raw.load_shares(&cfg)?;
         for sc in &shares {
-            seed_change_log_from_index(&mut db_raw, sc, &fs, workdir.as_deref())?;
+            seed_journal_from_index(&mut db_raw, sc, &fs, workdir.as_deref())?;
         }
         let db = Arc::new(Mutex::new(db_raw));
         info!("Engine starting up");
@@ -339,11 +339,10 @@ async fn persist_incoming_change(
         .get_share_row_id_by_share_id(&change.share_id)
         .ok()?;
     let created_at = OffsetDateTime::now_utc().unix_timestamp();
-    let seq = if change.seq > 0 {
-        change.seq
-    } else {
-        db_guard.next_change_seq(share_row_id).ok()?
-    };
+    // Peek the seq the journal will assign so `meta.version` can carry it. Safe
+    // because we hold the DB lock across both calls, so nothing can allocate in
+    // between; the append below is still the authority.
+    let seq = db_guard.next_journal_seq(share_row_id).ok()?;
     change.seq = seq;
 
     if change.kind == ChangeKind::Delete && change.meta.is_none() {
@@ -372,16 +371,25 @@ async fn persist_incoming_change(
         }
     }
 
-    let Ok(seq) = db_guard.append_change_log(share_row_id, &change, created_at) else {
-        error!("Failed to append change log for {}", change.path);
-        return None;
-    };
-
-    if seq > 0 {
-        change.seq = seq;
+    match db_guard.append_journal_entry(share_row_id, &change, created_at, JournalOrigin::Local) {
+        Ok(Some(seq)) => {
+            change.seq = seq;
+            Some(change)
+        }
+        Ok(None) => {
+            // Locally authored entries mint a fresh MAX+1 seq and are exempt from
+            // the origin index, so there is nothing they can collide with.
+            error!(
+                "Journal append for {} was unexpectedly a no-op",
+                change.path
+            );
+            None
+        }
+        Err(e) => {
+            error!("Failed to append journal entry for {}: {e}", change.path);
+            None
+        }
     }
-
-    Some(change)
 }
 
 fn group_pending_by_share(pending: &mut Vec<FileChange>) -> HashMap<[u8; 16], Vec<FileChange>> {
@@ -427,7 +435,7 @@ async fn process_share_changes(
             })
         };
         if !cfg
-            .resolve_push_mode(&share_name, peer_key.as_deref())
+            .resolve_sync_mode(&share_name, peer_key.as_deref())
             .is_auto()
         {
             continue;
@@ -438,7 +446,7 @@ async fn process_share_changes(
                 continue;
             };
             let (_, last_acked) = guard.get_peer_progress(pid, share_row_id).unwrap_or((0, 0));
-            let max_seq = guard.max_change_seq(share_row_id).unwrap_or(0);
+            let max_seq = guard.max_journal_seq(share_row_id).unwrap_or(0);
             (last_acked, max_seq)
         };
         if to_seq <= from_seq {
@@ -446,7 +454,7 @@ async fn process_share_changes(
         }
         match db.lock().await.create_and_materialize_intent(
             models::IntentKind::SyncCatchup,
-            models::IntentOrigin::AutoPush,
+            models::IntentOrigin::AutoSync,
             &share_name,
             share_id,
             Some(pid),
@@ -652,6 +660,85 @@ mod tests {
 
         assert!(rx.try_recv().is_err());
     }
+
+    /// Seeding must be idempotent: before this was fixed, both arms of a dead
+    /// if/else appended unconditionally, so every restart re-journaled the whole
+    /// index under fresh seqs -- inflating max_journal_seq and re-sending
+    /// everything to every peer.
+    #[test]
+    fn seed_journal_from_index_is_idempotent_across_restarts() {
+        use super::seed_journal_from_index;
+        use models::{AppConfig, ApplicationState, FileMeta, ShareConfig, TransferMode};
+
+        let fs: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+        let root = PathBuf::from("/seed-share");
+        let cfg = AppConfig {
+            pc_name: "pc-one".into(),
+            instance_id: "inst".into(),
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            plain_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            use_tls_for_peers: false,
+            discovery_port: 0,
+            aggregation_window_ms: 100,
+            db_path: PathBuf::new(),
+            log_path: PathBuf::new(),
+            tls_cert_path: PathBuf::new(),
+            tls_key_path: PathBuf::new(),
+            tls_ca_cert_path: PathBuf::new(),
+            tls_pinned_ca_fingerprints: Vec::new(),
+            tls_peer_fingerprints: HashMap::new(),
+            tls_insecure_shared_cert: false,
+            remote_share_root: PathBuf::from("remote"),
+            shares: vec![ShareConfig {
+                name: "shareA".into(),
+                root_path: root.clone(),
+                recursive: true,
+                ignore_patterns: Vec::new(),
+                max_file_size_bytes: None,
+                sync: TransferMode::Manual,
+                pull: TransferMode::Manual,
+                request_handling: None,
+            }],
+            app_state: ApplicationState::MirrorHost,
+            request_handling: TransferMode::Manual,
+            peer_policies: Vec::new(),
+            control_socket: PathBuf::from("localbox.sock"),
+        };
+
+        let mut db = db::Db::open_in_memory().unwrap();
+        let mut share = db.load_shares(&cfg).unwrap().remove(0);
+        for name in ["one.txt", "two.txt"] {
+            share.index.insert(
+                name.to_string(),
+                FileMeta {
+                    path: name.to_string(),
+                    size: 3,
+                    mtime: 100,
+                    hash: [5u8; 32],
+                    version: 1,
+                    deleted: false,
+                },
+            );
+        }
+
+        seed_journal_from_index(&mut db, &share, &fs, None).unwrap();
+        let after_first = (
+            db.journal_entry_count().unwrap(),
+            db.max_journal_seq(share.id).unwrap(),
+        );
+        assert_eq!(after_first, (2, 2));
+
+        // Restart: same index, same journal.
+        seed_journal_from_index(&mut db, &share, &fs, None).unwrap();
+        assert_eq!(
+            (
+                db.journal_entry_count().unwrap(),
+                db.max_journal_seq(share.id).unwrap()
+            ),
+            after_first,
+            "re-seeding must not append duplicate entries"
+        );
+    }
 }
 
 pub(crate) fn log_banner() {
@@ -788,7 +875,7 @@ async fn change_aggregator_task(
                 };
 
                 let label = format_share_label(&change.share_id, &share_labels);
-                // Always persist to ShareJournal; SyncCatchup intents are gated by push policy.
+                // Always persist to the share journal; SyncCatchup intents are gated by sync policy.
                 if let Some(change) = persist_incoming_change(&db, change).await {
                     info!("Logged change for share {}: {}", label, change.path);
                     if pending.len() >= MAX_PENDING_CHANGES {
@@ -997,7 +1084,7 @@ fn map_event_kind(event_kind: &EventKind) -> Option<ChangeKind> {
     None
 }
 
-fn seed_change_log_from_index(
+fn seed_journal_from_index(
     db: &mut db::Db,
     share: &ShareContext,
     fs: &Arc<dyn FileSystem>,
@@ -1006,16 +1093,21 @@ fn seed_change_log_from_index(
     let share_row_id = share.id;
     let now = OffsetDateTime::now_utc().unix_timestamp();
 
-    // Walk current index; if WAL is empty, seed; if WAL exists but entry missing, add.
-    let last_applied = db.get_last_applied_seq(share_row_id)?;
+    // Walk the current index; seed the journal with any path it does not yet
+    // cover. Skipping already-journaled paths is what keeps this idempotent:
+    // without it every restart re-appended the whole index under fresh seqs,
+    // inflating max_journal_seq and re-sending everything to every peer.
     for meta in share.index.values() {
         let mut meta = meta.clone();
-        let seq = db.next_change_seq(share_row_id)?;
-        meta.version = seq;
         let full_path = share.root_path.join(&meta.path);
         if is_in_workdir(workdir, &full_path) {
             continue;
         }
+        if db.journal_has_path(share_row_id, &meta.path)? {
+            continue;
+        }
+        let seq = db.next_journal_seq(share_row_id)?;
+        meta.version = seq;
         let meta_for_change = meta.clone();
         let change = FileChange {
             seq,
@@ -1030,12 +1122,7 @@ fn seed_change_log_from_index(
             meta: Some(meta_for_change),
         };
         let _ = db.upsert_file_meta(share_row_id, &meta);
-        if last_applied == 0 {
-            let _ = db.append_change_log(share_row_id, &change, now)?;
-        } else {
-            // Append only if this path has no entry beyond last_applied (lightweight check via progress)
-            let _ = db.append_change_log(share_row_id, &change, now)?;
-        }
+        db.append_journal_entry(share_row_id, &change, now, JournalOrigin::Local)?;
     }
 
     // Detect files missing from DB (filesystem drift) and add them.
@@ -1073,7 +1160,7 @@ fn seed_change_log_from_index(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(now);
             let hash = compute_file_hash(fs.as_ref(), &entry_path).unwrap_or_else(|_| [0u8; 32]);
-            let seq = db.next_change_seq(share_row_id)?;
+            let seq = db.next_journal_seq(share_row_id)?;
             let meta = FileMeta {
                 path: rel_path.clone(),
                 size,
@@ -1090,7 +1177,7 @@ fn seed_change_log_from_index(
                 meta: Some(meta.clone()),
             };
             let _ = db.upsert_file_meta(share_row_id, &meta);
-            let _ = db.append_change_log(share_row_id, &change, now)?;
+            db.append_journal_entry(share_row_id, &change, now, JournalOrigin::Local)?;
         }
     }
     Ok(())

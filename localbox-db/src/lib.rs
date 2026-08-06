@@ -2,8 +2,8 @@
 
 use models::{
     AppConfig, ChangeKind, ChatMessageRecord, FileChange, FileMeta, IntentBasis, IntentKind,
-    IntentOrigin, IntentStatus, ShareConfig, ShareContext, ShareId, ThreadKind, ThreadSummary,
-    TransferIntent, TransferRequest,
+    IntentOrigin, IntentStatus, JournalEntry, ShareConfig, ShareContext, ShareId, ThreadKind,
+    ThreadSummary, TransferIntent, TransferRequest,
 };
 use rusqlite::{params, types::Type, Connection, Result};
 use serde::{Deserialize, Serialize};
@@ -11,10 +11,21 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-const DB_SCHEMA_VERSION: i32 = 6;
+const DB_SCHEMA_VERSION: i32 = 7;
 
 pub struct Db {
     conn: Connection,
+}
+
+/// Where a journal entry came from. Determines whether it carries a foreign
+/// seq that must be kept out of the local `share_journal.seq` namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalOrigin {
+    /// Authored on this node by a filesystem event or index seed.
+    Local,
+    /// Replicated from `peer_id`. `origin_seq` is that peer's journal position,
+    /// or 0 for snapshot-derived changes (a manual push), which have none.
+    Peer { peer_id: i64, origin_seq: i64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,8 +60,11 @@ pub struct PeerProgressRow {
     pub share_row_id: i64,
     pub share_name: String,
     pub share_pc_name: String,
+    /// Outbound: positions in *our* journal shipped to / confirmed by this peer.
     pub last_seq_sent: i64,
     pub last_seq_acked: i64,
+    /// Inbound: how far of *their* journal we have taken in. Different namespace.
+    pub last_seq_recv: i64,
 }
 
 pub trait DbFactory: Send + Sync {
@@ -184,29 +198,48 @@ impl Db {
                 received_at INTEGER NOT NULL
             );
 
+            -- `seq` is ALWAYS locally allocated (invariant I1). A seq that arrived
+            -- from a peer lives in `origin_seq`, never here: the two are different
+            -- numbering namespaces and mixing them corrupts every watermark.
             CREATE TABLE IF NOT EXISTS share_journal (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                share_id      INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
-                seq           INTEGER NOT NULL,
-                path          TEXT NOT NULL,
-                kind          TEXT NOT NULL,
-                size          INTEGER,
-                mtime         INTEGER,
-                hash          BLOB,
-                version       INTEGER,
-                deleted       INTEGER NOT NULL,
-                created_at    INTEGER NOT NULL,
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                share_id       INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+                seq            INTEGER NOT NULL,
+                path           TEXT NOT NULL,
+                kind           TEXT NOT NULL,
+                size           INTEGER,
+                mtime          INTEGER,
+                hash           BLOB,
+                version        INTEGER,
+                deleted        INTEGER NOT NULL,
+                created_at     INTEGER NOT NULL,
+                -- NULL = authored locally. Set = replicated from this peer.
+                origin_peer_id INTEGER REFERENCES peers(id) ON DELETE SET NULL,
+                -- The originating node's journal seq. 0 = snapshot-derived
+                -- (a manual push), which has no position in any journal.
+                origin_seq     INTEGER NOT NULL DEFAULT 0,
                 UNIQUE (share_id, seq)
             );
 
+            -- NOTE: the replay-gate index (idx_share_journal_origin) is created by
+            -- the v7 migration, not here. This batch runs before migrations, so on
+            -- an upgraded DB the origin columns do not exist yet at this point.
+
+            -- last_seq_sent/last_seq_acked are OUTBOUND: positions in *our* journal
+            -- that we have shipped to / had confirmed by this peer.
+            -- last_seq_recv is INBOUND: how far of *their* journal we have taken in.
+            -- The two are different namespaces; never assign one from the other.
             CREATE TABLE IF NOT EXISTS peer_progress (
                 peer_id        INTEGER NOT NULL REFERENCES peers(id) ON DELETE CASCADE,
                 share_id       INTEGER NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
                 last_seq_sent  INTEGER NOT NULL DEFAULT 0,
                 last_seq_acked INTEGER NOT NULL DEFAULT 0,
+                last_seq_recv  INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (peer_id, share_id)
             );
 
+            -- Denormalized MAX(share_journal.seq) cache. Local namespace only;
+            -- not a replay gate (see idx_share_journal_origin for that).
             CREATE TABLE IF NOT EXISTS share_progress (
                 share_id       INTEGER NOT NULL UNIQUE REFERENCES shares(id) ON DELETE CASCADE,
                 last_seq_applied INTEGER NOT NULL DEFAULT 0
@@ -435,10 +468,73 @@ impl Db {
             }
         }
 
+        if current < 7 {
+            // Separate the two seq namespaces that previously shared
+            // `share_journal.seq` and `peer_progress.last_seq_acked`.
+            //
+            // Safe because a share row is either owner-authored or a mirror
+            // replica, never both: batches are only ever produced for
+            // locally-owned shares (ShareId is derived from the local pc_name),
+            // mirrors are registered under the remote pc_name, and `shares` is
+            // UNIQUE (share_name, pc_name). So a legacy `last_seq_acked` had
+            // exactly one meaning per row -- but we cannot tell which from the
+            // value alone, so we discard rather than guess (see below).
+            if !self.has_column("share_journal", "origin_peer_id")? {
+                self.conn.execute(
+                    "ALTER TABLE share_journal ADD COLUMN origin_peer_id INTEGER REFERENCES peers(id) ON DELETE SET NULL",
+                    [],
+                )?;
+            }
+            if !self.has_column("share_journal", "origin_seq")? {
+                self.conn.execute(
+                    "ALTER TABLE share_journal ADD COLUMN origin_seq INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            if !self.has_column("peer_progress", "last_seq_recv")? {
+                self.conn.execute(
+                    "ALTER TABLE peer_progress ADD COLUMN last_seq_recv INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
+            self.conn.execute_batch(
+                r#"
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_share_journal_origin
+                    ON share_journal (share_id, origin_peer_id, origin_seq)
+                    WHERE origin_peer_id IS NOT NULL AND origin_seq > 0;
+
+                UPDATE transfer_intents SET kind   = 'snapshot_push' WHERE kind   = 'push';
+                UPDATE transfer_intents SET origin = 'auto_sync'     WHERE origin = 'auto_push';
+
+                -- Pre-release: existing watermarks may already be contaminated by
+                -- the namespace collision, and there is no way to tell a good value
+                -- from a bad one. Reset and re-catch-up; that is idempotent because
+                -- `should_apply` rejects changes at or below the current version.
+                UPDATE peer_progress
+                   SET last_seq_sent = 0, last_seq_acked = 0, last_seq_recv = 0;
+
+                -- Queued payloads were serialized under the old semantics.
+                DELETE FROM outbound_queue;
+                "#,
+            )?;
+        }
+
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {DB_SCHEMA_VERSION};"))?;
 
         Ok(())
+    }
+
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn schema_version(&self) -> Result<i32> {
@@ -659,15 +755,25 @@ impl Db {
         Ok(())
     }
 
-    /// Clean up old batches to stop the table growing forever.
-    /// max_age_secs: delete batches older than now - max_age_secs.
+    /// Clean up old batches to stop the tables growing forever.
+    /// max_age_secs: delete rows older than now - max_age_secs.
+    ///
+    /// Covers both the `batches` audit log and delivered `outbound_queue` rows.
+    /// The latter matters: `outbound_queue_depth` only counts `status != 'sent'`,
+    /// so without this sweep the table grows without bound (each row holding a
+    /// full serialized manifest) while both the queue-depth guard and
+    /// `localbox monitor` keep reporting healthy.
     pub fn cleanup_old_batches(&self, max_age_secs: i64) -> Result<usize> {
         use time::OffsetDateTime;
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let cutoff = now - max_age_secs;
-        let rows = self
+        let mut rows = self
             .conn
             .execute("DELETE FROM batches WHERE created_at < ?1", params![cutoff])?;
+        rows += self.conn.execute(
+            "DELETE FROM outbound_queue WHERE status = 'sent' AND created_at < ?1",
+            params![cutoff],
+        )?;
         Ok(rows)
     }
 
@@ -898,9 +1004,9 @@ impl Db {
         Ok(rows > 0)
     }
 
-    /* Change log + progress */
+    /* Share journal + progress watermarks */
 
-    pub fn next_change_seq(&self, share_row_id: i64) -> Result<i64> {
+    pub fn next_journal_seq(&self, share_row_id: i64) -> Result<i64> {
         let mut stmt = self
             .conn
             .prepare("SELECT COALESCE(MAX(seq), 0) + 1 FROM share_journal WHERE share_id = ?1")?;
@@ -908,16 +1014,30 @@ impl Db {
         Ok(next)
     }
 
-    pub fn append_change_log(
+    /// Append one entry to a share's journal.
+    ///
+    /// The returned seq is **always locally allocated** (invariant I1) —
+    /// `change.seq` is deliberately ignored. When the entry came from a peer,
+    /// pass its journal position as [`JournalOrigin::Peer::origin_seq`] so it is
+    /// recorded in the peer's namespace instead of being conflated with ours.
+    ///
+    /// Returns `Ok(None)` when this peer entry has already been journaled, which
+    /// is a normal no-op rather than an error. Callers must distinguish that from
+    /// `Err`, which means the append genuinely failed.
+    pub fn append_journal_entry(
         &self,
         share_row_id: i64,
         change: &FileChange,
         created_at: i64,
-    ) -> Result<i64> {
-        let seq = if change.seq > 0 {
-            change.seq
-        } else {
-            self.next_change_seq(share_row_id)?
+        origin: JournalOrigin,
+    ) -> Result<Option<i64>> {
+        let seq = self.next_journal_seq(share_row_id)?;
+        let (origin_peer_id, origin_seq) = match origin {
+            JournalOrigin::Local => (None, 0),
+            JournalOrigin::Peer {
+                peer_id,
+                origin_seq,
+            } => (Some(peer_id), origin_seq.max(0)),
         };
 
         let (size, mtime, hash, version, deleted) = match &change.meta {
@@ -931,11 +1051,15 @@ impl Db {
             None => (None, None, None, None, true),
         };
 
-        self.conn.execute(
+        // DO NOTHING (not IGNORE) so a genuine failure still surfaces as Err,
+        // while a re-delivered peer entry collapses into a reported no-op.
+        let inserted = self.conn.execute(
             r#"
             INSERT INTO share_journal
-              (share_id, seq, path, kind, size, mtime, hash, version, deleted, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+              (share_id, seq, path, kind, size, mtime, hash, version, deleted,
+               created_at, origin_peer_id, origin_seq)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT DO NOTHING
             "#,
             params![
                 share_row_id,
@@ -947,21 +1071,29 @@ impl Db {
                 hash,
                 version,
                 deleted as i64,
-                created_at
+                created_at,
+                origin_peer_id,
+                origin_seq
             ],
         )?;
+        if inserted == 0 {
+            return Ok(None);
+        }
+
+        // MAX, not assignment: a late lower-seq append must never rewind the cache.
         self.conn.execute(
             r#"
             INSERT INTO share_progress (share_id, last_seq_applied)
             VALUES (?1, ?2)
-            ON CONFLICT(share_id) DO UPDATE SET last_seq_applied=excluded.last_seq_applied
+            ON CONFLICT(share_id) DO UPDATE SET
+                last_seq_applied = MAX(share_progress.last_seq_applied, excluded.last_seq_applied)
             "#,
             params![share_row_id, seq],
         )?;
-        Ok(seq)
+        Ok(Some(seq))
     }
 
-    pub fn get_last_applied_seq(&self, share_row_id: i64) -> Result<i64> {
+    pub fn journal_high_water(&self, share_row_id: i64) -> Result<i64> {
         let mut stmt = self
             .conn
             .prepare("SELECT last_seq_applied FROM share_progress WHERE share_id=?1")?;
@@ -972,15 +1104,21 @@ impl Db {
         }
     }
 
-    pub fn list_changes_since(
+    /// Read a share's journal in local-seq order. `from_seq_exclusive` is
+    /// exclusive, so pass a watermark directly.
+    ///
+    /// `change.share_id` is left zeroed — the row stores a share *row id*, not
+    /// the 16-byte ShareId. Callers that put these on the wire must set it.
+    pub fn list_journal_since(
         &self,
         share_row_id: i64,
         from_seq_exclusive: i64,
         limit: usize,
-    ) -> Result<Vec<FileChange>> {
+    ) -> Result<Vec<JournalEntry>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT seq, path, kind, size, mtime, hash, version, deleted
+            SELECT seq, path, kind, size, mtime, hash, version, deleted,
+                   origin_peer_id, origin_seq
             FROM share_journal
             WHERE share_id = ?1 AND seq > ?2
             ORDER BY seq ASC
@@ -998,6 +1136,8 @@ impl Db {
                 let hash: Option<Vec<u8>> = row.get(5)?;
                 let version: Option<i64> = row.get(6)?;
                 let deleted: i64 = row.get(7)?;
+                let origin_peer_id: Option<i64> = row.get(8)?;
+                let origin_seq: i64 = row.get(9)?;
                 let ck = match kind.as_str() {
                     "Create" => ChangeKind::Create,
                     "Modify" => ChangeKind::Modify,
@@ -1021,12 +1161,16 @@ impl Db {
                         deleted: false,
                     })
                 };
-                Ok(FileChange {
-                    seq,
-                    share_id: ShareId([0u8; 16]), // caller should overwrite
-                    path,
-                    kind: ck,
-                    meta,
+                Ok(JournalEntry {
+                    origin_peer_id,
+                    origin_seq,
+                    change: FileChange {
+                        seq,
+                        share_id: ShareId([0u8; 16]),
+                        path,
+                        kind: ck,
+                        meta,
+                    },
                 })
             },
         )?;
@@ -1057,6 +1201,8 @@ impl Db {
         }
     }
 
+    /// Assigns outbound watermarks outright. Admin/test setup only —
+    /// use `bump_*` on hot paths so watermarks stay monotonic.
     pub fn set_peer_progress(
         &self,
         peer_id: i64,
@@ -1083,13 +1229,16 @@ impl Db {
             INSERT INTO peer_progress (peer_id, share_id, last_seq_sent, last_seq_acked)
             VALUES (?1, ?2, ?3, 0)
             ON CONFLICT(peer_id, share_id) DO UPDATE SET
-                last_seq_sent = excluded.last_seq_sent
+                last_seq_sent = MAX(peer_progress.last_seq_sent, excluded.last_seq_sent)
             "#,
             params![peer_id, share_row_id, new_sent],
         )?;
         Ok(())
     }
 
+    /// Outbound watermark: how far of *our* journal this peer has confirmed.
+    /// MAX-based — a stale or malformed ack must never rewind sync, because
+    /// `from_seq` for the next SyncCatchup is read straight off this value.
     pub fn bump_last_seq_acked(
         &self,
         peer_id: i64,
@@ -1101,10 +1250,44 @@ impl Db {
             INSERT INTO peer_progress (peer_id, share_id, last_seq_sent, last_seq_acked)
             VALUES (?1, ?2, ?3, ?3)
             ON CONFLICT(peer_id, share_id) DO UPDATE SET
-                last_seq_acked = excluded.last_seq_acked,
+                last_seq_acked = MAX(peer_progress.last_seq_acked, excluded.last_seq_acked),
                 last_seq_sent = MAX(peer_progress.last_seq_sent, excluded.last_seq_sent)
             "#,
             params![peer_id, share_row_id, new_acked],
+        )?;
+        Ok(())
+    }
+
+    /// Inbound watermark: how far of *this peer's* journal we have taken in.
+    /// This is the value that belongs in `TransferRequest.since_seq` — never
+    /// `last_seq_acked`, which lives in our own namespace.
+    pub fn inbound_watermark(&self, peer_id: i64, share_row_id: i64) -> Result<i64> {
+        let mut stmt = self.conn.prepare(
+            "SELECT last_seq_recv FROM peer_progress WHERE peer_id = ?1 AND share_id = ?2",
+        )?;
+        match stmt.query_row(params![peer_id, share_row_id], |row| row.get(0)) {
+            Ok(v) => Ok(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Advance the inbound watermark. Only journal-derived (SyncCatchup) traffic
+    /// may call this: snapshot pushes carry no journal position (invariant I6).
+    pub fn bump_inbound_watermark(
+        &self,
+        peer_id: i64,
+        share_row_id: i64,
+        new_recv: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            INSERT INTO peer_progress (peer_id, share_id, last_seq_sent, last_seq_acked, last_seq_recv)
+            VALUES (?1, ?2, 0, 0, ?3)
+            ON CONFLICT(peer_id, share_id) DO UPDATE SET
+                last_seq_recv = MAX(peer_progress.last_seq_recv, excluded.last_seq_recv)
+            "#,
+            params![peer_id, share_row_id, new_recv],
         )?;
         Ok(())
     }
@@ -1182,7 +1365,8 @@ impl Db {
                 s.share_name,
                 s.pc_name,
                 pp.last_seq_sent,
-                pp.last_seq_acked
+                pp.last_seq_acked,
+                pp.last_seq_recv
             FROM peer_progress pp
             JOIN peers p ON p.id = pp.peer_id
             JOIN shares s ON s.id = pp.share_id
@@ -1199,6 +1383,7 @@ impl Db {
                 share_pc_name: row.get(5)?,
                 last_seq_sent: row.get(6)?,
                 last_seq_acked: row.get(7)?,
+                last_seq_recv: row.get(8)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1224,15 +1409,19 @@ impl Db {
         Ok(n)
     }
 
-    pub fn share_journal_total(&self) -> Result<i64> {
+    /// Whether a share's journal already carries any entry for `path`.
+    /// Used to keep startup seeding idempotent across restarts.
+    pub fn journal_has_path(&self, share_row_id: i64, path: &str) -> Result<bool> {
+        self.conn
+            .prepare("SELECT 1 FROM share_journal WHERE share_id = ?1 AND path = ?2 LIMIT 1")?
+            .exists(params![share_row_id, path])
+    }
+
+    /// Total journal entries across all shares.
+    pub fn journal_entry_count(&self) -> Result<i64> {
         let mut stmt = self.conn.prepare("SELECT COUNT(*) FROM share_journal")?;
         let n: i64 = stmt.query_row([], |row| row.get(0))?;
         Ok(n)
-    }
-
-    /// Backward-compatible alias for [`Self::share_journal_total`].
-    pub fn change_log_total(&self) -> Result<i64> {
-        self.share_journal_total()
     }
 
     pub fn find_peer_by_key(&self, peer_key: &str) -> Result<Option<PeerRow>> {
@@ -1540,7 +1729,7 @@ impl Db {
         let status_s: String = row.get(3)?;
         Ok(TransferIntent {
             id: row.get(0)?,
-            kind: IntentKind::parse(&kind_s).unwrap_or(IntentKind::Push),
+            kind: IntentKind::parse(&kind_s).unwrap_or(IntentKind::SnapshotPush),
             origin: IntentOrigin::parse(&origin_s).unwrap_or(IntentOrigin::User),
             status: IntentStatus::parse(&status_s).unwrap_or(IntentStatus::Pending),
             share_name: row.get(4)?,
@@ -1616,6 +1805,29 @@ impl Db {
         Ok(())
     }
 
+    /// Look up the intent raised for a `TransferRequest`, so the eventual
+    /// `TransferReply` can complete it instead of leaving it active forever.
+    pub fn get_transfer_intent_by_request_id(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<TransferIntent>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT id, kind, origin, status, share_name, share_id, peer_id, basis_json,
+                   request_id, last_error, created_at, updated_at
+            FROM transfer_intents
+            WHERE request_id = ?1
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )?;
+        match stmt.query_row(params![request_id], Self::row_to_transfer_intent) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn list_transfer_intents(
         &self,
         statuses: Option<&[IntentStatus]>,
@@ -1685,14 +1897,8 @@ impl Db {
     }
 
     /// All outbound batches for an intent (any status).
-    pub fn count_batches_for_intent(&self, intent_id: &str) -> Result<i64> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT COUNT(*) FROM outbound_queue WHERE intent_id = ?1")?;
-        stmt.query_row(params![intent_id], |row| row.get(0))
-    }
 
-    pub fn max_change_seq(&self, share_row_id: i64) -> Result<i64> {
+    pub fn max_journal_seq(&self, share_row_id: i64) -> Result<i64> {
         let mut stmt = self
             .conn
             .prepare("SELECT COALESCE(MAX(seq), 0) FROM share_journal WHERE share_id = ?1")?;
@@ -1743,15 +1949,17 @@ impl Db {
                 let mut start = *from_seq;
                 while start < *to_seq {
                     let chunk =
-                        self.list_changes_since(share_row_id, start, MAX_CHANGES_PER_BATCH)?;
+                        self.list_journal_since(share_row_id, start, MAX_CHANGES_PER_BATCH)?;
                     if chunk.is_empty() {
                         break;
                     }
                     let mut advanced = false;
-                    for mut ch in chunk {
+                    for entry in chunk {
+                        let mut ch = entry.change;
                         if ch.seq > *to_seq {
                             break;
                         }
+                        // The journal stores a share row id, not the wire ShareId.
                         ch.share_id = share_id;
                         start = ch.seq;
                         all.push(ch);
@@ -1787,12 +1995,25 @@ impl Db {
         let mut batch_ids = Vec::new();
         for chunk in changes.chunks(MAX_CHANGES_PER_BATCH) {
             let batch_id = uuid::Uuid::new_v4().to_string();
+            // Tell the receiver how to read these seqs. A chunk covers from the
+            // range start up to its own last seq, so a partial send still lets
+            // the receiver advance to exactly what it received.
+            let (basis, from_seq, to_seq) = match &basis {
+                IntentBasis::Snapshot { .. } => (models::BatchBasis::Snapshot, 0, 0),
+                IntentBasis::JournalRange { from_seq, .. } => {
+                    let chunk_to = chunk.last().map(|c| c.seq).unwrap_or(0);
+                    (models::BatchBasis::Journal, *from_seq, chunk_to)
+                }
+            };
             let manifest = models::BatchManifest {
                 protocol_version: models::WIRE_PROTOCOL_VERSION,
                 batch_id: batch_id.clone(),
                 share_id,
                 from_node: from_node.to_string(),
                 created_at: now,
+                basis,
+                journal_from_seq: from_seq,
+                journal_to_seq: to_seq,
                 changes: chunk.to_vec(),
             };
             self.enqueue_outbound_batch(&manifest, peer_id, Some(&intent_id))?;
@@ -1856,24 +2077,23 @@ impl Db {
         self.mark_outbound_sent(batch_id)?;
         let intent_id = self.get_outbound_intent_id(batch_id)?;
         let Some(intent_id) = intent_id else {
-            // Legacy queue rows without intent: preserve old watermark behavior.
-            if max_seq > 0 {
-                if let Ok(share_row_id) = self.get_share_row_id_by_share_id(share_id) {
-                    let _ = self.bump_last_seq_sent(peer_id, share_row_id, max_seq);
-                }
-            }
+            // No intent to attribute this batch to, so we cannot tell whether
+            // max_seq is a journal position or a snapshot's placeholder 0.
+            // Leave the watermark alone rather than guess.
             return Ok(());
         };
         if let Some(intent) = self.get_transfer_intent(&intent_id)? {
-            if intent.kind.updates_peer_progress() && max_seq > 0 {
+            if intent.kind.awaits_ack() && max_seq > 0 {
                 if let Ok(share_row_id) = self.get_share_row_id_by_share_id(share_id) {
                     let _ = self.bump_last_seq_sent(peer_id, share_row_id, max_seq);
                 }
             }
             let pending = self.count_pending_batches_for_intent(&intent_id)?;
-            if pending == 0 && !intent.kind.updates_peer_progress() {
-                // Snapshot / Push / PullFulfill: complete on send (no watermark wait).
-                self.update_transfer_intent_status(&intent_id, IntentStatus::Acked, None)?;
+            if pending == 0 && !intent.kind.awaits_ack() {
+                // SnapshotPush / PullFulfill: nothing will confirm these, so
+                // `Sent` is their terminal state. Reporting them as `Acked`
+                // would claim a confirmation the peer never gave.
+                self.update_transfer_intent_status(&intent_id, IntentStatus::Sent, None)?;
             } else {
                 self.update_transfer_intent_status(&intent_id, IntentStatus::InFlight, None)?;
             }
@@ -1896,11 +2116,18 @@ impl Db {
             }
         }
         if intent_ids.is_empty() {
+            // No batch_id on the ack: fall back to sent batches for this peer+share.
+            // Restricted to sync_catchup because only that kind owns a seq range —
+            // resolving to a snapshot push here would bump our watermark with a
+            // number from the receiver's namespace.
             let mut stmt = self.conn.prepare(
                 r#"
-                SELECT DISTINCT intent_id
-                FROM outbound_queue
-                WHERE peer_id = ?1 AND share_id = ?2 AND intent_id IS NOT NULL AND status = 'sent'
+                SELECT DISTINCT oq.intent_id
+                FROM outbound_queue oq
+                JOIN transfer_intents ti ON ti.id = oq.intent_id
+                WHERE oq.peer_id = ?1 AND oq.share_id = ?2
+                  AND oq.intent_id IS NOT NULL AND oq.status = 'sent'
+                  AND ti.kind = 'sync_catchup'
                 "#,
             )?;
             let rows = stmt.query_map(params![peer_id, &share_id.0[..]], |row| {
@@ -1912,24 +2139,34 @@ impl Db {
         }
 
         if intent_ids.is_empty() {
-            // Legacy outbound rows without intents: keep prior watermark behavior.
-            if let Ok(share_row_id) = self.get_share_row_id_by_share_id(share_id) {
-                let _ = self.bump_last_seq_acked(peer_id, share_row_id, upto_seq);
-            }
+            // Nothing resolvable. Do NOT bump: an unattributed upto_seq cannot be
+            // trusted to be in our namespace, and bump_last_seq_acked is one-way.
             return Ok(());
         }
 
         let mut bumped = false;
         for id in &intent_ids {
             if let Some(intent) = self.get_transfer_intent(id)? {
-                if intent.kind.updates_peer_progress() && !bumped {
-                    if let Ok(share_row_id) = self.get_share_row_id_by_share_id(share_id) {
-                        let _ = self.bump_last_seq_acked(peer_id, share_row_id, upto_seq);
-                        bumped = true;
+                if intent.kind.awaits_ack() && !bumped {
+                    // Clamp to the range this intent actually covers. A peer can
+                    // only ever confirm what we sent; anything beyond that would
+                    // push from_seq past our own journal and stall sync forever.
+                    let covered = match &intent.basis {
+                        IntentBasis::JournalRange { to_seq, .. } => upto_seq.min(*to_seq),
+                        IntentBasis::Snapshot { .. } => 0,
+                    };
+                    if covered > 0 {
+                        if let Ok(share_row_id) = self.get_share_row_id_by_share_id(share_id) {
+                            let _ = self.bump_last_seq_acked(peer_id, share_row_id, covered);
+                            bumped = true;
+                        }
                     }
                 }
+                // Only a kind that actually waits for confirmation may reach
+                // Acked. A stray ack naming a Sent snapshot intent is a no-op.
                 let pending = self.count_pending_batches_for_intent(id)?;
                 if pending == 0
+                    && intent.kind.awaits_ack()
                     && matches!(
                         intent.status,
                         IntentStatus::Materialized | IntentStatus::InFlight
@@ -1942,27 +2179,6 @@ impl Db {
         Ok(())
     }
 
-    pub fn list_intent_ids_for_sent_batches(
-        &self,
-        peer_id: i64,
-        share_id: &ShareId,
-    ) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            r#"
-            SELECT DISTINCT intent_id
-            FROM outbound_queue
-            WHERE peer_id = ?1 AND share_id = ?2 AND intent_id IS NOT NULL
-            "#,
-        )?;
-        let rows = stmt.query_map(params![peer_id, &share_id.0[..]], |row| {
-            row.get::<_, String>(0)
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    }
 
     pub fn update_chat_message_status(&self, message_id: &str, status: &str) -> Result<()> {
         self.conn.execute(

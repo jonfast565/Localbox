@@ -70,9 +70,12 @@ pub struct ShareConfig {
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
     pub max_file_size_bytes: Option<u64>,
-    /// Auto-push local changes to peers (default: manual).
-    #[serde(default)]
-    pub push: TransferMode,
+    /// Auto-sync local journal changes to peers via SyncCatchup (default: manual).
+    /// Note: this gates *journal sync*, not `IntentKind::SnapshotPush` — a manual
+    /// `localbox push` works regardless of this setting.
+    /// `push` is the pre-v7 spelling of this key.
+    #[serde(default, alias = "push")]
+    pub sync: TransferMode,
     /// Auto-pull / request from peers (default: manual).
     #[serde(default)]
     pub pull: TransferMode,
@@ -89,7 +92,7 @@ impl ShareConfig {
             recursive,
             ignore_patterns: Vec::new(),
             max_file_size_bytes: None,
-            push: TransferMode::Manual,
+            sync: TransferMode::Manual,
             pull: TransferMode::Manual,
             request_handling: None,
         }
@@ -103,8 +106,9 @@ pub struct PeerPolicy {
     /// Optional share name; if omitted, applies to all shares.
     #[serde(default)]
     pub share: Option<String>,
-    #[serde(default)]
-    pub push: Option<TransferMode>,
+    /// `push` is the pre-v7 spelling of this key.
+    #[serde(default, alias = "push")]
+    pub sync: Option<TransferMode>,
     #[serde(default)]
     pub pull: Option<TransferMode>,
     #[serde(default)]
@@ -112,15 +116,17 @@ pub struct PeerPolicy {
 }
 
 impl AppConfig {
-    pub fn resolve_push_mode(&self, share_name: &str, peer_key: Option<&str>) -> TransferMode {
+    /// Whether journal sync (SyncCatchup) runs automatically for this share/peer.
+    /// Does not gate manual `IntentKind::SnapshotPush`.
+    pub fn resolve_sync_mode(&self, share_name: &str, peer_key: Option<&str>) -> TransferMode {
         if let Some(peer) = peer_key {
             if let Some(p) = self.find_peer_policy(peer, Some(share_name)) {
-                if let Some(mode) = p.push {
+                if let Some(mode) = p.sync {
                     return mode;
                 }
             }
             if let Some(p) = self.find_peer_policy(peer, None) {
-                if let Some(mode) = p.push {
+                if let Some(mode) = p.sync {
                     return mode;
                 }
             }
@@ -128,7 +134,7 @@ impl AppConfig {
         self.shares
             .iter()
             .find(|s| s.name == share_name)
-            .map(|s| s.push)
+            .map(|s| s.sync)
             .unwrap_or(TransferMode::Manual)
     }
 

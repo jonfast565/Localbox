@@ -80,7 +80,7 @@ fn app_config_json_round_trip() {
             recursive: true,
             ignore_patterns: Vec::new(),
             max_file_size_bytes: None,
-            push: Default::default(),
+            sync: Default::default(),
             pull: Default::default(),
             request_handling: None,
         }],

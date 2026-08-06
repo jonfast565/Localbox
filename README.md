@@ -1,12 +1,12 @@
 # Localbox
 
-Localbox is a peer-to-peer file replication engine for small networks. Each node is both a client and a server: it discovers peers via UDP, dials and listens over TCP/TLS, and exchanges encrypted batches of file metadata and contents. Transfers are **manual by default**; opt into auto push and/or auto pull per share (or per peer). Peers can also chat (DM or share-scoped threads) with a persistent inbox.
+Localbox is a peer-to-peer file replication engine for small networks. Each node is both a client and a server: it discovers peers via UDP, dials and listens over TCP/TLS, and exchanges encrypted batches of file metadata and contents. Transfers are **manual by default**; opt into auto sync and/or auto pull per share (or per peer). Peers can also chat (DM or share-scoped threads) with a persistent inbox.
 
 ## Highlights
 
 - **End-to-end security:** TLS 1.3 + mutual authentication by default, certificates bound to peer identity, optional plaintext fallback, fingerprint pinning, and on-disk TLS material rotation with live reloads.
 - **Two ways to establish trust:** a shared network CA with token-based enrollment (`localbox ca` / `localbox enroll`) so a new machine joins by pasting one string, or the original per-node signed bootstrap invites.
-- **On-demand transfers:** `push` / `pull` / `request` / `reply` over the wire (`TransferRequest` / `TransferReply`) plus optional `push=auto` / `pull=auto` policies. Every outbound transfer is a `TransferIntent` (Snapshot from the file index, or SyncCatchup from the share journal).
+- **On-demand transfers:** `push` / `pull` / `request` / `reply` over the wire (`TransferRequest` / `TransferReply`) plus optional `sync=auto` / `pull=auto` policies. Every outbound transfer is a `TransferIntent` (Snapshot from the file index, or SyncCatchup from the share journal).
 - **Interactive shell:** `localbox run --interactive` (ephemeral engine + REPL) or `localbox shell` attached to a running daemon’s control plane (Unix socket or Windows named pipe). Use `intents` / `intent show` to inspect the outbox.
 - **Chat + inbox:** Peer DMs and share-scoped threads, with dead CLI (`localbox chat …`) or live REPL; optional file attachments trigger a push into a share.
 - **Desktop GUI:** `localbox-gui` (iced) talks to the same control socket for status, transfers, and chat.
@@ -196,12 +196,14 @@ are, and are visible in `localbox status`.
 ## Sync & Peering Semantics
 
 - **Ownership:** A share is owned by the node that watches it. Peers replicate it under `<remote_share_root>/<peer_pc>/<peer_instance>/<share_name>` when transfers run.
-- **ShareJournal vs outbox:** Local FS events update the file index (`files`) and append to the **ShareJournal** (`share_journal` — local history only). Outbound work is always a **TransferIntent** that materializes into `outbound_queue`. Continuous sync uses `SyncCatchup` from journal ranges; manual push/chat/reply use `Push` / `PullFulfill` **Snapshot** intents from the index. `peer_progress` advances **only** for `SyncCatchup`.
-- **Manual by default:** Journal writes always happen, but SyncCatchup intents are created only when `push = "auto"` (or a matching `[[peer_policies]]`). Discovery bootstrap/catch-up is similarly gated. Set `pull = "auto"` to send `TransferRequest`s on connect.
+- **Share journal vs outbox:** Local FS events update the file index (`files`) and append to the **share journal** (`share_journal` — local history only). Outbound work is always a **TransferIntent** that materializes into `outbound_queue`. Continuous sync uses `SyncCatchup` from journal ranges; manual push/chat/reply use `SnapshotPush` / `PullFulfill` **Snapshot** intents from the index. `peer_progress` advances **only** for `SyncCatchup`.
+- **Manual by default:** Journal writes always happen, but SyncCatchup intents are created only when `sync = "auto"` (or a matching `[[peer_policies]]`). Discovery bootstrap/catch-up is similarly gated. Set `pull = "auto"` to send `TransferRequest`s on connect. `sync` gates *journal sync only* — `localbox push` works on demand regardless. (`push` is accepted as a deprecated alias for `sync`.)
+- **Intent completion:** `Acked` means the peer confirmed via `BatchAck` and is reached only by `SyncCatchup`. Everything else — `SnapshotPush`, `PullFulfill`, an accepted `PullRequest` — terminates as `Sent`, meaning the batches reached the transport with no confirmation expected. Both are terminal, so `is_active()` alone decides what still counts as in-flight work.
 - **Request/reply:** `pull`/`request` sends `TransferRequest`; the peer auto-fulfills only when `request_handling = "auto"`, otherwise pending until `reply accept|decline`. Fulfillment is a `PullFulfill` intent.
-- **Batching / framing (wire v3):** Materialized intents become `BatchManifest` batches; `FileChunk` carries `batch_id` + `protocol_version`; `BatchAck` may include `batch_id` so the sender resolves the DB-local intent. Intent ids never go on the wire.
+- **Batching / framing (wire v4):** Materialized intents become `BatchManifest` batches; `FileChunk` carries `batch_id` + `protocol_version`; `BatchAck` may include `batch_id` so the sender resolves the DB-local intent. Intent ids never go on the wire.
+- **Seq namespaces:** Every `share_journal.seq` is allocated **locally**; a peer's position is kept separately as `origin_peer_id`/`origin_seq`, with a partial unique index over the pair acting as the replay gate. `BatchManifest.basis` (`journal` / `snapshot`) tells the receiver whether `FileChange.seq` holds real positions, and `journal_from_seq`/`journal_to_seq` declare the range so a filtered-out change cannot pin the watermark. `BatchAck.upto_seq` is always in the **sender's** namespace, and 0 for a snapshot batch. Outbound watermarks (`last_seq_sent`/`last_seq_acked`, our journal) are separate from the inbound one (`last_seq_recv`, theirs) — `TransferRequest.since_seq` comes from the latter.
 - **Chat:** Peer DM thread ids are deterministic (`min(local,remote)`); share threads key off share name. Messages persist in SQLite (`chat_threads` / `chat_messages`).
-- **Discovery:** Nodes broadcast `DISCOVER` and respond with `HERE`. Protocol version is 3 (upgrade peers together for batch_id framing).
+- **Discovery:** Nodes broadcast `DISCOVER` and respond with `HERE`. Protocol version is 4; there is no version negotiation, so all peers must be upgraded together.
 - **Control plane:** Daemon listens on `control_socket` for newline-delimited JSON (`shell`, dead CLI, `localbox-gui`). Default `localbox.sock` on Unix, `\\.\pipe\localbox` on Windows. List intents with `intents` / `intent show --id …`.
 
 ## Application States
@@ -251,7 +253,7 @@ Optional `--config path/to/config.toml` picks up `control_socket` when `--socket
 
 - `core/` – `localbox-core` package (CLI + engine, binary `localbox`).
 - `db/` – `localbox-db` (SQLite access layer and persistence helpers).
-- `models/` – `localbox-models` (config/wire/ShareJournal/TransferIntent structs).
+- `models/` – `localbox-models` (config/wire/JournalEntry/TransferIntent structs).
 - `peering/` – `localbox-peering` (discovery, TLS/plain connections, batching, chunk streaming).
 - `protocol/` – `localbox-protocol` (Protobuf schema + framing helpers).
 - `tls/` – `localbox-tls` (runtime TLS, invite workflow, trust-store utilities).

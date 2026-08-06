@@ -191,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
             let progress_count = progress.len();
             let queue_depth = db.outbound_queue_depth()?;
             let queue_due = db.outbound_queue_due_now(now)?;
-            let change_log_total = db.change_log_total()?;
+            let journal_entries = db.journal_entry_count()?;
             let db_filename = cfg
                 .db_path
                 .file_name()
@@ -270,7 +270,7 @@ async fn main() -> anyhow::Result<()> {
                                 "metrics": {
                                     "outbound_queue_depth": queue_depth,
                                     "outbound_queue_due_now": queue_due,
-                                    "change_log_total": change_log_total,
+                                    "journal_entries": journal_entries,
                                 },
                                 "peers": peers_json(),
                                 "shares": shares_json(),
@@ -300,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
                             "{}",
                             serde_json::to_string_pretty(&json!({
                                 "metrics": {
-                                    "change_log_total": change_log_total,
+                                    "journal_entries": journal_entries,
                                 },
                             }))?
                         );
@@ -382,8 +382,8 @@ async fn main() -> anyhow::Result<()> {
                         println!("Metrics status:");
                         let mut metrics_table = Table::new();
                         metrics_table.load_preset(ASCII_FULL_CONDENSED);
-                        metrics_table.set_header(vec!["change_log_total"]);
-                        metrics_table.add_row(vec![change_log_total.to_string()]);
+                        metrics_table.set_header(vec!["journal_entries"]);
+                        metrics_table.add_row(vec![journal_entries.to_string()]);
                         println!("{metrics_table}");
                     }
                     StatusSection::Peers => {

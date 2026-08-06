@@ -1,13 +1,14 @@
 use anyhow::Result;
 use models::{
-    BatchAck, BatchManifest, ChangeKind, ChatAck, ChatAttachment, ChatMessage, FileChange,
+    BatchAck, BatchBasis, BatchManifest, ChangeKind, ChatAck, ChatAttachment, ChatMessage, FileChange,
     FileChunk, FileMeta, ThreadKind, TransferPushOffer, TransferReply, TransferReplyStatus,
     TransferRequest, WireMessage,
 };
 use prost::Message;
 
 use crate::proto::{
-    wire_envelope::Msg as ProtoMsg, BatchAck as ProtoBatchAck, BatchManifest as ProtoBatch,
+    wire_envelope::Msg as ProtoMsg, BatchAck as ProtoBatchAck, BatchBasis as ProtoBatchBasis,
+    BatchManifest as ProtoBatch,
     ChangeKind as ProtoChange, ChatAck as ProtoChatAck, ChatMessage as ProtoChatMessage,
     FileChange as ProtoFileChange, FileChunk as ProtoFileChunk, FileMeta as ProtoFileMeta,
     Hello as ProtoHello, TransferPushOffer as ProtoTransferPushOffer,
@@ -387,6 +388,12 @@ fn batch_to_proto(batch: &BatchManifest) -> ProtoBatch {
         from_node: batch.from_node.clone(),
         created_at: batch.created_at,
         changes: batch.changes.iter().map(change_to_proto).collect(),
+        basis: match batch.basis {
+            BatchBasis::Snapshot => ProtoBatchBasis::Snapshot as i32,
+            BatchBasis::Journal => ProtoBatchBasis::Journal as i32,
+        },
+        journal_from_seq: batch.journal_from_seq,
+        journal_to_seq: batch.journal_to_seq,
     }
 }
 
@@ -397,6 +404,13 @@ fn batch_from_proto(pb: &ProtoBatch) -> Result<BatchManifest> {
         share_id: models::ShareId(proto_share_id_to_array(&pb.share_id)?),
         from_node: pb.from_node.clone(),
         created_at: pb.created_at,
+        // Unknown/absent decodes to Snapshot, the conservative reading.
+        basis: match ProtoBatchBasis::try_from(pb.basis) {
+            Ok(ProtoBatchBasis::Journal) => BatchBasis::Journal,
+            _ => BatchBasis::Snapshot,
+        },
+        journal_from_seq: pb.journal_from_seq,
+        journal_to_seq: pb.journal_to_seq,
         changes: pb
             .changes
             .iter()

@@ -72,6 +72,9 @@ fn batch_manifest_json_parse() {
         share_id,
         from_node: "pc-one".to_string(),
         created_at: 123,
+        basis: models::BatchBasis::Snapshot,
+        journal_from_seq: 0,
+        journal_to_seq: 0,
         changes: vec![FileChange {
             seq: 1,
             share_id,

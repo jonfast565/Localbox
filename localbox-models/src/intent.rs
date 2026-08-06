@@ -5,16 +5,18 @@ use crate::share::ShareId;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentKind {
-    Push,
+    /// User-initiated transfer of the current file index. Carries no journal seq.
+    SnapshotPush,
     PullRequest,
     PullFulfill,
+    /// Continuous sync from the share journal. The only kind that owns a seq range.
     SyncCatchup,
 }
 
 impl IntentKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            IntentKind::Push => "push",
+            IntentKind::SnapshotPush => "snapshot_push",
             IntentKind::PullRequest => "pull_request",
             IntentKind::PullFulfill => "pull_fulfill",
             IntentKind::SyncCatchup => "sync_catchup",
@@ -23,7 +25,8 @@ impl IntentKind {
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "push" => Some(IntentKind::Push),
+            // "push" is the pre-v7 spelling, kept so old rows still parse.
+            "snapshot_push" | "push" => Some(IntentKind::SnapshotPush),
             "pull_request" => Some(IntentKind::PullRequest),
             "pull_fulfill" => Some(IntentKind::PullFulfill),
             "sync_catchup" => Some(IntentKind::SyncCatchup),
@@ -31,8 +34,9 @@ impl IntentKind {
         }
     }
 
-    /// Only SyncCatchup advances peer_progress watermarks.
-    pub fn updates_peer_progress(self) -> bool {
+    /// Only SyncCatchup is confirmed by a `BatchAck` and advances seq watermarks.
+    /// Every other kind completes once its batches reach the transport.
+    pub fn awaits_ack(self) -> bool {
         matches!(self, IntentKind::SyncCatchup)
     }
 }
@@ -41,7 +45,9 @@ impl IntentKind {
 #[serde(rename_all = "snake_case")]
 pub enum IntentOrigin {
     User,
-    AutoPush,
+    /// Automatic journal sync triggered by the `sync = "auto"` policy.
+    /// Attaches to SyncCatchup intents, never to SnapshotPush.
+    AutoSync,
     AutoPull,
     Chat,
     Reply,
@@ -51,7 +57,7 @@ impl IntentOrigin {
     pub fn as_str(self) -> &'static str {
         match self {
             IntentOrigin::User => "user",
-            IntentOrigin::AutoPush => "auto_push",
+            IntentOrigin::AutoSync => "auto_sync",
             IntentOrigin::AutoPull => "auto_pull",
             IntentOrigin::Chat => "chat",
             IntentOrigin::Reply => "reply",
@@ -61,7 +67,8 @@ impl IntentOrigin {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "user" => Some(IntentOrigin::User),
-            "auto_push" => Some(IntentOrigin::AutoPush),
+            // "auto_push" is the pre-v7 spelling, kept so old rows still parse.
+            "auto_sync" | "auto_push" => Some(IntentOrigin::AutoSync),
             "auto_pull" => Some(IntentOrigin::AutoPull),
             "chat" => Some(IntentOrigin::Chat),
             "reply" => Some(IntentOrigin::Reply),
@@ -76,6 +83,12 @@ pub enum IntentStatus {
     Pending,
     Materialized,
     InFlight,
+    /// Every batch reached the transport and no ack is expected. Terminal.
+    /// This is the success state for snapshot pushes, pull fulfillments and
+    /// accepted pull requests — none of which the peer confirms.
+    Sent,
+    /// The peer confirmed delivery with a `BatchAck`. Terminal.
+    /// Only ever reached by `SyncCatchup`; see [`IntentKind::awaits_ack`].
     Acked,
     Declined,
     Failed,
@@ -87,6 +100,7 @@ impl IntentStatus {
             IntentStatus::Pending => "pending",
             IntentStatus::Materialized => "materialized",
             IntentStatus::InFlight => "in_flight",
+            IntentStatus::Sent => "sent",
             IntentStatus::Acked => "acked",
             IntentStatus::Declined => "declined",
             IntentStatus::Failed => "failed",
@@ -98,11 +112,47 @@ impl IntentStatus {
             "pending" => Some(IntentStatus::Pending),
             "materialized" => Some(IntentStatus::Materialized),
             "in_flight" => Some(IntentStatus::InFlight),
+            "sent" => Some(IntentStatus::Sent),
             "acked" => Some(IntentStatus::Acked),
             "declined" => Some(IntentStatus::Declined),
             "failed" => Some(IntentStatus::Failed),
             _ => None,
         }
+    }
+
+    /// Whether this intent is finished, whatever the outcome. Terminality is
+    /// deliberately kind-free so callers can reason from status alone.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            IntentStatus::Sent
+                | IntentStatus::Acked
+                | IntentStatus::Declined
+                | IntentStatus::Failed
+        )
+    }
+
+    pub fn is_active(self) -> bool {
+        !self.is_terminal()
+    }
+
+    pub const ALL: [IntentStatus; 7] = [
+        IntentStatus::Pending,
+        IntentStatus::Materialized,
+        IntentStatus::InFlight,
+        IntentStatus::Sent,
+        IntentStatus::Acked,
+        IntentStatus::Declined,
+        IntentStatus::Failed,
+    ];
+
+    /// The non-terminal statuses, for filtering "still in progress" intents.
+    /// Derived from [`Self::is_terminal`] so the two can never drift.
+    pub fn active_statuses() -> Vec<IntentStatus> {
+        IntentStatus::ALL
+            .into_iter()
+            .filter(|s| s.is_active())
+            .collect()
     }
 }
 

@@ -83,11 +83,7 @@ pub async fn record_pull_request_intent(
 }
 
 pub async fn list_active_intents(db: &Arc<Mutex<Db>>, limit: usize) -> Result<Vec<TransferIntent>> {
-    let statuses = [
-        IntentStatus::Pending,
-        IntentStatus::Materialized,
-        IntentStatus::InFlight,
-    ];
+    let statuses = IntentStatus::active_statuses();
     Ok(db
         .lock()
         .await

@@ -72,9 +72,75 @@ fn serde_round_trip_includes_protocol_version() {
         share_id: ShareId::new("shareA", "pc-one"),
         from_node: "pc-one".to_string(),
         created_at: 1,
+        basis: models::BatchBasis::Snapshot,
+        journal_from_seq: 0,
+        journal_to_seq: 0,
         changes: vec![],
     };
     let json = serde_json::to_string(&manifest).unwrap();
     let parsed = parse_batch_manifest(&json).unwrap();
     assert_eq!(parsed.protocol_version, models::WIRE_PROTOCOL_VERSION);
+}
+
+#[test]
+fn batch_basis_round_trips_json_and_proto() {
+    use localbox_protocol::{decode_wire_message_proto, encode_wire_message_proto};
+
+    let journal = BatchManifest {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
+        batch_id: "b-journal".to_string(),
+        share_id: ShareId::new("shareA", "pc-one"),
+        from_node: "pc-one".to_string(),
+        created_at: 7,
+        basis: models::BatchBasis::Journal,
+        journal_from_seq: 3,
+        journal_to_seq: 9,
+        changes: vec![],
+    };
+
+    // JSON
+    let json = serde_json::to_string(&journal).unwrap();
+    let parsed = parse_batch_manifest(&json).unwrap();
+    assert_eq!(parsed.basis, models::BatchBasis::Journal);
+    assert_eq!((parsed.journal_from_seq, parsed.journal_to_seq), (3, 9));
+
+    // Protobuf
+    let bytes = encode_wire_message_proto(&WireMessage::Batch(journal.clone())).unwrap();
+    match decode_wire_message_proto(&bytes).unwrap() {
+        WireMessage::Batch(b) => {
+            assert_eq!(b.basis, models::BatchBasis::Journal);
+            assert_eq!((b.journal_from_seq, b.journal_to_seq), (3, 9));
+        }
+        other => panic!("expected batch, got {other:?}"),
+    }
+
+    // A snapshot batch round-trips as snapshot, with no range.
+    let snapshot = BatchManifest {
+        basis: models::BatchBasis::Snapshot,
+        journal_from_seq: 0,
+        journal_to_seq: 0,
+        ..journal
+    };
+    let bytes = encode_wire_message_proto(&WireMessage::Batch(snapshot)).unwrap();
+    match decode_wire_message_proto(&bytes).unwrap() {
+        WireMessage::Batch(b) => assert_eq!(b.basis, models::BatchBasis::Snapshot),
+        other => panic!("expected batch, got {other:?}"),
+    }
+}
+
+#[test]
+fn batch_without_basis_field_reads_as_snapshot() {
+    // A manifest serialized before `basis` existed must decode to the
+    // conservative reading: no journal positions, so no watermark may move.
+    let json = r#"{
+        "protocol_version": 4,
+        "batch_id": "legacy",
+        "share_id": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+        "from_node": "pc-one",
+        "created_at": 1,
+        "changes": []
+    }"#;
+    let parsed = parse_batch_manifest(json).unwrap();
+    assert_eq!(parsed.basis, models::BatchBasis::Snapshot);
+    assert_eq!(parsed.journal_to_seq, 0);
 }

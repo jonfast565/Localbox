@@ -130,14 +130,7 @@ impl ControlService {
                 let queue = db.outbound_queue_depth()?;
                 let pending = db.list_pending_transfer_requests()?.len();
                 let intents = db
-                    .list_transfer_intents(
-                        Some(&[
-                            IntentStatus::Pending,
-                            IntentStatus::Materialized,
-                            IntentStatus::InFlight,
-                        ]),
-                        50,
-                    )?
+                    .list_transfer_intents(Some(&IntentStatus::active_statuses()), 50)?
                     .len();
                 Ok(ControlResponse::ok_data(
                     "status",
@@ -279,7 +272,7 @@ impl ControlService {
             let (intent_id, batches) = crate::intent_ops::enqueue_intent(
                 &self.db,
                 &self.net_tx,
-                IntentKind::Push,
+                IntentKind::SnapshotPush,
                 origin,
                 share_name,
                 share_id,
@@ -313,14 +306,11 @@ impl ControlService {
             .find_peer_by_key(peer_key_str)?
             .ok_or_else(|| anyhow!("peer '{peer_key_str}' not found"))?;
         let share_id = ShareId::new(share_name, &peer.pc_name);
+        // How far of *their* journal we already hold — the peer's namespace.
         let since_seq = {
             let db = self.db.lock().await;
             match db.get_share_row_id_by_share_id(&share_id) {
-                Ok(row) => db
-                    .get_peer_progress(peer.id, row)
-                    .ok()
-                    .map(|(_, a)| a)
-                    .unwrap_or(0),
+                Ok(row) => db.inbound_watermark(peer.id, row).unwrap_or(0),
                 Err(_) => 0,
             }
         };
@@ -386,7 +376,7 @@ impl ControlService {
                 let max_seq = {
                     let db = self.db.lock().await;
                     let row = db.get_share_row_id_by_share_id(&local_share_id)?;
-                    db.max_change_seq(row)?
+                    db.max_journal_seq(row)?
                 };
                 IntentBasis::JournalRange {
                     from_seq: since_seq,
@@ -554,138 +544,4 @@ impl ControlService {
         let _: Option<ThreadSummary> = None;
         Ok(message_id)
     }
-}
-
-/// Parse a simple REPL / dead-CLI line into a ControlRequest.
-pub fn parse_shell_line(line: &str) -> Result<Option<ControlRequest>> {
-    let line = line.trim();
-    if line.is_empty() {
-        return Ok(None);
-    }
-    let mut parts = shell_words(line);
-    if parts.is_empty() {
-        return Ok(None);
-    }
-    let cmd = parts.remove(0).to_lowercase();
-    match cmd.as_str() {
-        "help" | "?" => Ok(Some(ControlRequest::Status)), // shown by shell
-        "ping" => Ok(Some(ControlRequest::Ping)),
-        "status" => Ok(Some(ControlRequest::Status)),
-        "quit" | "exit" => Ok(Some(ControlRequest::Quit)),
-        "pending" => Ok(Some(ControlRequest::PendingRequests)),
-        "intents" => {
-            let all = parts.iter().any(|p| p == "--all");
-            let limit = take_flag(&mut parts, "--limit").and_then(|s| s.parse().ok());
-            Ok(Some(ControlRequest::Intents { all, limit }))
-        }
-        "intent" => {
-            let sub = parts.first().map(|s| s.to_lowercase()).unwrap_or_default();
-            if sub == "show" {
-                parts.remove(0);
-            }
-            let id = take_flag(&mut parts, "--id")
-                .or_else(|| parts.first().cloned())
-                .ok_or_else(|| anyhow!("usage: intent show --id ID"))?;
-            Ok(Some(ControlRequest::IntentShow { id }))
-        }
-        "push" => {
-            let share = take_flag(&mut parts, "--share")
-                .or_else(|| parts.first().cloned())
-                .ok_or_else(|| anyhow!("usage: push --share NAME [--peer P] [--path REL]"))?;
-            let peer = take_flag(&mut parts, "--peer");
-            let path = take_flag(&mut parts, "--path");
-            Ok(Some(ControlRequest::Push { share, peer, path }))
-        }
-        "pull" | "request" => {
-            let share = take_flag(&mut parts, "--share")
-                .ok_or_else(|| anyhow!("usage: {cmd} --share NAME --peer P [--path REL]"))?;
-            let peer = take_flag(&mut parts, "--peer")
-                .ok_or_else(|| anyhow!("usage: {cmd} --share NAME --peer P [--path REL]"))?;
-            let path = take_flag(&mut parts, "--path");
-            Ok(Some(ControlRequest::Request { share, peer, path }))
-        }
-        "reply" => {
-            let id = take_flag(&mut parts, "--id")
-                .or_else(|| parts.first().cloned())
-                .ok_or_else(|| anyhow!("usage: reply --id ID accept|decline"))?;
-            let action = parts
-                .iter()
-                .find(|p| *p == "accept" || *p == "decline")
-                .cloned()
-                .ok_or_else(|| anyhow!("usage: reply --id ID accept|decline"))?;
-            Ok(Some(ControlRequest::Reply {
-                id,
-                accept: action == "accept",
-                reason: None,
-            }))
-        }
-        "chat" => {
-            if parts.is_empty() {
-                bail!("usage: chat send|inbox|threads|show|read ...");
-            }
-            let sub = parts.remove(0).to_lowercase();
-            match sub.as_str() {
-                "inbox" | "threads" => Ok(Some(ControlRequest::ChatInbox)),
-                "show" => {
-                    let thread = take_flag(&mut parts, "--thread")
-                        .or_else(|| parts.first().cloned())
-                        .ok_or_else(|| anyhow!("usage: chat show --thread ID"))?;
-                    Ok(Some(ControlRequest::ChatShow {
-                        thread,
-                        limit: None,
-                    }))
-                }
-                "read" => {
-                    let thread = take_flag(&mut parts, "--thread")
-                        .or_else(|| parts.first().cloned())
-                        .ok_or_else(|| anyhow!("usage: chat read --thread ID"))?;
-                    Ok(Some(ControlRequest::ChatRead { thread }))
-                }
-                "send" => Ok(Some(ControlRequest::ChatSend {
-                    peer: take_flag(&mut parts, "--peer"),
-                    share: take_flag(&mut parts, "--share"),
-                    thread: take_flag(&mut parts, "--thread"),
-                    message: take_flag(&mut parts, "--message"),
-                    file: take_flag(&mut parts, "--file"),
-                    share_dest: take_flag(&mut parts, "--share-dest"),
-                })),
-                _ => bail!("unknown chat subcommand '{sub}'"),
-            }
-        }
-        _ => bail!(
-            "unknown command '{cmd}' (try: status, push, pull, request, reply, pending, intents, chat, quit)"
-        ),
-    }
-}
-
-fn take_flag(parts: &mut Vec<String>, flag: &str) -> Option<String> {
-    if let Some(i) = parts.iter().position(|p| p == flag) {
-        if i + 1 < parts.len() {
-            let val = parts.remove(i + 1);
-            parts.remove(i);
-            return Some(val);
-        }
-    }
-    None
-}
-
-fn shell_words(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    for c in line.chars() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            ' ' | '\t' if !in_quotes => {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-            }
-            _ => cur.push(c),
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
 }

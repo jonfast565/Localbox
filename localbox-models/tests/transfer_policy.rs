@@ -26,7 +26,7 @@ fn cfg() -> AppConfig {
             recursive: true,
             ignore_patterns: vec![],
             max_file_size_bytes: None,
-            push: TransferMode::Manual,
+            sync: TransferMode::Manual,
             pull: TransferMode::Auto,
             request_handling: None,
         }],
@@ -35,7 +35,7 @@ fn cfg() -> AppConfig {
         peer_policies: vec![PeerPolicy {
             peer: "bob".into(),
             share: Some("docs".into()),
-            push: Some(TransferMode::Auto),
+            sync: Some(TransferMode::Auto),
             pull: None,
             request_handling: Some(TransferMode::Auto),
         }],
@@ -44,14 +44,14 @@ fn cfg() -> AppConfig {
 }
 
 #[test]
-fn peer_policy_overrides_share_push() {
+fn peer_policy_overrides_share_sync() {
     let c = cfg();
     assert_eq!(
-        c.resolve_push_mode("docs", None),
+        c.resolve_sync_mode("docs", None),
         TransferMode::Manual
     );
     assert_eq!(
-        c.resolve_push_mode("docs", Some("bob@1")),
+        c.resolve_sync_mode("docs", Some("bob@1")),
         TransferMode::Auto
     );
     assert_eq!(

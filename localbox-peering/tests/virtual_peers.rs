@@ -1,6 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -105,10 +104,10 @@ async fn virtual_peers_exchange_changes() {
     let changes_on_2 = db2
         .lock()
         .await
-        .list_changes_since(share_row2, 0, 10)
+        .list_journal_since(share_row2, 0, 10)
         .unwrap();
     assert!(
-        changes_on_2.iter().any(|c| c.path == "a.txt"),
+        changes_on_2.iter().any(|c| c.change.path == "a.txt"),
         "peer2 should have received a.txt"
     );
     let remote_root = build_remote_share_root(
@@ -125,12 +124,12 @@ async fn virtual_peers_exchange_changes() {
     let changes_on_1 = db1
         .lock()
         .await
-        .list_changes_since(share_row1, 0, 10)
+        .list_journal_since(share_row1, 0, 10)
         .unwrap();
     assert!(
         changes_on_1
             .iter()
-            .any(|c| c.path == "old.txt" && c.kind == ChangeKind::Delete),
+            .any(|c| c.change.path == "old.txt" && c.change.kind == ChangeKind::Delete),
         "peer1 should have received delete for old.txt"
     );
 
@@ -194,35 +193,37 @@ async fn replayed_change_does_not_clobber_file_meta() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Send seq=2 modify then seq=1 delete for the same path. The delete is a replay and must not
-    // overwrite the file metadata on the receiver.
+    // Build two entries in node1's journal for the same path: a delete at seq 1,
+    // then a modify at seq 2. Ship the modify first, then re-ship the older
+    // delete -- which discovery genuinely does when a bootstrap intent (from_seq 0)
+    // races a catch-up. The delete is a replay and must not clobber the file.
     let replay_bytes = b"seq-two";
-    enqueue_batch_with_seq(
-        &db1,
-        &shares1[0],
-        fs1.clone(),
-        "a.txt",
-        ChangeKind::Modify,
-        2,
-        Some(replay_bytes),
-        net_tx1.clone(),
-    )
-    .await;
-
-    let share_row2 = wait_for_share(&db2, &shares1[0].share_id).await;
-    wait_for_file_meta(&db2, share_row2, "a.txt").await;
-
-    enqueue_batch_with_seq(
+    let delete_seq = journal_change(
         &db1,
         &shares1[0],
         fs1.clone(),
         "a.txt",
         ChangeKind::Delete,
-        1,
         None,
-        net_tx1.clone(),
     )
     .await;
+    let modify_seq = journal_change(
+        &db1,
+        &shares1[0],
+        fs1.clone(),
+        "a.txt",
+        ChangeKind::Modify,
+        Some(replay_bytes),
+    )
+    .await;
+    assert_eq!((delete_seq, modify_seq), (1, 2));
+
+    send_journal_range(&db1, &shares1[0], delete_seq, modify_seq, net_tx1.clone()).await;
+
+    let share_row2 = wait_for_share(&db2, &shares1[0].share_id).await;
+    wait_for_file_meta(&db2, share_row2, "a.txt").await;
+
+    send_journal_range(&db1, &shares1[0], 0, delete_seq, net_tx1.clone()).await;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     let meta = db2
@@ -770,7 +771,7 @@ fn test_config_with_state(
             recursive: true,
             ignore_patterns: Vec::new(),
             max_file_size_bytes: None,
-            push: Default::default(),
+            sync: Default::default(),
             pull: Default::default(),
             request_handling: None,
         }],
@@ -781,6 +782,44 @@ fn test_config_with_state(
     }
 }
 
+/// Build the sender-side index entry a change of `kind` would have produced.
+/// `version` mirrors what `snapshot_changes` needs to round-trip `kind`: it maps
+/// `version <= 1` to `Create` and anything higher to `Modify`.
+fn stage_index_entry(
+    share: &ShareContext,
+    fs: &dyn FileSystem,
+    path: &str,
+    kind: &ChangeKind,
+    contents: Option<&[u8]>,
+    version: i64,
+) -> FileMeta {
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    if matches!(kind, ChangeKind::Delete) {
+        return FileMeta {
+            path: path.to_string(),
+            size: 0,
+            mtime: now,
+            hash: [0u8; 32],
+            version,
+            deleted: true,
+        };
+    }
+    let data = contents.unwrap_or(b"default");
+    write_share_file(fs, share, path, data);
+    FileMeta {
+        path: path.to_string(),
+        size: data.len() as u64,
+        mtime: now,
+        hash: hash_bytes(data),
+        version,
+        deleted: false,
+    }
+}
+
+/// Manual push: stage the file in the index, then materialize a real
+/// `Push`/`Snapshot` intent. Deliberately goes through
+/// `create_and_materialize_intent` rather than hand-building a manifest, so the
+/// tests exercise the intent path the daemon actually uses.
 async fn enqueue_sample_batch(
     db: &Arc<Mutex<Db>>,
     share: &ShareContext,
@@ -790,81 +829,101 @@ async fn enqueue_sample_batch(
     contents: Option<&[u8]>,
     net_tx: mpsc::Sender<String>,
 ) {
-    let mut meta = None;
-    if !matches!(kind, ChangeKind::Delete) {
-        let data = contents.unwrap_or(b"default");
-        write_share_file(fs.as_ref(), share, path, data);
-        meta = Some(FileMeta {
-            path: path.to_string(),
-            size: data.len() as u64,
-            mtime: OffsetDateTime::now_utc().unix_timestamp(),
-            hash: hash_bytes(data),
-            version: 1,
-            deleted: false,
-        });
+    // Modify must survive the snapshot round-trip as Modify, not Create.
+    let version = if matches!(kind, ChangeKind::Modify) { 2 } else { 1 };
+    let meta = stage_index_entry(share, fs.as_ref(), path, &kind, contents, version);
+
+    let batch_ids = {
+        let db_guard = db.lock().await;
+        db_guard.upsert_file_meta(share.id, &meta).unwrap();
+        let (_intent_id, batch_ids) = db_guard
+            .create_and_materialize_intent(
+                models::IntentKind::SnapshotPush,
+                models::IntentOrigin::User,
+                &share.share_name,
+                share.share_id,
+                None,
+                models::IntentBasis::Snapshot {
+                    paths: vec![path.to_string()],
+                },
+                None,
+                "local",
+            )
+            .unwrap();
+        batch_ids
+    };
+    for batch_id in batch_ids {
+        let _ = net_tx.try_send(batch_id);
     }
-    let change = FileChange {
-        seq: 0,
-        share_id: share.share_id,
-        path: path.to_string(),
-        kind: kind.clone(),
-        meta,
-    };
-    let unique = BATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let manifest = models::BatchManifest {
-        protocol_version: models::WIRE_PROTOCOL_VERSION,
-        batch_id: format!("batch-{}-{unique}", path),
-        share_id: share.share_id,
-        from_node: "local".to_string(),
-        created_at: OffsetDateTime::now_utc().unix_timestamp(),
-        changes: vec![change],
-    };
-    let db_guard = db.lock().await;
-    db_guard.enqueue_outbound_batch(&manifest, None, None).unwrap();
-    let _ = net_tx.try_send(manifest.batch_id);
 }
 
-async fn enqueue_batch_with_seq(
+/// Append a change to the owning node's share journal without sending anything.
+/// Returns the seq the journal actually assigned — seqs are locally allocated,
+/// so callers must take the value rather than dictate it.
+async fn journal_change(
     db: &Arc<Mutex<Db>>,
     share: &ShareContext,
     fs: Arc<dyn FileSystem>,
     path: &str,
     kind: ChangeKind,
-    seq: i64,
     contents: Option<&[u8]>,
-    net_tx: mpsc::Sender<String>,
-) {
-    let mut meta = None;
-    if !matches!(kind, ChangeKind::Delete) {
-        let data = contents.unwrap_or(b"default");
-        write_share_file(fs.as_ref(), share, path, data);
-        meta = Some(FileMeta {
-            path: path.to_string(),
-            size: data.len() as u64,
-            mtime: OffsetDateTime::now_utc().unix_timestamp(),
-            hash: hash_bytes(data),
-            version: 1,
-            deleted: false,
-        });
-    }
+) -> i64 {
+    let meta = stage_index_entry(share, fs.as_ref(), path, &kind, contents, 1);
     let change = FileChange {
-        seq,
+        seq: 0,
         share_id: share.share_id,
         path: path.to_string(),
         kind: kind.clone(),
-        meta,
+        meta: if matches!(kind, ChangeKind::Delete) {
+            None
+        } else {
+            Some(meta.clone())
+        },
     };
-    let manifest = models::BatchManifest {
-        protocol_version: models::WIRE_PROTOCOL_VERSION,
-        batch_id: format!("batch-{}-{}", path, seq),
-        share_id: share.share_id,
-        from_node: "local".to_string(),
-        created_at: OffsetDateTime::now_utc().unix_timestamp(),
-        changes: vec![change],
-    };
+
     let db_guard = db.lock().await;
-    db_guard.enqueue_outbound_batch(&manifest, None, None).unwrap();
-    let _ = net_tx.try_send(manifest.batch_id);
+    if !matches!(kind, ChangeKind::Delete) {
+        db_guard.upsert_file_meta(share.id, &meta).unwrap();
+    }
+    db_guard
+        .append_journal_entry(
+            share.id,
+            &change,
+            OffsetDateTime::now_utc().unix_timestamp(),
+            db::JournalOrigin::Local,
+        )
+        .unwrap()
+        .expect("journal append must insert")
+}
+
+/// Materialize a real `SyncCatchup`/`JournalRange` intent over an existing range
+/// of the owning node's journal. `from_seq` is exclusive, `to_seq` inclusive.
+async fn send_journal_range(
+    db: &Arc<Mutex<Db>>,
+    share: &ShareContext,
+    from_seq: i64,
+    to_seq: i64,
+    net_tx: mpsc::Sender<String>,
+) {
+    let batch_ids = {
+        let db_guard = db.lock().await;
+        let (_intent_id, batch_ids) = db_guard
+            .create_and_materialize_intent(
+                models::IntentKind::SyncCatchup,
+                models::IntentOrigin::AutoSync,
+                &share.share_name,
+                share.share_id,
+                None,
+                models::IntentBasis::JournalRange { from_seq, to_seq },
+                None,
+                "local",
+            )
+            .unwrap();
+        batch_ids
+    };
+    for batch_id in batch_ids {
+        let _ = net_tx.try_send(batch_id);
+    }
 }
 
 async fn wait_for_share(db: &Arc<Mutex<Db>>, share_id: &models::ShareId) -> i64 {
@@ -950,8 +1009,6 @@ async fn assert_share_never_registered(db: &Arc<Mutex<Db>>, share_id: &models::S
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
-
-static BATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct TlsPaths {

@@ -1,8 +1,14 @@
 #![allow(dead_code)]
 
 /// v3: FileChunk carries protocol_version + batch_id; BatchAck may include batch_id.
+/// v4: BatchManifest declares its `BatchBasis` and journal range, so the receiver
+///     knows whether `FileChange.seq` holds real journal positions. `BatchAck.upto_seq`
+///     is always in the sender's namespace (0 for snapshot batches).
 /// TransferIntent ids remain DB-local (batch_uuid ↔ intent).
-pub const WIRE_PROTOCOL_VERSION: u16 = 3;
+///
+/// v4 is a flag day: `parse_wire_message` rejects anything stamped above the
+/// local version, so all nodes must be upgraded together.
+pub const WIRE_PROTOCOL_VERSION: u16 = 4;
 
 pub fn default_wire_protocol_version() -> u16 {
     WIRE_PROTOCOL_VERSION
@@ -17,7 +23,9 @@ pub mod share;
 pub mod transfer;
 pub mod wire;
 
-pub use change::{BatchManifest, ChangeKind, FileChange, FileChunk, FileMeta};
+pub use change::{
+    BatchBasis, BatchManifest, ChangeKind, FileChange, FileChunk, FileMeta, JournalEntry,
+};
 pub use chat::{
     peer_key, peer_thread_id, share_thread_id, ChatAck, ChatAttachment, ChatMessage,
     ChatMessageRecord, ThreadKind, ThreadSummary,

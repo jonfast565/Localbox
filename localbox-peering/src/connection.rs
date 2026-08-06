@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use db::JournalOrigin;
 use models::{
     AppConfig, ChangeKind, ChatAck, ChatMessage, ChatMessageRecord, FileChange,
     FileChunk, FileMeta, HelloMessage, ShareConfig, ShareId, ThreadKind, TransferMode,
@@ -17,7 +18,7 @@ use tokio::io::{split, AsyncRead, AsyncWrite};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::Instrument;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use utilities::disk_utilities::build_remote_share_root;
 use utilities::{write_atomic, DynStream, FileSystem, Net};
 
@@ -427,14 +428,11 @@ async fn maybe_auto_pull(
             continue;
         }
         let share_id = ShareId::new(share_name, &remote.pc_name);
+        // How far of *their* journal we already hold — the peer's namespace.
         let since_seq = {
             let db = db.lock().await;
             match db.get_share_row_id_by_share_id(&share_id) {
-                Ok(row_id) => db
-                    .get_peer_progress(peer_id, row_id)
-                    .ok()
-                    .map(|(_, acked)| acked)
-                    .unwrap_or(0),
+                Ok(row_id) => db.inbound_watermark(peer_id, row_id).unwrap_or(0),
                 Err(_) => 0,
             }
         };
@@ -549,14 +547,14 @@ pub async fn fulfill_transfer_request(
             paths: req.paths.clone(),
         }
     } else {
-        let max_seq = db.lock().await.max_change_seq(share_row.id).unwrap_or(0);
+        let max_seq = db.lock().await.max_journal_seq(share_row.id).unwrap_or(0);
         models::IntentBasis::JournalRange {
             from_seq: req.since_seq,
             to_seq: max_seq,
         }
     };
     let origin = if cfg
-        .resolve_push_mode(&req.share_name, None)
+        .resolve_sync_mode(&req.share_name, None)
         .is_auto()
     {
         models::IntentOrigin::AutoPull
@@ -589,6 +587,34 @@ async fn handle_transfer_reply(db: &DbHandle, reply: TransferReply) {
         status,
         reply.reason.as_deref(),
     );
+
+    // Close out the PullRequest intent. Without this it stays InFlight forever
+    // and every `pull` permanently inflates the active-intent count.
+    {
+        let guard = db.lock().await;
+        match guard.get_transfer_intent_by_request_id(&reply.request_id) {
+            Ok(Some(intent)) if intent.status.is_active() => {
+                // On accept, our side of the exchange is done: what follows is a
+                // separate PullFulfill intent raised by the peer.
+                let (next, err) = match reply.status {
+                    TransferReplyStatus::Accept => (models::IntentStatus::Sent, None),
+                    TransferReplyStatus::Decline => {
+                        (models::IntentStatus::Declined, reply.reason.as_deref())
+                    }
+                };
+                if let Err(e) = guard.update_transfer_intent_status(&intent.id, next, err) {
+                    warn!(intent_id = %intent.id, error = %e, "Failed to close pull request intent");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
+                request_id = %reply.request_id,
+                error = %e,
+                "Failed to look up intent for transfer reply"
+            ),
+        }
+    }
+
     info!(
         request_id = %reply.request_id,
         status = status,
@@ -761,12 +787,19 @@ async fn handle_batch_message(
         };
         let share_root = PathBuf::from(share_row.root_path.clone());
 
-        let mut max_seq_for_share = 0;
+        // The basis decides how to read `change.seq` and whether any watermark
+        // may move. A journal batch carries real positions in the sender's
+        // namespace; a snapshot batch carries none at all.
+        let is_journal = batch.basis == models::BatchBasis::Journal;
+
+        // Tracked in the SENDER's namespace so the ack we send back is a number
+        // the sender can interpret (invariant I4).
+        let mut max_origin_seq = 0;
         for mut change in batch.changes.clone() {
-            if is_replay(db, share_row_id, change.seq).await {
-                if change.seq > 0 {
-                    max_seq_for_share = max_seq_for_share.max(change.seq);
-                }
+            // Only journal batches can be replays; a snapshot has no position to
+            // compare, and gating it on a seq would drop legitimate pushes.
+            if is_journal && is_replay(db, peer_id, share_row_id, change.seq).await {
+                max_origin_seq = max_origin_seq.max(change.seq);
                 continue;
             }
 
@@ -784,8 +817,15 @@ async fn handle_batch_message(
             change.meta = resolve_change_meta(&change, existing.clone());
             if let Some(meta) = &change.meta {
                 let mut meta = meta.clone();
-                if meta.version <= 0 || change.seq > meta.version {
+                // `version` is the conflict-resolution key in `should_apply`, so
+                // it may only ever be raised from the sender's journal position.
+                // For a snapshot the sender's index version already travels in
+                // the meta; overwriting it with a local number would shadow
+                // genuine later updates.
+                if is_journal && (meta.version <= 0 || change.seq > meta.version) {
                     meta.version = change.seq.max(1);
+                } else if meta.version <= 0 {
+                    meta.version = 1;
                 }
                 let _ = db.lock().await.upsert_file_meta(share_row_id, &meta);
                 change.meta = Some(meta);
@@ -810,20 +850,34 @@ async fn handle_batch_message(
             }
             }
 
-            if let Some(seq) =
-                append_change_and_ack(db, peer_id, share_row_id, &mut change, batch.created_at)
-                    .await
-            {
-                max_seq_for_share = max_seq_for_share.max(seq);
-            }
+            append_inbound_change(db, peer_id, share_row_id, &change, batch.created_at).await;
+            max_origin_seq = max_origin_seq.max(change.seq);
         }
 
-        // Always ack so the sender can resolve intent via batch_id (Snapshot uses seq=0).
+        // Advance to the whole declared range, not just the changes we applied.
+        // Changes filtered out by should_apply_change are still *covered* by this
+        // range; without crediting them the watermark pins and the sender
+        // re-sends the same range forever.
+        let covered = if is_journal {
+            batch.journal_to_seq.max(max_origin_seq)
+        } else {
+            0
+        };
+        if covered > 0 {
+            let _ = db
+                .lock()
+                .await
+                .bump_inbound_watermark(peer_id, share_row_id, covered);
+        }
+
+        // Always ack so the sender can resolve the intent via batch_id. upto_seq
+        // is in the sender's namespace and is 0 for a snapshot batch, which the
+        // sender treats as "no watermark to advance".
         send_batch_ack(
             connections,
             peer_id,
             &batch.share_id,
-            max_seq_for_share,
+            covered,
             Some(batch.batch_id.clone()),
         )
         .await;
@@ -1038,37 +1092,65 @@ fn resolve_change_meta(change: &FileChange, existing: Option<FileMeta>) -> Optio
     }
 }
 
-async fn is_replay(db: &DbHandle, share_row_id: i64, seq: i64) -> bool {
+/// True when this peer's journal entry is at or below what we have already taken
+/// in from them. Compares within the *peer's* namespace via the inbound
+/// watermark — never against our own journal seqs, which are a different
+/// numbering space, and never against a counter that local activity can move.
+async fn is_replay(db: &DbHandle, peer_id: i64, share_row_id: i64, seq: i64) -> bool {
     if seq <= 0 {
+        // Snapshot-derived (manual push): carries no journal position, so there
+        // is nothing to compare and nothing to suppress.
         return false;
     }
-    match db.lock().await.get_last_applied_seq(share_row_id) {
-        Ok(last_applied) => seq <= last_applied,
+    match db.lock().await.inbound_watermark(peer_id, share_row_id) {
+        Ok(recv) => seq <= recv,
         Err(_) => false,
     }
 }
 
-async fn append_change_and_ack(
+/// Journal an inbound change under the originating peer's namespace.
+///
+/// Does not touch watermarks: the caller credits the batch's whole declared
+/// range once, which also covers changes that were filtered out locally.
+///
+/// Returns the locally allocated seq, or `None` when the entry was already
+/// journaled (a benign duplicate) or the append failed.
+async fn append_inbound_change(
     db: &DbHandle,
     peer_id: i64,
     share_row_id: i64,
-    change: &mut FileChange,
+    change: &FileChange,
     created_at: i64,
 ) -> Option<i64> {
-    let Ok(seq) = db
-        .lock()
-        .await
-        .append_change_log(share_row_id, change, created_at)
-    else {
-        return None;
+    let origin = JournalOrigin::Peer {
+        peer_id,
+        origin_seq: change.seq.max(0),
     };
-
-    change.seq = seq;
-    let _ = db
+    let local_seq = match db
         .lock()
         .await
-        .bump_last_seq_acked(peer_id, share_row_id, seq);
-    Some(seq)
+        .append_journal_entry(share_row_id, change, created_at, origin)
+    {
+        Ok(Some(seq)) => seq,
+        Ok(None) => {
+            debug!(
+                path = %change.path,
+                origin_seq = change.seq,
+                "Journal entry already present; skipping duplicate"
+            );
+            return None;
+        }
+        Err(e) => {
+            error!(
+                path = %change.path,
+                origin_seq = change.seq,
+                error = %e,
+                "Failed to append inbound change to journal"
+            );
+            return None;
+        }
+    };
+    Some(local_seq)
 }
 
 fn should_apply(incoming: &FileMeta, existing: Option<&FileMeta>) -> bool {
@@ -1127,7 +1209,7 @@ async fn ensure_remote_shares(
             recursive: true,
             ignore_patterns: Vec::new(),
             max_file_size_bytes: None,
-            push: Default::default(),
+            sync: Default::default(),
             pull: Default::default(),
             request_handling: None,
         };

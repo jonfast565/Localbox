@@ -35,12 +35,22 @@ message FileChange {
   FileMeta meta = 5;
 }
 
+enum BatchBasis {
+  BATCH_BASIS_SNAPSHOT = 0;
+  BATCH_BASIS_JOURNAL = 1;
+}
+
 message BatchManifest {
   string batch_id = 1;
   bytes share_id = 2;
   string from_node = 3;
   int64 created_at = 4;
   repeated FileChange changes = 5;
+  // How to read changes[].seq. Default (0) is SNAPSHOT: no journal positions.
+  BatchBasis basis = 6;
+  // Journal range covered, in the sender's namespace. from exclusive, to inclusive.
+  int64 journal_from_seq = 7;
+  int64 journal_to_seq = 8;
 }
 
 message BatchAck {

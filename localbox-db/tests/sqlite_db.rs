@@ -2,7 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use localbox_db as db;
-use db::Db;
+use db::{Db, JournalOrigin};
 use models::{
     peer_thread_id, AppConfig, ApplicationState, BatchManifest, ChangeKind, ChatMessageRecord,
     FileChange, FileMeta, ShareConfig, ShareId, ThreadKind, TransferRequest,
@@ -33,7 +33,7 @@ fn test_config(pc_name: &str, share_name: &str) -> AppConfig {
             recursive: true,
             ignore_patterns: Vec::new(),
             max_file_size_bytes: None,
-            push: Default::default(),
+            sync: Default::default(),
             pull: Default::default(),
             request_handling: None,
         }],
@@ -88,6 +88,9 @@ fn outbound_queue_round_trip_and_mark_sent() {
         share_id,
         from_node: "pc-one".to_string(),
         created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+        basis: models::BatchBasis::Snapshot,
+        journal_from_seq: 0,
+        journal_to_seq: 0,
         changes: vec![FileChange {
             seq: 0,
             share_id,
@@ -125,7 +128,7 @@ fn status_helpers_report_queue_depth_and_peers() {
 
     assert_eq!(db.outbound_queue_depth().unwrap(), 0);
     assert_eq!(db.outbound_queue_due_now(now).unwrap(), 0);
-    assert_eq!(db.change_log_total().unwrap(), 0);
+    assert_eq!(db.journal_entry_count().unwrap(), 0);
     assert!(db.list_peers().unwrap().is_empty());
 
     let peer_id = db
@@ -162,6 +165,9 @@ fn status_helpers_report_queue_depth_and_peers() {
         share_id: shares[0].share_id,
         from_node: "pc-two".to_string(),
         created_at: now,
+        basis: models::BatchBasis::Snapshot,
+        journal_from_seq: 0,
+        journal_to_seq: 0,
         changes: vec![FileChange {
             seq: 0,
             share_id: shares[0].share_id,
@@ -183,7 +189,7 @@ fn status_helpers_report_queue_depth_and_peers() {
 }
 
 #[test]
-fn change_log_append_and_list() {
+fn journal_append_and_list() {
     let db = Db::open_in_memory().unwrap();
     let cfg = test_config("pc-one", "shareA");
     let shares = db.load_shares(&cfg).unwrap();
@@ -207,22 +213,22 @@ fn change_log_append_and_list() {
     };
 
     let seq = db
-        .append_change_log(share_row_id, &change, created_at)
+        .append_journal_entry(share_row_id, &change, created_at, JournalOrigin::Local)
         .unwrap();
-    assert_eq!(seq, 1);
+    assert_eq!(seq, Some(1));
 
-    let changes = db.list_changes_since(share_row_id, 0, 10).unwrap();
+    let changes = db.list_journal_since(share_row_id, 0, 10).unwrap();
     assert_eq!(changes.len(), 1);
-    assert_eq!(changes[0].seq, 1);
-    assert_eq!(changes[0].path, "a.txt");
-    assert_eq!(changes[0].kind, ChangeKind::Create);
-    assert!(changes[0].meta.is_some());
+    assert_eq!(changes[0].change.seq, 1);
+    assert_eq!(changes[0].change.path, "a.txt");
+    assert_eq!(changes[0].change.kind, ChangeKind::Create);
+    assert!(changes[0].change.meta.is_some());
 }
 
 #[test]
-fn schema_version_is_six() {
+fn schema_version_is_current() {
     let db = Db::open_in_memory().unwrap();
-    assert_eq!(db.schema_version().unwrap(), 6);
+    assert_eq!(db.schema_version().unwrap(), 7);
 }
 
 #[test]
@@ -340,8 +346,8 @@ fn migrates_v4_to_v6_renames_share_journal() {
         .unwrap();
     }
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 6);
-    assert_eq!(db.share_journal_total().unwrap(), 1);
+    assert_eq!(db.schema_version().unwrap(), 7);
+    assert_eq!(db.journal_entry_count().unwrap(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -438,7 +444,7 @@ fn snapshot_push_does_not_change_peer_progress() {
 
     let (intent_id, batch_ids) = db
         .create_and_materialize_intent(
-            IntentKind::Push,
+            IntentKind::SnapshotPush,
             IntentOrigin::User,
             &share.share_name,
             share.share_id,
@@ -456,12 +462,28 @@ fn snapshot_push_does_not_change_peer_progress() {
     db.on_outbound_batch_sent(&batch_ids[0], peer_id, &share.share_id, 0)
         .unwrap();
     assert_eq!(db.get_peer_progress(peer_id, share.id).unwrap(), (0, 0));
+
+    // Terminal on send: nothing will confirm a snapshot push, so it must not
+    // claim `Acked`.
+    let intent = db.get_transfer_intent(&intent_id).unwrap().unwrap();
+    assert_eq!(intent.status, models::IntentStatus::Sent);
+    assert!(intent.status.is_terminal());
+
+    // A stray ack -- here with a wildly out-of-range upto_seq -- must move
+    // neither the watermark nor the status.
     db.on_batch_ack(peer_id, &share.share_id, 99, Some(&batch_ids[0]))
         .unwrap();
     assert_eq!(db.get_peer_progress(peer_id, share.id).unwrap(), (0, 0));
 
     let intent = db.get_transfer_intent(&intent_id).unwrap().unwrap();
-    assert_eq!(intent.kind, IntentKind::Push);
+    assert_eq!(intent.kind, IntentKind::SnapshotPush);
+    assert_eq!(intent.status, models::IntentStatus::Sent);
+
+    // And it no longer counts as in-progress work.
+    let active = db
+        .list_transfer_intents(Some(&models::IntentStatus::active_statuses()), 50)
+        .unwrap();
+    assert!(active.is_empty(), "sent snapshot push must not stay active");
 }
 
 #[test]
@@ -500,13 +522,16 @@ fn sync_catchup_advances_watermarks_on_ack() {
             deleted: false,
         }),
     };
-    let seq = db.append_change_log(share.id, &change, now).unwrap();
+    let seq = db
+        .append_journal_entry(share.id, &change, now, JournalOrigin::Local)
+        .unwrap()
+        .expect("append must insert");
     change.seq = seq;
 
     let (_intent_id, batch_ids) = db
         .create_and_materialize_intent(
             IntentKind::SyncCatchup,
-            IntentOrigin::AutoPush,
+            IntentOrigin::AutoSync,
             &share.share_name,
             share.share_id,
             Some(peer_id),
@@ -557,7 +582,9 @@ fn manual_path_snapshot_uses_index_not_full_journal() {
             deleted: false,
         }),
     };
-    let _ = db.append_change_log(share.id, &old, now).unwrap();
+    let _ = db
+        .append_journal_entry(share.id, &old, now, JournalOrigin::Local)
+        .unwrap();
 
     db.upsert_file_meta(
         share.id,
@@ -574,7 +601,7 @@ fn manual_path_snapshot_uses_index_not_full_journal() {
 
     let (_intent_id, batch_ids) = db
         .create_and_materialize_intent(
-            IntentKind::Push,
+            IntentKind::SnapshotPush,
             IntentOrigin::User,
             &share.share_name,
             share.share_id,
@@ -594,4 +621,389 @@ fn manual_path_snapshot_uses_index_not_full_journal() {
     assert_eq!(due[0].manifest.changes.len(), 1);
     assert_eq!(due[0].manifest.changes[0].path, "keep.txt");
     assert_eq!(due[0].manifest.changes[0].seq, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Journal / manual-push namespace separation
+// ---------------------------------------------------------------------------
+
+/// Build a share plus one peer, returning (share_row_id, share_id, peer_id).
+fn share_and_peer(db: &Db, pc: &str, share: &str) -> (i64, ShareId, i64) {
+    let cfg = test_config(pc, share);
+    let shares = db.load_shares(&cfg).unwrap();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let peer_id = db
+        .upsert_peer(
+            "pc-remote",
+            "inst-remote",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5001),
+            now,
+            "connected",
+            5001,
+            0,
+            true,
+        )
+        .unwrap();
+    (shares[0].id, shares[0].share_id, peer_id)
+}
+
+fn change_at(share_id: ShareId, path: &str, seq: i64) -> FileChange {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    FileChange {
+        seq,
+        share_id,
+        path: path.to_string(),
+        kind: ChangeKind::Modify,
+        meta: Some(FileMeta {
+            path: path.to_string(),
+            size: 1,
+            mtime: now,
+            hash: [4u8; 32],
+            version: 1,
+            deleted: false,
+        }),
+    }
+}
+
+#[test]
+fn journal_seq_is_always_locally_allocated() {
+    let db = Db::open_in_memory().unwrap();
+    let (share_row_id, share_id, peer_id) = share_and_peer(&db, "pc-one", "shareA");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    // A peer's seq of 42 must not become our local seq.
+    let change = change_at(share_id, "a.txt", 42);
+    let seq = db
+        .append_journal_entry(
+            share_row_id,
+            &change,
+            now,
+            JournalOrigin::Peer {
+                peer_id,
+                origin_seq: 42,
+            },
+        )
+        .unwrap();
+    assert_eq!(seq, Some(1), "local seq must start at 1, not adopt 42");
+
+    let entries = db.list_journal_since(share_row_id, 0, 10).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].change.seq, 1);
+    assert_eq!(entries[0].origin_seq, 42);
+    assert_eq!(entries[0].origin_peer_id, Some(peer_id));
+}
+
+#[test]
+fn snapshot_between_journal_entries_does_not_collide() {
+    let db = Db::open_in_memory().unwrap();
+    let (share_row_id, share_id, peer_id) = share_and_peer(&db, "pc-one", "shareA");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let journal = |origin_seq: i64, path: &str| {
+        db.append_journal_entry(
+            share_row_id,
+            &change_at(share_id, path, origin_seq),
+            now,
+            JournalOrigin::Peer {
+                peer_id,
+                origin_seq,
+            },
+        )
+        .expect("append must not error")
+    };
+
+    assert_eq!(journal(1, "a.txt"), Some(1));
+    assert_eq!(journal(2, "b.txt"), Some(2));
+    assert_eq!(journal(3, "c.txt"), Some(3));
+    // A manual push lands between journal entries: origin_seq 0, no position.
+    assert_eq!(journal(0, "pushed.txt"), Some(4));
+    // The next journal entry must still land, not trip UNIQUE (share_id, seq).
+    assert_eq!(journal(4, "d.txt"), Some(5));
+
+    let entries = db.list_journal_since(share_row_id, 0, 50).unwrap();
+    let local: Vec<i64> = entries.iter().map(|e| e.change.seq).collect();
+    let origin: Vec<i64> = entries.iter().map(|e| e.origin_seq).collect();
+    assert_eq!(local, vec![1, 2, 3, 4, 5], "local seqs stay contiguous");
+    assert_eq!(origin, vec![1, 2, 3, 0, 4], "origin seqs keep their namespace");
+}
+
+#[test]
+fn duplicate_origin_seq_is_deduped_not_errored() {
+    let db = Db::open_in_memory().unwrap();
+    let (share_row_id, share_id, peer_id) = share_and_peer(&db, "pc-one", "shareA");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let change = change_at(share_id, "a.txt", 3);
+    let origin = JournalOrigin::Peer {
+        peer_id,
+        origin_seq: 3,
+    };
+
+    assert_eq!(
+        db.append_journal_entry(share_row_id, &change, now, origin)
+            .unwrap(),
+        Some(1)
+    );
+    // Re-delivery is a reported no-op, distinguishable from a failure.
+    assert_eq!(
+        db.append_journal_entry(share_row_id, &change, now, origin)
+            .unwrap(),
+        None
+    );
+    assert_eq!(db.journal_entry_count().unwrap(), 1);
+}
+
+#[test]
+fn snapshot_entries_are_never_deduped_against_each_other() {
+    // origin_seq 0 is exempt from the origin index: two manual pushes of the
+    // same path are two real events, not a replay.
+    let db = Db::open_in_memory().unwrap();
+    let (share_row_id, share_id, peer_id) = share_and_peer(&db, "pc-one", "shareA");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let change = change_at(share_id, "a.txt", 0);
+    let origin = JournalOrigin::Peer {
+        peer_id,
+        origin_seq: 0,
+    };
+
+    assert_eq!(
+        db.append_journal_entry(share_row_id, &change, now, origin)
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        db.append_journal_entry(share_row_id, &change, now, origin)
+            .unwrap(),
+        Some(2)
+    );
+}
+
+#[test]
+fn share_progress_last_applied_is_monotonic() {
+    let db = Db::open_in_memory().unwrap();
+    let (share_row_id, share_id, _) = share_and_peer(&db, "pc-one", "shareA");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    for path in ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"] {
+        db.append_journal_entry(
+            share_row_id,
+            &change_at(share_id, path, 0),
+            now,
+            JournalOrigin::Local,
+        )
+        .unwrap();
+    }
+    assert_eq!(db.journal_high_water(share_row_id).unwrap(), 5);
+
+    // Directly force a lower value in, as a late append would have done before
+    // the MAX fix; the watermark must not rewind.
+    db.append_journal_entry(
+        share_row_id,
+        &change_at(share_id, "f.txt", 0),
+        now,
+        JournalOrigin::Local,
+    )
+    .unwrap();
+    assert_eq!(db.journal_high_water(share_row_id).unwrap(), 6);
+}
+
+#[test]
+fn bump_last_seq_acked_never_rewinds() {
+    let db = Db::open_in_memory().unwrap();
+    let (share_row_id, _, peer_id) = share_and_peer(&db, "pc-one", "shareA");
+
+    db.bump_last_seq_acked(peer_id, share_row_id, 10).unwrap();
+    assert_eq!(db.get_peer_progress(peer_id, share_row_id).unwrap().1, 10);
+
+    // A stale ack arriving late must not move sync backwards.
+    db.bump_last_seq_acked(peer_id, share_row_id, 3).unwrap();
+    assert_eq!(db.get_peer_progress(peer_id, share_row_id).unwrap().1, 10);
+
+    db.bump_last_seq_sent(peer_id, share_row_id, 20).unwrap();
+    db.bump_last_seq_sent(peer_id, share_row_id, 5).unwrap();
+    assert_eq!(db.get_peer_progress(peer_id, share_row_id).unwrap().0, 20);
+}
+
+#[test]
+fn inbound_and_outbound_watermarks_are_independent() {
+    let db = Db::open_in_memory().unwrap();
+    let (share_row_id, _, peer_id) = share_and_peer(&db, "pc-one", "shareA");
+
+    db.bump_inbound_watermark(peer_id, share_row_id, 7).unwrap();
+    assert_eq!(db.inbound_watermark(peer_id, share_row_id).unwrap(), 7);
+    assert_eq!(
+        db.get_peer_progress(peer_id, share_row_id).unwrap(),
+        (0, 0),
+        "receiving must not touch outbound watermarks"
+    );
+
+    db.bump_last_seq_acked(peer_id, share_row_id, 99).unwrap();
+    assert_eq!(
+        db.inbound_watermark(peer_id, share_row_id).unwrap(),
+        7,
+        "sending must not touch the inbound watermark"
+    );
+
+    // And it is monotonic too.
+    db.bump_inbound_watermark(peer_id, share_row_id, 2).unwrap();
+    assert_eq!(db.inbound_watermark(peer_id, share_row_id).unwrap(), 7);
+}
+
+#[test]
+fn ack_is_clamped_to_the_range_the_intent_covers() {
+    use models::{IntentBasis, IntentKind, IntentOrigin};
+
+    let db = Db::open_in_memory().unwrap();
+    let (share_row_id, share_id, peer_id) = share_and_peer(&db, "pc-one", "shareA");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    for path in ["a.txt", "b.txt"] {
+        db.append_journal_entry(
+            share_row_id,
+            &change_at(share_id, path, 0),
+            now,
+            JournalOrigin::Local,
+        )
+        .unwrap();
+    }
+
+    let (_id, batch_ids) = db
+        .create_and_materialize_intent(
+            IntentKind::SyncCatchup,
+            IntentOrigin::AutoSync,
+            "shareA",
+            share_id,
+            Some(peer_id),
+            IntentBasis::JournalRange {
+                from_seq: 0,
+                to_seq: 2,
+            },
+            None,
+            "pc-one",
+        )
+        .unwrap();
+    db.on_outbound_batch_sent(&batch_ids[0], peer_id, &share_id, 2)
+        .unwrap();
+
+    // A peer claiming 9999 can only ever be credited for what we actually sent.
+    db.on_batch_ack(peer_id, &share_id, 9999, Some(&batch_ids[0]))
+        .unwrap();
+    assert_eq!(
+        db.get_peer_progress(peer_id, share_row_id).unwrap().1,
+        2,
+        "ack must be clamped to the intent's to_seq"
+    );
+}
+
+#[test]
+fn legacy_ack_without_batch_id_ignores_snapshot_intents() {
+    use models::{IntentBasis, IntentKind, IntentOrigin};
+
+    let db = Db::open_in_memory().unwrap();
+    let (share_row_id, share_id, peer_id) = share_and_peer(&db, "pc-one", "shareA");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    db.upsert_file_meta(
+        share_row_id,
+        &FileMeta {
+            path: "only.txt".into(),
+            size: 1,
+            mtime: now,
+            hash: [8u8; 32],
+            version: 1,
+            deleted: false,
+        },
+    )
+    .unwrap();
+    db.append_journal_entry(
+        share_row_id,
+        &change_at(share_id, "only.txt", 0),
+        now,
+        JournalOrigin::Local,
+    )
+    .unwrap();
+
+    // One snapshot push and one catchup, same peer and share, both sent.
+    let (_p, push_batches) = db
+        .create_and_materialize_intent(
+            IntentKind::SnapshotPush,
+            IntentOrigin::User,
+            "shareA",
+            share_id,
+            Some(peer_id),
+            IntentBasis::Snapshot {
+                paths: vec!["only.txt".into()],
+            },
+            None,
+            "pc-one",
+        )
+        .unwrap();
+    let (_s, sync_batches) = db
+        .create_and_materialize_intent(
+            IntentKind::SyncCatchup,
+            IntentOrigin::AutoSync,
+            "shareA",
+            share_id,
+            Some(peer_id),
+            IntentBasis::JournalRange {
+                from_seq: 0,
+                to_seq: 1,
+            },
+            None,
+            "pc-one",
+        )
+        .unwrap();
+    db.on_outbound_batch_sent(&push_batches[0], peer_id, &share_id, 0)
+        .unwrap();
+    db.on_outbound_batch_sent(&sync_batches[0], peer_id, &share_id, 1)
+        .unwrap();
+
+    // No batch_id: the fallback must resolve only the catchup, and stay clamped.
+    db.on_batch_ack(peer_id, &share_id, 999, None).unwrap();
+    assert_eq!(
+        db.get_peer_progress(peer_id, share_row_id).unwrap().1,
+        1,
+        "legacy ack must not adopt a snapshot's number or exceed the range"
+    );
+}
+
+#[test]
+fn sent_outbound_rows_are_reclaimed() {
+    let db = Db::open_in_memory().unwrap();
+    let (_share_row_id, share_id, peer_id) = share_and_peer(&db, "pc-one", "shareA");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let manifest = BatchManifest {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
+        batch_id: "old-batch".to_string(),
+        share_id,
+        from_node: "pc-one".to_string(),
+        created_at: now,
+        basis: models::BatchBasis::Snapshot,
+        journal_from_seq: 0,
+        journal_to_seq: 0,
+        changes: vec![change_at(share_id, "a.txt", 0)],
+    };
+    db.enqueue_outbound_batch(&manifest, Some(peer_id), None)
+        .unwrap();
+    db.mark_outbound_sent("old-batch").unwrap();
+
+    // Delivered rows are invisible to queue depth, so only the sweep can free
+    // them -- which is exactly how the table used to grow without bound.
+    assert_eq!(db.outbound_queue_depth().unwrap(), 0);
+
+    // A future cutoff (negative age) stands in for "this row has aged out";
+    // enqueue_outbound_batch stamps created_at itself, so the test cannot
+    // backdate the row directly.
+    let removed = db.cleanup_old_batches(-60).unwrap();
+    assert!(removed >= 1, "sent outbound rows must be reclaimed");
+
+    // A pending row of the same age must survive: only delivered rows are swept.
+    let pending = BatchManifest {
+        batch_id: "live-batch".to_string(),
+        ..manifest
+    };
+    db.enqueue_outbound_batch(&pending, Some(peer_id), None)
+        .unwrap();
+    assert_eq!(db.cleanup_old_batches(-60).unwrap(), 0);
+    assert_eq!(db.outbound_queue_depth().unwrap(), 1);
 }

@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 pub struct MetricsSnapshot {
     pub queue_depth: u64,
     pub queue_due_now: u64,
-    pub change_log_total: u64,
+    pub journal_entries: u64,
     pub peers: Vec<PeerSnapshot>,
     pub timestamp: i64,
 }
@@ -51,7 +51,7 @@ pub fn run_monitor(cfg: &AppConfig, opts: &MonitorOptions) -> Result<()> {
                 snapshot.queue_depth,
                 snapshot.queue_due_now,
                 snapshot.peers.len(),
-                snapshot.change_log_total
+                snapshot.journal_entries
             );
         }
         for alert in &alerts {
@@ -75,7 +75,7 @@ fn collect_metrics(db: &Db) -> Result<MetricsSnapshot> {
     let now = current_ts();
     let queue_depth = db.outbound_queue_depth()? as u64;
     let queue_due_now = db.outbound_queue_due_now(now)? as u64;
-    let change_log_total = db.change_log_total()? as u64;
+    let journal_entries = db.journal_entry_count()? as u64;
     let peers = db
         .list_peers()?
         .into_iter()
@@ -92,7 +92,7 @@ fn collect_metrics(db: &Db) -> Result<MetricsSnapshot> {
     Ok(MetricsSnapshot {
         queue_depth,
         queue_due_now,
-        change_log_total,
+        journal_entries,
         peers,
         timestamp: now,
     })

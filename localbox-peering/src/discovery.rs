@@ -304,7 +304,7 @@ async fn handle_discover(
     );
 
     if accepts_remote_shares {
-        maybe_enqueue_auto_push(
+        maybe_enqueue_auto_sync(
             cfg,
             db,
             share_lookup,
@@ -416,7 +416,7 @@ async fn handle_here(
             pc_name, instance_id, peer_addr, shares
         );
         if accepts_remote_shares {
-            maybe_enqueue_auto_push(
+            maybe_enqueue_auto_sync(
                 cfg,
                 db,
                 share_lookup,
@@ -567,7 +567,7 @@ fn is_self_peer(cfg: &AppConfig, pc_name: &str, _instance_id: &str) -> bool {
     pc_name == cfg.pc_name
 }
 
-async fn maybe_enqueue_auto_push(
+async fn maybe_enqueue_auto_sync(
     cfg: &AppConfig,
     db: &DbHandle,
     share_lookup: &Arc<Vec<ShareContext>>,
@@ -580,7 +580,7 @@ async fn maybe_enqueue_auto_push(
     let peer_key = format!("{peer_pc}@{peer_instance}");
     let auto_shares: Vec<ShareContext> = share_lookup
         .iter()
-        .filter(|s| cfg.resolve_push_mode(&s.share_name, Some(&peer_key)).is_auto())
+        .filter(|s| cfg.resolve_sync_mode(&s.share_name, Some(&peer_key)).is_auto())
         .cloned()
         .collect();
     if auto_shares.is_empty() {
@@ -637,7 +637,7 @@ async fn enqueue_catchup_if_needed(
                     continue;
                 }
             };
-        let max_seq = match db.lock().await.max_change_seq(share_row_id) {
+        let max_seq = match db.lock().await.max_journal_seq(share_row_id) {
             Ok(s) => s,
             Err(e) => {
                 warn!(
@@ -652,7 +652,7 @@ async fn enqueue_catchup_if_needed(
         }
         match db.lock().await.create_and_materialize_intent(
             models::IntentKind::SyncCatchup,
-            models::IntentOrigin::AutoPush,
+            models::IntentOrigin::AutoSync,
             &share.share_name,
             share.share_id,
             Some(peer_id),
@@ -702,7 +702,7 @@ async fn enqueue_bootstrap_if_needed(
             continue;
         }
 
-        let max_seq = match db.lock().await.max_change_seq(share.id) {
+        let max_seq = match db.lock().await.max_journal_seq(share.id) {
             Ok(s) => s,
             Err(e) => {
                 warn!(
@@ -718,7 +718,7 @@ async fn enqueue_bootstrap_if_needed(
 
         match db.lock().await.create_and_materialize_intent(
             models::IntentKind::SyncCatchup,
-            models::IntentOrigin::AutoPush,
+            models::IntentOrigin::AutoSync,
             &share.share_name,
             share.share_id,
             Some(peer_id),

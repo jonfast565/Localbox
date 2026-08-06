@@ -913,7 +913,7 @@ impl ShareCli {
             recursive: self.recursive,
             ignore_patterns: Vec::new(),
             max_file_size_bytes: None,
-            push: Default::default(),
+            sync: Default::default(),
             pull: Default::default(),
             request_handling: None,
         }
@@ -1007,8 +1007,10 @@ struct FileShareConfig {
     #[serde(default)]
     ignore_patterns: Vec<String>,
     max_file_size_bytes: Option<u64>,
-    #[serde(default)]
-    push: TransferMode,
+    /// Gates journal sync (SyncCatchup), not manual push.
+    /// `push` is the pre-v7 spelling of this key.
+    #[serde(default, alias = "push")]
+    sync: TransferMode,
     #[serde(default)]
     pull: TransferMode,
     #[serde(default)]
@@ -1100,7 +1102,7 @@ fn merge_shares(
             recursive: s.recursive,
             ignore_patterns: s.ignore_patterns,
             max_file_size_bytes: s.max_file_size_bytes,
-            push: s.push,
+            sync: s.sync,
             pull: s.pull,
             request_handling: s.request_handling,
         });
@@ -1115,7 +1117,7 @@ fn merge_shares(
                 recursive: s.recursive,
                 ignore_patterns: existing.ignore_patterns,
                 max_file_size_bytes: existing.max_file_size_bytes,
-                push: existing.push,
+                sync: existing.sync,
                 pull: existing.pull,
                 request_handling: existing.request_handling,
             };
@@ -1294,15 +1296,17 @@ control_socket = "{control_socket}"
 # [[peer_policies]]
 # peer = "workstation-b"
 # share = "docs"
-# push = "auto"
+# sync = "auto"
 # pull = "manual"
 
 [[shares]]
 name = "docs"
 root_path = "C:/path/to/docs"
 recursive = true
-# push/pull default to "manual" (no automatic transfers)
-push = "manual"
+# sync/pull default to "manual" (no automatic transfers).
+# `sync = "auto"` streams journal changes to peers continuously; it does not
+# affect `localbox push`, which is always available on demand.
+sync = "manual"
 pull = "manual"
 # ignore_patterns = ["**/.git/**", "**/*.tmp"]
 # max_file_size_bytes = 1073741824 # 1 GiB
@@ -1400,6 +1404,29 @@ mod tests {
         assert!(parsed.get("shares").is_some());
     }
 
+    /// `sync` gates journal sync; `push` is the pre-v7 spelling of the same key.
+    /// `FileShareConfig` is `deny_unknown_fields`, so this pins that the alias is
+    /// still an accepted field name rather than a hard parse error.
+    #[test]
+    fn share_sync_accepts_legacy_push_spelling() {
+        let legacy: super::FileShareConfig = toml::from_str(
+            "name = \"docs\"\nroot_path = \"/docs\"\nrecursive = true\npush = \"auto\"\n",
+        )
+        .expect("legacy `push` key must still parse");
+        assert!(legacy.sync.is_auto());
+
+        let current: super::FileShareConfig = toml::from_str(
+            "name = \"docs\"\nroot_path = \"/docs\"\nrecursive = true\nsync = \"auto\"\n",
+        )
+        .expect("`sync` key must parse");
+        assert!(current.sync.is_auto());
+
+        // Absent means manual, unchanged from before the rename.
+        let bare: super::FileShareConfig =
+            toml::from_str("name = \"docs\"\nroot_path = \"/docs\"\nrecursive = true\n").unwrap();
+        assert!(!bare.sync.is_auto());
+    }
+
     #[test]
     fn validate_app_config_checks_share_paths() {
         let tmp_dir = test_temp_path("localbox-test");
@@ -1427,7 +1454,7 @@ mod tests {
                 recursive: true,
                 ignore_patterns: Vec::new(),
                 max_file_size_bytes: None,
-                push: Default::default(),
+                sync: Default::default(),
                 pull: Default::default(),
                 request_handling: None,
             }],
@@ -1465,7 +1492,7 @@ mod tests {
                 recursive: true,
                 ignore_patterns: Vec::new(),
                 max_file_size_bytes: None,
-                push: Default::default(),
+                sync: Default::default(),
                 pull: Default::default(),
                 request_handling: None,
             }],

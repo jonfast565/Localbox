@@ -130,7 +130,19 @@ pub fn share_context_from_row(row: &ShareRow) -> ShareContext {
 
 type DbHandle = Arc<Mutex<Db>>;
 type SharedWriters = Arc<Mutex<Vec<(i64, Arc<tokio::sync::Mutex<writer::PeerWriter>>)>>>;
-type PendingFiles = Arc<Mutex<HashMap<(ShareId, String), InboundFileState>>>;
+/// In-flight inbound receives, keyed by `(peer_id, share_id, wire_path)`.
+///
+/// `peer_id` is part of the key, not decoration: the map is process-wide and
+/// every connection handler shares one `Arc`. Keyed on `(share_id, path)`
+/// alone, two peers pushing the same path at overlapping times collided — the
+/// second peer's `offset == 0` chunk took the out-of-order branch in
+/// `handle_file_chunk_message`, truncating the first peer's staging file and
+/// resetting its hasher, after which both streams interleaved into one file.
+/// The final hash check caught the corruption, so nothing bad reached disk, but
+/// both transfers were wasted and each peer's restart re-triggered the other's.
+type PendingFiles = Arc<Mutex<HashMap<PendingFileKey, InboundFileState>>>;
+
+type PendingFileKey = (i64, ShareId, String);
 
 struct InboundFileState {
     target_path: PathBuf,
@@ -140,6 +152,12 @@ struct InboundFileState {
     expected_offset: u64,
     expected_hash: Option<[u8; 32]>,
     expected_size: Option<u64>,
+    /// Hard ceiling on bytes written to staging: the tighter of the manifest's
+    /// declared size and the share's `max_file_size_bytes`. Without it a peer
+    /// that under-declares a file streams the whole thing to disk before the
+    /// eof hash check notices, which is exactly the disk-filling push the share
+    /// limit is supposed to prevent.
+    size_limit: Option<u64>,
 }
 
 pub struct PeerManager {
@@ -499,6 +517,7 @@ impl PeerManager {
         token: CancellationToken,
     ) -> JoinHandle<()> {
         let db = Arc::clone(&self.db);
+        let max_attempts = self.cfg.outbound_max_attempts;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
@@ -634,18 +653,48 @@ impl PeerManager {
                         }
                     } else {
                         let backoff = compute_backoff_secs(item.attempts + 1);
-                        warn!(
-                            batch_id = %item.batch_id,
-                            peer_id = ?target_peer,
-                            attempts = item.attempts + 1,
-                            backoff_secs = backoff,
-                            "Batch send failed (will retry)"
-                        );
-                        let _ = db.lock().await.mark_outbound_failed(
+                        let outcome = db.lock().await.record_outbound_failure(
                             &item.batch_id,
                             "send failure",
                             backoff,
+                            max_attempts,
                         );
+                        match outcome {
+                            Ok(db::OutboundAttempt::Retrying { attempts }) => warn!(
+                                batch_id = %item.batch_id,
+                                peer_id = ?target_peer,
+                                attempts,
+                                max_attempts,
+                                backoff_secs = backoff,
+                                "Batch send failed (will retry)"
+                            ),
+                            Ok(db::OutboundAttempt::DeadLettered {
+                                attempts,
+                                intent_id,
+                            }) => {
+                                error!(
+                                    batch_id = %item.batch_id,
+                                    peer_id = ?target_peer,
+                                    attempts,
+                                    max_attempts,
+                                    intent_id = ?intent_id,
+                                    "Batch dead-lettered after exhausting its attempts; \
+                                     it will not be retried (see `localbox status queue`)"
+                                );
+                                notify.emit(models::ControlEvent::BatchDeadLettered {
+                                    batch_id: item.batch_id.clone(),
+                                    peer_id: target_peer,
+                                    intent_id,
+                                    attempts,
+                                    last_error: "send failure".to_string(),
+                                });
+                            }
+                            Err(e) => error!(
+                                batch_id = %item.batch_id,
+                                error = %e,
+                                "Failed to record outbound send failure"
+                            ),
+                        }
                     }
                 }
             }

@@ -221,6 +221,7 @@ fn event_matches_topics(event: &ControlEvent, topics: &[String]) -> bool {
         ControlEvent::ChatReceived { .. } => "chat",
         ControlEvent::TransferRequestPending { .. } => "transfer",
         ControlEvent::BatchReceived { .. } => "batch",
+        ControlEvent::BatchDeadLettered { .. } => "batch",
     };
     topics.iter().any(|t| t.eq_ignore_ascii_case(name))
 }

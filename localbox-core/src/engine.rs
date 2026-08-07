@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use utilities::compute_file_hash;
 use utilities::disk_utilities::build_meta_with_retry_limited;
-use utilities::{init_logging, FileSystem, Net, RealFileSystem, RealNet};
+use utilities::{init_logging, DirEntry, FileSystem, Net, RealFileSystem, RealNet};
 const APP_BANNER: &str = r#"
        ,gggg,                                           ,ggggggggggg,                           
       d8" "8I                                    ,dPYb,dP"""88""""""Y8,                         
@@ -630,7 +630,7 @@ mod tests {
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
     use notify::EventKind;
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use utilities::{FileSystem, VirtualFileSystem};
@@ -840,22 +840,19 @@ mod tests {
             peer_policies: Vec::new(),
             quarantined_peers: Vec::new(),
             control_socket: PathBuf::from("localbox.sock"),
+            outbound_max_attempts: models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
         };
 
         let mut db = db::Db::open_in_memory().unwrap();
         let mut share = db.load_shares(&cfg).unwrap().remove(0);
+        // Index and disk agree, which is the state a clean shutdown leaves.
         for name in ["one.txt", "two.txt"] {
-            share.index.insert(
-                name.to_string(),
-                FileMeta {
-                    path: name.to_string(),
-                    size: 3,
-                    mtime: 100,
-                    hash: [5u8; 32],
-                    version: 1,
-                    deleted: false,
-                },
-            );
+            let full = root.join(name);
+            fs.write(&full, b"abc").unwrap();
+            share
+                .index
+                .insert(name.to_string(), meta_from_disk(&fs, &root, name));
+            let _ = full;
         }
 
         seed_journal_from_index(&mut db, &share, &fs, None).unwrap();
@@ -874,6 +871,213 @@ mod tests {
             ),
             after_first,
             "re-seeding must not append duplicate entries"
+        );
+    }
+
+    /// Build the index entry a clean shutdown would have left for a file.
+    fn meta_from_disk(fs: &Arc<dyn FileSystem>, root: &Path, rel: &str) -> models::FileMeta {
+        let md = fs.metadata(&root.join(rel)).unwrap();
+        models::FileMeta {
+            path: rel.to_string(),
+            size: md.len,
+            mtime: md
+                .modified
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            hash: [0u8; 32],
+            version: 1,
+            deleted: false,
+        }
+    }
+
+    fn rescan_fixture(
+        root: &Path,
+        recursive: bool,
+    ) -> (db::Db, models::ShareContext, Arc<dyn FileSystem>) {
+        use models::{AppConfig, ApplicationState, ConflictPolicy, ShareConfig, TransferMode};
+        let fs: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+        fs.create_dir_all(root).unwrap();
+        let cfg = AppConfig {
+            pc_name: "pc-one".into(),
+            instance_id: "inst".into(),
+            display_name: String::new(),
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            plain_listen_addr: "127.0.0.1:0".parse().unwrap(),
+            use_tls_for_peers: false,
+            discovery_port: 0,
+            discovery_send_ports: Vec::new(),
+            dht_port: 5003,
+            utp_port: 5004,
+            enable_dht: false,
+            enable_utp: false,
+            bootstrap_peers: Vec::new(),
+            aggregation_window_ms: 100,
+            db_path: PathBuf::new(),
+            log_path: PathBuf::new(),
+            tls_cert_path: PathBuf::new(),
+            tls_key_path: PathBuf::new(),
+            tls_ca_cert_path: PathBuf::new(),
+            tls_pinned_ca_fingerprints: Vec::new(),
+            tls_peer_fingerprints: HashMap::new(),
+            tls_insecure_shared_cert: false,
+            remote_share_root: PathBuf::from("remote"),
+            shares: vec![ShareConfig {
+                name: "shareA".into(),
+                root_path: root.to_path_buf(),
+                recursive,
+                ignore_patterns: Vec::new(),
+                sync_allow: Vec::new(),
+                max_file_size_bytes: None,
+                sync: TransferMode::Manual,
+                pull: TransferMode::Manual,
+                request_handling: None,
+                conflict: ConflictPolicy::LastWriteWins,
+            }],
+            app_state: ApplicationState::MirrorHost,
+            request_handling: TransferMode::Manual,
+            peer_policies: Vec::new(),
+            quarantined_peers: Vec::new(),
+            control_socket: PathBuf::from("localbox.sock"),
+            outbound_max_attempts: models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
+        };
+        let mut db = db::Db::open_in_memory().unwrap();
+        let share = db.load_shares(&cfg).unwrap().remove(0);
+        (db, share, fs)
+    }
+
+    /// The regression for the old shallow scan: `read_dir` was not recursive, so
+    /// anything added below the top level while the daemon was down was never
+    /// noticed and peers stayed stale for it forever.
+    #[test]
+    fn rescan_finds_files_nested_below_the_share_root() {
+        use super::rescan_share;
+        let root = PathBuf::from("/nested-share");
+        let (mut db, share, fs) = rescan_fixture(&root, true);
+
+        fs.write(&root.join("top.txt"), b"t").unwrap();
+        // create_dir_all first, as every real write path does: the virtual FS
+        // only registers a file's immediate parent otherwise.
+        fs.create_dir_all(&root.join("a/b/c")).unwrap();
+        fs.write(&root.join("a/b/deep.txt"), b"d").unwrap();
+        fs.write(&root.join("a/b/c/deeper.txt"), b"dd").unwrap();
+
+        let summary = rescan_share(&mut db, &share, &fs, None).unwrap();
+        assert_eq!(summary.added, 3, "every depth must be walked");
+        assert_eq!(summary.modified, 0);
+        assert_eq!(summary.deleted, 0);
+
+        let paths: Vec<String> = db
+            .list_journal_since(share.id, 0, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.change.path)
+            .collect();
+        assert!(paths.iter().any(|p| p.ends_with("deeper.txt")));
+    }
+
+    /// A non-recursive share must not adopt the subtree it deliberately excludes.
+    #[test]
+    fn a_non_recursive_share_stays_at_its_top_level() {
+        use super::rescan_share;
+        let root = PathBuf::from("/flat-share");
+        let (mut db, share, fs) = rescan_fixture(&root, false);
+
+        fs.write(&root.join("top.txt"), b"t").unwrap();
+        fs.create_dir_all(&root.join("sub")).unwrap();
+        fs.write(&root.join("sub/deep.txt"), b"d").unwrap();
+
+        let summary = rescan_share(&mut db, &share, &fs, None).unwrap();
+        assert_eq!(summary.added, 1);
+    }
+
+    /// Files changed or removed while the daemon was down used to be invisible:
+    /// the scan only ever *added*, so peers stayed permanently stale for them.
+    #[test]
+    fn rescan_journals_offline_modifications_and_deletions() {
+        use super::rescan_share;
+        let root = PathBuf::from("/drift-share");
+        let (mut db, mut share, fs) = rescan_fixture(&root, true);
+
+        for name in ["keep.txt", "edit.txt", "gone.txt"] {
+            fs.write(&root.join(name), b"original").unwrap();
+        }
+        // First pass establishes the baseline.
+        let first = rescan_share(&mut db, &share, &fs, None).unwrap();
+        assert_eq!(first.added, 3);
+        share.index = db.load_file_index(share.id).unwrap();
+
+        // Nothing changed: a second pass must be silent.
+        let quiet = rescan_share(&mut db, &share, &fs, None).unwrap();
+        assert!(quiet.is_empty(), "an unchanged tree must journal nothing");
+
+        // Now drift the tree the way an offline edit session would.
+        fs.write(&root.join("edit.txt"), b"a much longer body")
+            .unwrap();
+        fs.remove_file(&root.join("gone.txt")).unwrap();
+        fs.write(&root.join("new.txt"), b"fresh").unwrap();
+
+        let summary = rescan_share(&mut db, &share, &fs, None).unwrap();
+        assert_eq!(summary.added, 1, "new.txt");
+        assert_eq!(summary.modified, 1, "edit.txt");
+        assert_eq!(summary.deleted, 1, "gone.txt");
+
+        let index = db.load_file_index(share.id).unwrap();
+        assert!(index["gone.txt"].deleted, "the tombstone must be recorded");
+        assert!(!index["keep.txt"].deleted);
+        assert_eq!(index["edit.txt"].size, "a much longer body".len() as u64);
+    }
+
+    /// An unreadable share root reads as "no files found". Journaling a delete
+    /// per index entry would replicate a mass deletion caused by nothing more
+    /// than an unplugged drive.
+    #[test]
+    fn an_unreadable_share_root_never_journals_deletions() {
+        use super::rescan_share;
+        let root = PathBuf::from("/vanishing-share");
+        let (mut db, mut share, fs) = rescan_fixture(&root, true);
+
+        for name in ["a.txt", "b.txt"] {
+            fs.write(&root.join(name), b"body").unwrap();
+        }
+        rescan_share(&mut db, &share, &fs, None).unwrap();
+        share.index = db.load_file_index(share.id).unwrap();
+
+        // The mount goes away: the root itself is no longer readable.
+        let gone = models::ShareContext {
+            root_path: PathBuf::from("/vanishing-share-unmounted"),
+            ..share.clone()
+        };
+        let summary = rescan_share(&mut db, &gone, &fs, None).unwrap();
+        assert_eq!(
+            summary.deleted, 0,
+            "an unreachable root must never be read as an emptied share"
+        );
+
+        let index = db.load_file_index(share.id).unwrap();
+        assert!(!index["a.txt"].deleted);
+        assert!(!index["b.txt"].deleted);
+    }
+
+    /// A path the walk was never allowed to visit cannot be judged missing.
+    #[test]
+    fn ignored_paths_are_not_journaled_as_deletions() {
+        use super::rescan_share;
+        let root = PathBuf::from("/ignore-share");
+        let (mut db, mut share, fs) = rescan_fixture(&root, true);
+
+        fs.write(&root.join("visible.txt"), b"v").unwrap();
+        fs.write(&root.join("secret.key"), b"s").unwrap();
+        rescan_share(&mut db, &share, &fs, None).unwrap();
+        share.index = db.load_file_index(share.id).unwrap();
+        assert_eq!(share.index.len(), 2);
+
+        // The pattern is added after the fact, so the index still holds the path.
+        share.ignore_patterns = vec!["**/*.key".to_string()];
+        let summary = rescan_share(&mut db, &share, &fs, None).unwrap();
+        assert_eq!(
+            summary.deleted, 0,
+            "becoming ignored is not the same as being deleted"
         );
     }
 }
@@ -1233,19 +1437,68 @@ fn map_event_kind(event_kind: &EventKind) -> Option<ChangeKind> {
     None
 }
 
+/// What a reconciliation pass found. All four counts are journal entries
+/// actually appended, not paths inspected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RescanSummary {
+    /// Index entries that had no journal coverage yet (the idempotent seed).
+    pub seeded: usize,
+    /// Files on disk the index had never heard of.
+    pub added: usize,
+    /// Files whose `(size, mtime)` no longer matches the index.
+    pub modified: usize,
+    /// Index entries with no file on disk.
+    pub deleted: usize,
+}
+
+impl RescanSummary {
+    pub fn total(&self) -> usize {
+        self.seeded + self.added + self.modified + self.deleted
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
+/// Depth cap for the recursive walk. Symlinked directories are followed by
+/// `read_dir` (it stats through links), so a cycle would otherwise never end.
+const MAX_WALK_DEPTH: usize = 64;
+
 pub(crate) fn seed_journal_from_index(
     db: &mut db::Db,
     share: &ShareContext,
     fs: &Arc<dyn FileSystem>,
     workdir: Option<&Path>,
 ) -> Result<()> {
+    rescan_share(db, share, fs, workdir).map(|_| ())
+}
+
+/// Reconcile a share's journal against what is actually on disk.
+///
+/// Runs at startup and on demand (`localbox rescan`). Three passes, in order:
+///
+/// 1. Seed journal entries for index paths the journal does not cover yet.
+///    Skipping already-journaled paths is what keeps this idempotent: without
+///    it every restart re-appended the whole index under fresh seqs, inflating
+///    `max_journal_seq` and re-sending everything to every peer.
+/// 2. Walk the tree and journal anything new or drifted.
+/// 3. Journal a `Delete` for index entries with no file on disk.
+///
+/// Passes 2 and 3 are what make a restart safe after offline edits. Previously
+/// this walked only the share root non-recursively and only ever *added*, so a
+/// file changed or removed below the top level while the daemon was down left
+/// every peer permanently stale for that path.
+pub fn rescan_share(
+    db: &mut db::Db,
+    share: &ShareContext,
+    fs: &Arc<dyn FileSystem>,
+    workdir: Option<&Path>,
+) -> Result<RescanSummary> {
     let share_row_id = share.id;
     let now = OffsetDateTime::now_utc().unix_timestamp();
+    let mut summary = RescanSummary::default();
 
-    // Walk the current index; seed the journal with any path it does not yet
-    // cover. Skipping already-journaled paths is what keeps this idempotent:
-    // without it every restart re-appended the whole index under fresh seqs,
-    // inflating max_journal_seq and re-sending everything to every peer.
     for meta in share.index.values() {
         let mut meta = meta.clone();
         let full_path = share.root_path.join(&meta.path);
@@ -1272,68 +1525,187 @@ pub(crate) fn seed_journal_from_index(
         };
         let _ = db.upsert_file_meta(share_row_id, &meta);
         db.append_journal_entry(share_row_id, &change, now, JournalOrigin::Local)?;
+        summary.seeded += 1;
     }
 
-    // Detect files missing from DB (filesystem drift) and add them.
-    if let Ok(fs_entries) = fs.read_dir(&share.root_path) {
-        for entry in fs_entries {
-            if !entry.metadata.is_file {
+    // Pass 2: everything on disk, compared against the index.
+    let mut seen_on_disk: HashSet<String> = HashSet::new();
+    for entry in walk_share_files(fs.as_ref(), &share.root_path, share.recursive) {
+        if is_in_workdir(workdir, &entry.path) {
+            continue;
+        }
+        let Ok(rel) = entry.path.strip_prefix(&share.root_path) else {
+            continue;
+        };
+        let rel_path = rel.to_string_lossy().to_string();
+        if rel_path.is_empty() {
+            continue;
+        }
+        if entry
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(utilities::is_staging_tmp_name)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if !utilities::ignore::is_path_allowed(&rel_path, &share.sync_allow, &share.ignore_patterns)
+        {
+            continue;
+        }
+        if let Some(max) = share.max_file_size_bytes {
+            if entry.metadata.len > max {
                 continue;
             }
-            if is_in_workdir(workdir, &entry.path) {
-                continue;
-            }
-            let entry_path = entry.path;
-            let rel = match entry_path.strip_prefix(&share.root_path) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let rel_path = rel.to_string_lossy().to_string();
-            if !utilities::ignore::is_path_allowed(
-                &rel_path,
-                &share.sync_allow,
-                &share.ignore_patterns,
-            ) {
-                continue;
-            }
-            if let Some(max) = share.max_file_size_bytes {
-                if entry.metadata.len > max {
-                    continue;
-                }
-            }
-            if share.index.contains_key(&rel_path) {
-                continue;
-            }
+        }
+        seen_on_disk.insert(rel_path.clone());
 
-            let size = entry.metadata.len;
-            let mtime = entry
-                .metadata
-                .modified
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(now);
-            let hash = compute_file_hash(fs.as_ref(), &entry_path).unwrap_or_else(|_| [0u8; 32]);
-            let seq = db.next_journal_seq(share_row_id)?;
-            let meta = FileMeta {
-                path: rel_path.clone(),
-                size,
-                mtime,
-                hash,
-                version: seq,
-                deleted: false,
-            };
-            let change = FileChange {
-                seq,
-                share_id: share.share_id,
-                path: rel_path.clone(),
-                kind: ChangeKind::Modify,
-                meta: Some(meta.clone()),
-            };
-            let _ = db.upsert_file_meta(share_row_id, &meta);
-            db.append_journal_entry(share_row_id, &change, now, JournalOrigin::Local)?;
+        let size = entry.metadata.len;
+        let mtime = entry
+            .metadata
+            .modified
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(now);
+
+        // `(size, mtime)` is the cheap drift probe; hashing every file in every
+        // share on every startup would make the check unaffordable on the very
+        // shares that need it most. A resurrected tombstone counts as drift too.
+        let known = share.index.get(&rel_path);
+        let drifted = match known {
+            None => true,
+            Some(prev) => prev.deleted || prev.size != size || prev.mtime != mtime,
+        };
+        if !drifted {
+            continue;
+        }
+
+        let hash = compute_file_hash(fs.as_ref(), &entry.path).unwrap_or_else(|_| [0u8; 32]);
+        let seq = db.next_journal_seq(share_row_id)?;
+        let meta = FileMeta {
+            path: rel_path.clone(),
+            size,
+            mtime,
+            hash,
+            version: seq,
+            deleted: false,
+        };
+        let change = FileChange {
+            seq,
+            share_id: share.share_id,
+            path: rel_path.clone(),
+            kind: if known.is_some() {
+                ChangeKind::Modify
+            } else {
+                ChangeKind::Create
+            },
+            meta: Some(meta.clone()),
+        };
+        let _ = db.upsert_file_meta(share_row_id, &meta);
+        db.append_journal_entry(share_row_id, &change, now, JournalOrigin::Local)?;
+        if known.is_some() {
+            summary.modified += 1;
+        } else {
+            summary.added += 1;
         }
     }
-    Ok(())
+
+    // Pass 3: index entries with nothing behind them any more.
+    //
+    // Gated on the share root being a readable directory *right now*. An
+    // unmounted network drive or a disconnected external disk presents as "no
+    // files found", and journaling a Delete per index entry would replicate a
+    // mass deletion to every peer over a cable someone unplugged. A share whose
+    // root is missing is reconciled as "unknown", never as "emptied".
+    let root_ok = matches!(fs.metadata(&share.root_path), Ok(md) if md.is_dir);
+    if !root_ok {
+        warn!(
+            share = %share.share_name,
+            root = %share.root_path.display(),
+            "Share root is unreadable; skipping deletion detection this pass"
+        );
+        return Ok(summary);
+    }
+
+    // Only reachable if the walk could actually have found the file: a path
+    // excluded by ignore/allow rules, or one outside a non-recursive share's
+    // top level, was never a candidate, and calling it deleted would propagate
+    // a removal that never happened.
+    for (rel_path, prev) in &share.index {
+        if prev.deleted || seen_on_disk.contains(rel_path) {
+            continue;
+        }
+        let full_path = share.root_path.join(rel_path);
+        if is_in_workdir(workdir, &full_path) {
+            continue;
+        }
+        if !utilities::ignore::is_path_allowed(rel_path, &share.sync_allow, &share.ignore_patterns)
+        {
+            continue;
+        }
+        if !share.recursive && Path::new(rel_path).components().count() > 1 {
+            continue;
+        }
+        // Confirm against the filesystem rather than the walk: a transient
+        // read_dir failure must not be read as "the user deleted everything".
+        if fs.metadata(&full_path).is_ok() {
+            continue;
+        }
+
+        let seq = db.next_journal_seq(share_row_id)?;
+        let meta = FileMeta {
+            path: rel_path.clone(),
+            size: 0,
+            mtime: now,
+            hash: [0u8; 32],
+            version: seq,
+            deleted: true,
+        };
+        let change = FileChange {
+            seq,
+            share_id: share.share_id,
+            path: rel_path.clone(),
+            kind: ChangeKind::Delete,
+            meta: Some(meta.clone()),
+        };
+        let _ = db.upsert_file_meta(share_row_id, &meta);
+        db.append_journal_entry(share_row_id, &change, now, JournalOrigin::Local)?;
+        summary.deleted += 1;
+    }
+
+    Ok(summary)
+}
+
+/// Every file under `root`, recursing when the share asks for it.
+///
+/// Directory read failures are skipped rather than propagated: one unreadable
+/// subtree should not abort the reconciliation of an entire share.
+fn walk_share_files(fs: &dyn FileSystem, root: &Path, recursive: bool) -> Vec<DirEntry> {
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+
+    while let Some((dir, depth)) = stack.pop() {
+        if !visited.insert(dir.clone()) {
+            continue;
+        }
+        let entries = match fs.read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(path = %dir.display(), error = %e, "Rescan could not read directory");
+                continue;
+            }
+        };
+        for entry in entries {
+            if entry.metadata.is_file {
+                out.push(entry);
+            } else if entry.metadata.is_dir && recursive && depth + 1 < MAX_WALK_DEPTH {
+                stack.push((entry.path, depth + 1));
+            }
+        }
+    }
+    out
 }
 
 fn handle_rename_event(

@@ -85,6 +85,10 @@ pub enum Command {
     Peer(PeerArgs),
     /// List / add local shares on a running node (control plane)
     Share(ShareArgs),
+    /// Reconcile a share's journal against what is on disk right now
+    Rescan(RescanArgs),
+    /// Outbound queue operations (retry dead-lettered batches)
+    Queue(QueueArgs),
     /// Get / set / list / unset settings (DB overrides config.toml)
     Config(ConfigArgs),
 }
@@ -152,6 +156,36 @@ pub enum ShareCliCommand {
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct QueueArgs {
+    #[command(subcommand)]
+    pub command: QueueCliCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum QueueCliCommand {
+    /// Requeue dead-lettered batches so the outbox tries them again
+    Retry {
+        /// Requeue only this batch (default: every dead-lettered batch)
+        #[arg(long, value_name = "BATCH_ID")]
+        batch: Option<String>,
+        /// Control socket path (defaults to config / localbox.sock)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct RescanArgs {
+    /// Limit the rescan to one share (default: every local share)
+    #[arg(long, value_name = "NAME")]
+    pub share: Option<String>,
+
+    /// Control socket path (defaults to config / localbox.sock)
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -1048,6 +1082,10 @@ impl Cli {
             .clone()
             .or_else(|| file_cfg.as_ref().and_then(|c| c.control_socket.clone()))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTROL_SOCKET));
+        let outbound_max_attempts = file_cfg
+            .as_ref()
+            .and_then(|c| c.outbound_max_attempts)
+            .unwrap_or(models::DEFAULT_OUTBOUND_MAX_ATTEMPTS);
 
         let mut cfg = AppConfig {
             pc_name,
@@ -1082,6 +1120,7 @@ impl Cli {
             peer_policies,
             quarantined_peers,
             control_socket,
+            outbound_max_attempts,
         };
 
         // Resolution: defaults/file → DB saved → CLI RunArgs (already applied above).
@@ -1132,7 +1171,8 @@ fn cli_overrides_key(run: &RunArgs, key: &str) -> bool {
         | "request_handling"
         | "peer_policies"
         | "quarantined_peers"
-        | "bootstrap_peers" => false,
+        | "bootstrap_peers"
+        | "outbound_max_attempts" => false,
         _ => false,
     }
 }
@@ -1405,6 +1445,7 @@ struct FileConfig {
     #[serde(default)]
     quarantined_peers: Option<Vec<String>>,
     control_socket: Option<PathBuf>,
+    outbound_max_attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1729,6 +1770,12 @@ request_handling = "manual"
 # Local control socket for `localbox shell` / dead CLI commands
 control_socket = "{control_socket}"
 
+# Failed send attempts before an outbound batch is dead-lettered and its intent
+# marked failed. Backoff caps at 300s, so {outbound_max_attempts} attempts is roughly 25
+# minutes of trying. Set to 0 to retry forever. Inspect parked batches with
+# `localbox status queue`.
+outbound_max_attempts = {outbound_max_attempts}
+
 # Optional per-peer transfer overrides / ACLs:
 # [[peer_policies]]
 # peer = "workstation-b"
@@ -1771,7 +1818,8 @@ control_socket = "{control_socket}"
         tls_key_path = DEFAULT_TLS_KEY_PATH,
         tls_ca_cert_path = DEFAULT_TLS_CA_CERT_PATH,
         remote_share_root = DEFAULT_REMOTE_SHARE_ROOT,
-        control_socket = DEFAULT_CONTROL_SOCKET
+        control_socket = DEFAULT_CONTROL_SOCKET,
+        outbound_max_attempts = models::DEFAULT_OUTBOUND_MAX_ATTEMPTS
     )
 }
 
@@ -1922,6 +1970,7 @@ mod tests {
             peer_policies: Vec::new(),
             quarantined_peers: Vec::new(),
             control_socket: std::path::PathBuf::from("localbox.sock"),
+            outbound_max_attempts: models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
         };
         validate_app_config(&cfg).unwrap();
         std::fs::remove_dir_all(&tmp_dir).unwrap();
@@ -1970,6 +2019,7 @@ mod tests {
             peer_policies: Vec::new(),
             quarantined_peers: Vec::new(),
             control_socket: std::path::PathBuf::from("localbox.sock"),
+            outbound_max_attempts: models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
         };
         validate_app_config(&cfg).unwrap();
     }

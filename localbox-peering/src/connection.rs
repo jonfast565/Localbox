@@ -22,7 +22,7 @@ use tracing::{debug, error, info, warn};
 use utilities::disk_utilities::build_remote_share_root;
 use sha2::{Digest, Sha256};
 use std::io::Write;
-use utilities::{staging_tmp_path, DynStream, FileSystem, Net};
+use utilities::{staging_tmp_path_for_peer, DynStream, FileSystem, Net};
 
 use crate::writer::{recv_framed_message, send_framed_message, PeerWriter};
 use crate::{DbHandle, InboundFileState, PendingFiles, PeerNotify, SharedWriters};
@@ -586,6 +586,7 @@ async fn incoming_reader_loop<R>(
                 handle_file_chunk_message(
                     chunk,
                     &pending_files,
+                    peer_id,
                     Arc::clone(&fs),
                     notify.clone(),
                 )
@@ -1122,6 +1123,7 @@ async fn handle_batch_message(
         let conflict = cfg.resolve_conflict_policy(&share_name, Some(&peer_key));
         let sync_allow = cfg.resolve_sync_allow(&share_name, Some(&peer_key));
         let ignore = cfg.resolve_ignore_patterns(&share_name, Some(&peer_key));
+        let max_file_size = cfg.resolve_max_file_size_bytes(&share_name);
 
         // The basis decides how to read `change.seq` and whether any watermark
         // may move. A journal batch carries real positions in the sender's
@@ -1142,6 +1144,30 @@ async fn handle_batch_message(
             if !utilities::ignore::is_path_allowed(&change.path, &sync_allow, &ignore) {
                 max_origin_seq = max_origin_seq.max(change.seq);
                 continue;
+            }
+
+            // The share's size cap governs what this node is willing to *store*,
+            // so it has to hold on the receive path too — the sender's config has
+            // no say in it. Rejecting here rather than in `prepare_pending_file`
+            // means the oversized entry never reaches `files` either.
+            //
+            // `max_origin_seq` still advances: the entry is covered by the
+            // declared range, and withholding the credit would only pin the
+            // watermark and make the peer resend it forever.
+            if let Some(max) = max_file_size {
+                let declared = change.meta.as_ref().map(|m| m.size).unwrap_or(0);
+                if !matches!(change.kind, ChangeKind::Delete) && declared > max {
+                    warn!(
+                        peer = %peer_key,
+                        share = %share_name,
+                        path = %change.path,
+                        declared_size = declared,
+                        max_file_size_bytes = max,
+                        "Rejecting inbound file: exceeds the share's size limit"
+                    );
+                    max_origin_seq = max_origin_seq.max(change.seq);
+                    continue;
+                }
             }
 
             let existing = db
@@ -1190,13 +1216,20 @@ async fn handle_batch_message(
 
             match change.kind {
                 ChangeKind::Delete => {
-                    drop_existing_pending(pending_files, change.share_id, &wire_path, fs.as_ref())
-                        .await;
+                    drop_existing_pending(
+                        pending_files,
+                        peer_id,
+                        change.share_id,
+                        &wire_path,
+                        fs.as_ref(),
+                    )
+                    .await;
                     apply_delete_to_disk(&share_root, &disk_rel_path, fs.as_ref()).await;
                 }
                 _ => {
                     prepare_pending_file(
                         pending_files,
+                        peer_id,
                         change.share_id,
                         &wire_path,
                         &disk_rel_path,
@@ -1204,6 +1237,7 @@ async fn handle_batch_message(
                         fs.as_ref(),
                         expected_hash,
                         expected_size,
+                        max_file_size,
                     )
                     .await;
                 }
@@ -1252,8 +1286,10 @@ async fn handle_batch_message(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_pending_file(
     pending_files: &PendingFiles,
+    peer_id: i64,
     share_id: ShareId,
     wire_path: &str,
     disk_rel_path: &str,
@@ -1261,7 +1297,13 @@ async fn prepare_pending_file(
     fs: &dyn FileSystem,
     expected_hash: Option<[u8; 32]>,
     expected_size: Option<u64>,
+    max_file_size: Option<u64>,
 ) {
+    let size_limit = match (expected_size, max_file_size) {
+        (Some(declared), Some(max)) => Some(declared.min(max)),
+        (only, None) => only,
+        (None, only) => only,
+    };
     let target = share_root.join(disk_rel_path);
     if let Some(parent) = target.parent() {
         if let Err(e) = fs.create_dir_all(parent) {
@@ -1273,7 +1315,9 @@ async fn prepare_pending_file(
             return;
         }
     }
-    let staging_path = staging_tmp_path(&target);
+    // Per-peer staging file: a concurrent push of the same path from another
+    // peer must not share this handle (see `PendingFiles`).
+    let staging_path = staging_tmp_path_for_peer(&target, peer_id);
     let writer = match fs.open_write_trunc(&staging_path) {
         Ok(w) => w,
         Err(e) => {
@@ -1288,12 +1332,12 @@ async fn prepare_pending_file(
     // Keyed by wire path so FileChunk messages still match.
     {
         let mut guard = pending_files.lock().await;
-        if let Some(prev) = guard.remove(&(share_id, wire_path.to_string())) {
+        if let Some(prev) = guard.remove(&(peer_id, share_id, wire_path.to_string())) {
             drop(prev.writer);
             let _ = fs.remove_file(&prev.staging_path);
         }
         guard.insert(
-            (share_id, wire_path.to_string()),
+            (peer_id, share_id, wire_path.to_string()),
             InboundFileState {
                 target_path: target,
                 staging_path,
@@ -1302,6 +1346,7 @@ async fn prepare_pending_file(
                 expected_offset: 0,
                 expected_hash,
                 expected_size,
+                size_limit,
             },
         );
     }
@@ -1309,12 +1354,13 @@ async fn prepare_pending_file(
 
 async fn drop_existing_pending(
     pending_files: &PendingFiles,
+    peer_id: i64,
     share_id: ShareId,
     rel_path: &str,
     fs: &dyn FileSystem,
 ) {
     let mut guard = pending_files.lock().await;
-    if let Some(prev) = guard.remove(&(share_id, rel_path.to_string())) {
+    if let Some(prev) = guard.remove(&(peer_id, share_id, rel_path.to_string())) {
         drop(prev.writer);
         let _ = fs.remove_file(&prev.staging_path);
     }
@@ -1336,10 +1382,13 @@ async fn apply_delete_to_disk(share_root: &Path, rel_path: &str, fs: &dyn FileSy
 async fn handle_file_chunk_message(
     chunk: FileChunk,
     pending_files: &PendingFiles,
+    peer_id: i64,
     fs: Arc<dyn FileSystem>,
     notify: PeerNotify,
 ) {
-    let key = (chunk.share_id, chunk.path.clone());
+    // Scoped to the sending peer, so a restart from one peer can never reset
+    // another peer's in-flight receive of the same path.
+    let key = (peer_id, chunk.share_id, chunk.path.clone());
     let mut completed: Option<(PathBuf, PathBuf, [u8; 32], Option<[u8; 32]>)> = None;
     {
         let mut guard = pending_files.lock().await;
@@ -1372,6 +1421,26 @@ async fn handle_file_chunk_message(
                 }
                 state.hasher = Sha256::new();
                 state.expected_offset = 0;
+            }
+            // Stop an over-long stream at the point it goes over rather than at
+            // the eof hash check, which would already have written every byte.
+            if let Some(limit) = state.size_limit {
+                let would_reach = chunk.offset.saturating_add(chunk.data.len() as u64);
+                if would_reach > limit {
+                    warn!(
+                        share_id = ?chunk.share_id.0,
+                        path = %chunk.path,
+                        limit,
+                        would_reach,
+                        "Inbound file exceeded its declared size / share limit; discarding"
+                    );
+                    drop(state.writer.take());
+                    let staging = state.staging_path.clone();
+                    guard.remove(&key);
+                    drop(guard);
+                    let _ = fs.remove_file(&staging);
+                    return;
+                }
             }
             if let Some(w) = state.writer.as_mut() {
                 if let Err(e) = w.write_all(&chunk.data) {
@@ -1963,5 +2032,247 @@ mod conflict_tests {
             }
             other => panic!("expected KeepBoth, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod inbound_staging_tests {
+    use super::*;
+    use models::ShareId;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex as TokioMutex;
+    use utilities::VirtualFileSystem;
+
+    fn chunk(share_id: ShareId, path: &str, offset: u64, data: &[u8], eof: bool) -> FileChunk {
+        FileChunk {
+            protocol_version: models::WIRE_PROTOCOL_VERSION,
+            batch_id: "b".into(),
+            share_id,
+            path: path.into(),
+            offset,
+            data: data.to_vec(),
+            eof,
+        }
+    }
+
+    fn sha(data: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let digest = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+
+    /// Two peers pushing the same path at overlapping times must not share one
+    /// staging file. Before `peer_id` joined the key, peer B's `offset == 0`
+    /// chunk took the out-of-order branch, truncating peer A's partial download
+    /// and resetting its hasher, so both transfers ended in a hash mismatch.
+    #[tokio::test]
+    async fn concurrent_pushes_of_one_path_from_two_peers_stage_independently() {
+        let fs: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+        let pending: PendingFiles = Arc::new(TokioMutex::new(HashMap::new()));
+        let share_id = ShareId::new("s", "pc");
+        let root = Path::new("/share");
+        let notify = PeerNotify::new();
+
+        let (peer_a, peer_b) = (1i64, 2i64);
+        let body_a: &[u8] = b"aaaaaaaaAAAAAAAA";
+        let body_b: &[u8] = b"bbbbbbbb";
+
+        for (peer, body) in [(peer_a, body_a), (peer_b, body_b)] {
+            prepare_pending_file(
+                &pending,
+                peer,
+                share_id,
+                "f.txt",
+                "f.txt",
+                root,
+                fs.as_ref(),
+                Some(sha(body)),
+                Some(body.len() as u64),
+            None,
+            )
+            .await;
+        }
+
+        // Each peer got its own staging file.
+        {
+            let guard = pending.lock().await;
+            let a = &guard[&(peer_a, share_id, "f.txt".to_string())].staging_path;
+            let b = &guard[&(peer_b, share_id, "f.txt".to_string())].staging_path;
+            assert_ne!(a, b, "peers must not share a staging file");
+        }
+
+        // Peer A streams half its file.
+        handle_file_chunk_message(
+            chunk(share_id, "f.txt", 0, &body_a[..8], false),
+            &pending,
+            peer_a,
+            Arc::clone(&fs),
+            notify.clone(),
+        )
+        .await;
+
+        // Peer B now starts from offset 0 — the chunk that used to reset peer A.
+        handle_file_chunk_message(
+            chunk(share_id, "f.txt", 0, body_b, true),
+            &pending,
+            peer_b,
+            Arc::clone(&fs),
+            notify.clone(),
+        )
+        .await;
+
+        // Peer A's progress survived untouched.
+        {
+            let guard = pending.lock().await;
+            let a = &guard[&(peer_a, share_id, "f.txt".to_string())];
+            assert_eq!(a.expected_offset, 8, "peer A's offset was reset by peer B");
+        }
+
+        // Peer A finishes, and its digest still matches — proof the hasher was
+        // never fed peer B's bytes.
+        handle_file_chunk_message(
+            chunk(share_id, "f.txt", 8, &body_a[8..], true),
+            &pending,
+            peer_a,
+            Arc::clone(&fs),
+            notify.clone(),
+        )
+        .await;
+
+        assert!(
+            pending.lock().await.is_empty(),
+            "both receives should have completed and been removed"
+        );
+        assert_eq!(
+            fs.read(&root.join("f.txt")).unwrap(),
+            body_a,
+            "peer A completed last, so its content is the one on disk"
+        );
+    }
+
+    /// A chunk for a path this peer never announced must not be answered out of
+    /// another peer's pending entry.
+    #[tokio::test]
+    async fn a_chunk_from_an_unannounced_peer_is_ignored() {
+        let fs: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+        let pending: PendingFiles = Arc::new(TokioMutex::new(HashMap::new()));
+        let share_id = ShareId::new("s", "pc");
+        let body: &[u8] = b"hello";
+
+        prepare_pending_file(
+            &pending,
+            1,
+            share_id,
+            "f.txt",
+            "f.txt",
+            Path::new("/share"),
+            fs.as_ref(),
+            Some(sha(body)),
+            Some(body.len() as u64),
+            None,
+        )
+        .await;
+
+        handle_file_chunk_message(
+            chunk(share_id, "f.txt", 0, body, true),
+            &pending,
+            42,
+            Arc::clone(&fs),
+            PeerNotify::new(),
+        )
+        .await;
+
+        assert_eq!(pending.lock().await.len(), 1, "peer 1's entry must survive");
+        assert!(fs.read(Path::new("/share/f.txt")).is_err());
+    }
+
+    /// A peer that under-declares a file's size must not be able to stream past
+    /// the share's cap: the write is stopped at the byte it goes over, not left
+    /// for the eof hash check after the whole file has landed in staging.
+    #[tokio::test]
+    async fn a_stream_that_overruns_the_share_limit_is_cut_off() {
+        let fs: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+        let pending: PendingFiles = Arc::new(TokioMutex::new(HashMap::new()));
+        let share_id = ShareId::new("s", "pc");
+        let notify = PeerNotify::new();
+
+        // Manifest claims 4 bytes; the share caps at 8.
+        prepare_pending_file(
+            &pending,
+            1,
+            share_id,
+            "big.bin",
+            "big.bin",
+            Path::new("/share"),
+            fs.as_ref(),
+            None,
+            Some(4),
+            Some(8),
+        )
+        .await;
+
+        let staging = {
+            let guard = pending.lock().await;
+            guard[&(1i64, share_id, "big.bin".to_string())]
+                .staging_path
+                .clone()
+        };
+
+        // …then sends 16.
+        handle_file_chunk_message(
+            chunk(share_id, "big.bin", 0, &[0u8; 16], true),
+            &pending,
+            1,
+            Arc::clone(&fs),
+            notify,
+        )
+        .await;
+
+        assert!(
+            pending.lock().await.is_empty(),
+            "the overrunning receive must be abandoned"
+        );
+        assert!(fs.read(&staging).is_err(), "staging file must be removed");
+        assert!(
+            fs.read(Path::new("/share/big.bin")).is_err(),
+            "nothing may be finalized to the share"
+        );
+    }
+
+    /// With no declared size and no share cap there is no ceiling to apply.
+    #[tokio::test]
+    async fn an_unlimited_share_accepts_an_undeclared_size() {
+        let fs: Arc<dyn FileSystem> = Arc::new(VirtualFileSystem::new());
+        let pending: PendingFiles = Arc::new(TokioMutex::new(HashMap::new()));
+        let share_id = ShareId::new("s", "pc");
+        let body: &[u8] = b"unbounded";
+
+        prepare_pending_file(
+            &pending,
+            1,
+            share_id,
+            "f.txt",
+            "f.txt",
+            Path::new("/share"),
+            fs.as_ref(),
+            Some(sha(body)),
+            None,
+            None,
+        )
+        .await;
+
+        handle_file_chunk_message(
+            chunk(share_id, "f.txt", 0, body, true),
+            &pending,
+            1,
+            Arc::clone(&fs),
+            PeerNotify::new(),
+        )
+        .await;
+
+        assert_eq!(fs.read(Path::new("/share/f.txt")).unwrap(), body);
     }
 }

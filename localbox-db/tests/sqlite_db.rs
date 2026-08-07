@@ -51,6 +51,7 @@ fn test_config(pc_name: &str, share_name: &str) -> AppConfig {
         peer_policies: Vec::new(),
         quarantined_peers: Vec::new(),
         control_socket: std::path::PathBuf::from("localbox.sock"),
+        outbound_max_attempts: models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
     }
 }
 
@@ -238,7 +239,7 @@ fn journal_append_and_list() {
 #[test]
 fn schema_version_is_current() {
     let db = Db::open_in_memory().unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
 }
 
 #[test]
@@ -397,7 +398,7 @@ fn migrates_v4_to_v6_renames_share_journal() {
         .unwrap();
     }
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
     assert_eq!(db.journal_entry_count().unwrap(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1097,4 +1098,151 @@ fn set_peer_shares_stores_structured_ads() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn outbound_batches_are_dead_lettered_once_attempts_are_exhausted() {
+    use db::OutboundAttempt;
+    let db = Db::open_in_memory().unwrap();
+    let (_share_row_id, share_id, peer_id) = share_and_peer(&db, "pc-one", "shareA");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let manifest = BatchManifest {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
+        batch_id: "doomed".to_string(),
+        share_id,
+        from_node: "pc-one".to_string(),
+        created_at: now,
+        basis: models::BatchBasis::Snapshot,
+        journal_from_seq: 0,
+        journal_to_seq: 0,
+        changes: vec![change_at(share_id, "a.txt", 0)],
+    };
+    db.enqueue_outbound_batch(&manifest, Some(peer_id), None)
+        .unwrap();
+
+    // Two failures against a ceiling of three: still in the game.
+    for expected in 1..=2 {
+        assert_eq!(
+            db.record_outbound_failure("doomed", "peer gone", 0, 3)
+                .unwrap(),
+            OutboundAttempt::Retrying { attempts: expected }
+        );
+        assert_eq!(db.outbound_queue_depth().unwrap(), 1);
+        assert_eq!(
+            db.dequeue_due_outbound(10, now + 60).unwrap().len(),
+            1,
+            "a retrying batch must still be dequeued"
+        );
+    }
+
+    // The third exhausts it.
+    assert_eq!(
+        db.record_outbound_failure("doomed", "peer gone", 0, 3)
+            .unwrap(),
+        OutboundAttempt::DeadLettered {
+            attempts: 3,
+            intent_id: None
+        }
+    );
+
+    // Terminal: out of the queue for good, and counted separately so a healthy
+    // queue depth cannot hide it.
+    assert_eq!(db.outbound_queue_depth().unwrap(), 0);
+    assert_eq!(db.outbound_queue_due_now(now + 60).unwrap(), 0);
+    assert!(db
+        .dequeue_due_outbound(10, now + 86_400)
+        .unwrap()
+        .is_empty());
+    assert_eq!(db.outbound_dead_letter_count().unwrap(), 1);
+
+    let rows = db.list_dead_letter_batches(10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].batch_id, "doomed");
+    assert_eq!(rows[0].attempts, 3);
+    assert_eq!(rows[0].last_error.as_deref(), Some("peer gone"));
+
+    // And an operator can put it back.
+    assert_eq!(db.retry_dead_letter_batches(Some("doomed")).unwrap(), 1);
+    assert_eq!(db.outbound_dead_letter_count().unwrap(), 0);
+    assert_eq!(db.outbound_queue_depth().unwrap(), 1);
+}
+
+#[test]
+fn max_attempts_of_zero_retries_forever() {
+    use db::OutboundAttempt;
+    let db = Db::open_in_memory().unwrap();
+    let (_share_row_id, share_id, peer_id) = share_and_peer(&db, "pc-one", "shareA");
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let manifest = BatchManifest {
+        protocol_version: models::WIRE_PROTOCOL_VERSION,
+        batch_id: "eternal".to_string(),
+        share_id,
+        from_node: "pc-one".to_string(),
+        created_at: now,
+        basis: models::BatchBasis::Snapshot,
+        journal_from_seq: 0,
+        journal_to_seq: 0,
+        changes: vec![change_at(share_id, "a.txt", 0)],
+    };
+    db.enqueue_outbound_batch(&manifest, Some(peer_id), None)
+        .unwrap();
+
+    for expected in 1..=50 {
+        assert_eq!(
+            db.record_outbound_failure("eternal", "nope", 0, 0).unwrap(),
+            OutboundAttempt::Retrying { attempts: expected }
+        );
+    }
+    assert_eq!(db.outbound_dead_letter_count().unwrap(), 0);
+    assert_eq!(db.outbound_queue_depth().unwrap(), 1);
+}
+
+#[test]
+fn dead_lettering_a_batch_fails_its_intent() {
+    let db = Db::open_in_memory().unwrap();
+    let (share_row_id, share_id, peer_id) = share_and_peer(&db, "pc-one", "shareA");
+    let _ = share_row_id;
+
+    let meta = FileMeta {
+        path: "a.txt".into(),
+        size: 3,
+        mtime: 0,
+        hash: [7u8; 32],
+        version: 1,
+        deleted: false,
+    };
+    db.upsert_file_meta(share_row_id, &meta).unwrap();
+
+    let (intent_id, batch_ids) = db
+        .create_and_materialize_intent(
+            models::IntentKind::SnapshotPush,
+            models::IntentOrigin::User,
+            "shareA",
+            share_id,
+            Some(peer_id),
+            models::IntentBasis::Snapshot {
+                paths: vec!["a.txt".into()],
+            },
+            None,
+            "pc-one",
+        )
+        .unwrap();
+    assert_eq!(batch_ids.len(), 1);
+
+    for _ in 0..2 {
+        db.record_outbound_failure(&batch_ids[0], "unreachable", 0, 2)
+            .unwrap();
+    }
+
+    // The intent must not sit in the outbox claiming to still be in flight.
+    let intent = db.get_transfer_intent(&intent_id).unwrap().unwrap();
+    assert_eq!(intent.status, models::IntentStatus::Failed);
+    let err = intent.last_error.expect("a dead-letter must record why");
+    assert!(err.contains("unreachable"), "last_error was {err:?}");
+    assert!(err.contains("2 attempt"), "last_error was {err:?}");
+
+    // The parked batch no longer counts as work outstanding for the intent.
+    assert_eq!(db.count_pending_batches_for_intent(&intent_id).unwrap(), 0);
 }

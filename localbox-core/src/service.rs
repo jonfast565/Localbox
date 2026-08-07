@@ -20,8 +20,9 @@ use utilities::{FileSystem, RealFileSystem};
 use uuid::Uuid;
 
 use crate::config::{add_share_to_config, DEFAULT_CONFIG_PATH};
-use crate::engine::{seed_journal_from_index, start_single_watcher};
+use crate::engine::{rescan_share, seed_journal_from_index, start_single_watcher};
 use crate::intent_ops;
+use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -102,6 +103,17 @@ pub enum ControlRequest {
         path: String,
         #[serde(default = "default_true")]
         recursive: bool,
+    },
+    /// Reconcile a share's journal against disk, or every local share when
+    /// `share` is omitted. Journals adds, modifications and deletions that
+    /// happened while the daemon was not watching.
+    Rescan {
+        share: Option<String>,
+    },
+    /// Requeue dead-lettered outbound batches (all, or one by id) with a fresh
+    /// attempt count. For when the peer that was unreachable has come back.
+    QueueRetry {
+        batch: Option<String>,
     },
     /// List effective settings (and which keys are saved in the DB).
     ConfigList,
@@ -229,6 +241,7 @@ impl ControlService {
                 let peers = db.list_peers()?.len();
                 let shares = db.list_shares_table()?.len();
                 let queue = db.outbound_queue_depth()?;
+                let dead_lettered = db.outbound_dead_letter_count()?;
                 let pending = db.list_pending_transfer_requests()?.len();
                 let intents = db
                     .list_transfer_intents(Some(&IntentStatus::active_statuses()), 50)?
@@ -239,6 +252,7 @@ impl ControlService {
                         "peers": peers,
                         "shares": shares,
                         "queue_depth": queue,
+                        "dead_lettered": dead_lettered,
                         "pending_requests": pending,
                         "active_intents": intents,
                     }),
@@ -461,6 +475,22 @@ impl ControlService {
                     }),
                 ))
             }
+            ControlRequest::Rescan { share } => self.rescan(share.as_deref()).await,
+            ControlRequest::QueueRetry { batch } => {
+                let revived = self
+                    .db
+                    .lock()
+                    .await
+                    .retry_dead_letter_batches(batch.as_deref())?;
+                if revived > 0 {
+                    // Wake the outbox rather than wait out its 5s tick.
+                    let _ = self.net_tx.try_send(String::new());
+                }
+                Ok(ControlResponse::ok_data(
+                    format!("requeued {revived} dead-lettered batch(es)"),
+                    serde_json::json!({ "requeued": revived }),
+                ))
+            }
             ControlRequest::Logs { limit } => self.tail_logs(limit).await,
             ControlRequest::Subscribe { .. } => {
                 // Handled specially in the control server connection loop.
@@ -582,6 +612,74 @@ impl ControlService {
         }
 
         Ok(ctx)
+    }
+
+    /// Reconcile one share, or every locally-owned share, against disk.
+    ///
+    /// Reloads each share's index from the DB first: `rescan_share` decides
+    /// what drifted by comparing disk against `ShareContext::index`, so a stale
+    /// in-memory copy would report changes that were already journaled.
+    async fn rescan(&self, share: Option<&str>) -> Result<ControlResponse> {
+        let cfg = self.cfg_snapshot();
+        let fs: Arc<dyn FileSystem> = self
+            .share_hooks
+            .as_ref()
+            .map(|h| h.fs.clone())
+            .unwrap_or_else(|| Arc::new(RealFileSystem::new()));
+        let workdir = self
+            .share_hooks
+            .as_ref()
+            .and_then(|h| h.workdir.clone())
+            .or_else(|| std::env::current_dir().ok());
+
+        let mut db = self.db.lock().await;
+        let mut contexts = db.load_shares(&cfg)?;
+        if let Some(name) = share {
+            contexts.retain(|c| c.share_name == name);
+            if contexts.is_empty() {
+                bail!("no local share named '{name}'");
+            }
+        }
+
+        let mut results = Vec::new();
+        let mut total = 0usize;
+        for ctx in &contexts {
+            let summary = rescan_share(&mut db, ctx, &fs, workdir.as_deref())?;
+            total += summary.total();
+            if !summary.is_empty() {
+                info!(
+                    share = %ctx.share_name,
+                    added = summary.added,
+                    modified = summary.modified,
+                    deleted = summary.deleted,
+                    seeded = summary.seeded,
+                    "Rescan journaled offline drift"
+                );
+            }
+            results.push(serde_json::json!({
+                "share_name": ctx.share_name,
+                "root_path": ctx.root_path,
+                "seeded": summary.seeded,
+                "added": summary.added,
+                "modified": summary.modified,
+                "deleted": summary.deleted,
+            }));
+        }
+
+        // Nudge the outbox so anything journaled here goes out now rather than
+        // waiting for the next tick.
+        if total > 0 {
+            let _ = self.net_tx.try_send(String::new());
+        }
+
+        Ok(ControlResponse::ok_data(
+            format!(
+                "rescanned {} share(s); {} change(s) journaled",
+                results.len(),
+                total
+            ),
+            serde_json::json!({ "shares": results, "changes": total }),
+        ))
     }
 
     async fn enqueue_push(

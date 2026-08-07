@@ -166,7 +166,7 @@ pub fn write_atomic(fs: &dyn FileSystem, path: &Path, data: &[u8]) -> io::Result
     Ok(())
 }
 
-fn unique_tmp_name(base: &OsStr) -> PathBuf {
+fn unique_tmp_name(base: &OsStr, scope: Option<i64>) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -176,17 +176,35 @@ fn unique_tmp_name(base: &OsStr) -> PathBuf {
     if stem.is_empty() {
         stem = "file".to_string();
     }
-    PathBuf::from(format!(".{}.tmp-{}-{}", stem, pid, nonce))
+    match scope {
+        Some(scope) => PathBuf::from(format!(".{}.tmp-{}-p{}-{}", stem, pid, scope, nonce)),
+        None => PathBuf::from(format!(".{}.tmp-{}-{}", stem, pid, nonce)),
+    }
 }
 
 /// Staging path next to `target` for streaming inbound receives.
 pub fn staging_tmp_path(target: &Path) -> PathBuf {
+    staging_tmp_path_inner(target, None)
+}
+
+/// Staging path for an inbound receive from a specific peer.
+///
+/// Two peers pushing the same path concurrently each get their own staging
+/// file, so neither can truncate the other's partial download out from under
+/// it. The `p<peer_id>` segment also makes an abandoned staging file traceable
+/// back to the sender that left it behind.
+pub fn staging_tmp_path_for_peer(target: &Path, peer_id: i64) -> PathBuf {
+    staging_tmp_path_inner(target, Some(peer_id))
+}
+
+fn staging_tmp_path_inner(target: &Path, peer_id: Option<i64>) -> PathBuf {
     let parent = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     parent.join(unique_tmp_name(
         target.file_name().unwrap_or_else(|| OsStr::new("file")),
+        peer_id,
     ))
 }
 
@@ -215,6 +233,7 @@ pub fn write_file_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
         .unwrap_or_else(|| Path::new("."));
     let tmp = parent.join(unique_tmp_name(
         path.file_name().unwrap_or_else(|| OsStr::new("file")),
+        None,
     ));
     let mut file = OpenOptions::new()
         .create(true)
@@ -244,6 +263,7 @@ pub fn write_secret_file_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
         .unwrap_or_else(|| Path::new("."));
     let tmp = parent.join(unique_tmp_name(
         path.file_name().unwrap_or_else(|| OsStr::new("file")),
+        None,
     ));
 
     let mut opts = OpenOptions::new();
@@ -294,6 +314,7 @@ pub fn copy_file_atomic(src: &Path, dst: &Path, overwrite: bool) -> io::Result<(
         .unwrap_or_else(|| Path::new("."));
     let tmp = parent.join(unique_tmp_name(
         dst.file_name().unwrap_or_else(|| OsStr::new("file")),
+        None,
     ));
     {
         let mut reader = File::open(src)?;

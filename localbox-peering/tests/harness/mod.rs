@@ -401,6 +401,7 @@ fn test_config(
         peer_policies: Vec::new(),
         quarantined_peers: Vec::new(),
         control_socket: PathBuf::from("localbox.sock"),
+        outbound_max_attempts: models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
     }
 }
 

@@ -42,6 +42,7 @@ pub use chat::{
 pub use config::{
     peer_dht_infohash, peer_dht_mutable_seed, peer_keys_match, AppConfig, ApplicationState,
     BootstrapPeer, ConflictPolicy, PeerPolicy, ShareConfig, TransferMode,
+    DEFAULT_OUTBOUND_MAX_ATTEMPTS,
 };
 pub use events::ControlEvent;
 pub use intent::{

@@ -437,6 +437,7 @@ mod tests {
             peer_policies: Vec::new(),
             quarantined_peers: Vec::new(),
             control_socket: root.join(format!("{node}.sock")),
+            outbound_max_attempts: models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
         };
 
         let materials =

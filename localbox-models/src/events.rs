@@ -25,6 +25,19 @@ pub enum ControlEvent {
         from_peer: String,
         change_count: usize,
     },
+    /// An outbound batch exhausted `outbound_max_attempts` and will never be
+    /// retried. Terminal, and the only notice an operator gets that data did
+    /// not reach a peer.
+    BatchDeadLettered {
+        batch_id: String,
+        #[serde(default)]
+        peer_id: Option<i64>,
+        #[serde(default)]
+        intent_id: Option<String>,
+        attempts: i64,
+        #[serde(default)]
+        last_error: String,
+    },
 }
 
 impl ControlEvent {
@@ -33,6 +46,7 @@ impl ControlEvent {
             ControlEvent::ChatReceived { .. } => "New chat message",
             ControlEvent::TransferRequestPending { .. } => "Transfer request",
             ControlEvent::BatchReceived { .. } => "Files received",
+            ControlEvent::BatchDeadLettered { .. } => "Transfer gave up",
         }
     }
 
@@ -72,6 +86,19 @@ impl ControlEvent {
                 };
                 format!("{change_count} change(s) in {share} from {from_peer}")
             }
+            ControlEvent::BatchDeadLettered {
+                batch_id,
+                attempts,
+                last_error,
+                ..
+            } => {
+                let reason = if last_error.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {last_error}")
+                };
+                format!("Batch {batch_id} failed {attempts} time(s) and was dropped{reason}")
+            }
         }
     }
 
@@ -82,6 +109,7 @@ impl ControlEvent {
                 format!("xfer:{request_id}")
             }
             ControlEvent::BatchReceived { batch_id, .. } => format!("batch:{batch_id}"),
+            ControlEvent::BatchDeadLettered { batch_id, .. } => format!("deadletter:{batch_id}"),
         }
     }
 }

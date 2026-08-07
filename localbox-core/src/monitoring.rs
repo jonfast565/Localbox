@@ -9,6 +9,9 @@ use std::time::{Duration, SystemTime};
 pub struct MetricsSnapshot {
     pub queue_depth: u64,
     pub queue_due_now: u64,
+    /// Batches that exhausted `outbound_max_attempts`. Non-zero means data did
+    /// not reach a peer and nothing will retry it on its own.
+    pub queue_dead_lettered: u64,
     pub journal_entries: u64,
     pub peers: Vec<PeerSnapshot>,
     pub timestamp: i64,
@@ -46,10 +49,11 @@ pub fn run_monitor(cfg: &AppConfig, opts: &MonitorOptions) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         } else {
             println!(
-                "[{}] queue_depth={} due_now={} peers={} share_journal={}",
+                "[{}] queue_depth={} due_now={} dead_lettered={} peers={} share_journal={}",
                 snapshot.timestamp,
                 snapshot.queue_depth,
                 snapshot.queue_due_now,
+                snapshot.queue_dead_lettered,
                 snapshot.peers.len(),
                 snapshot.journal_entries
             );
@@ -75,6 +79,7 @@ fn collect_metrics(db: &Db) -> Result<MetricsSnapshot> {
     let now = current_ts();
     let queue_depth = db.outbound_queue_depth()? as u64;
     let queue_due_now = db.outbound_queue_due_now(now)? as u64;
+    let queue_dead_lettered = db.outbound_dead_letter_count()? as u64;
     let journal_entries = db.journal_entry_count()? as u64;
     let peers = db
         .list_peers()?
@@ -92,6 +97,7 @@ fn collect_metrics(db: &Db) -> Result<MetricsSnapshot> {
     Ok(MetricsSnapshot {
         queue_depth,
         queue_due_now,
+        queue_dead_lettered,
         journal_entries,
         peers,
         timestamp: now,
@@ -110,6 +116,14 @@ fn evaluate_alerts(snapshot: &MetricsSnapshot, opts: &MonitorOptions) -> Vec<Str
         alerts.push(format!(
             "outbound batches due now {} exceeds threshold {}",
             snapshot.queue_due_now, opts.queue_threshold
+        ));
+    }
+    // Always an alert, with no threshold to tune: a dead-lettered batch is a
+    // transfer that silently did not happen.
+    if snapshot.queue_dead_lettered > 0 {
+        alerts.push(format!(
+            "{} outbound batch(es) dead-lettered after exhausting their attempts",
+            snapshot.queue_dead_lettered
         ));
     }
     let stale: Vec<_> = snapshot

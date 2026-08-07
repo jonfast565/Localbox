@@ -109,6 +109,13 @@ pub struct AppConfig {
     /// Unix domain socket for control plane (CLI/GUI).
     #[serde(default = "default_control_socket")]
     pub control_socket: PathBuf,
+    /// Failed send attempts before an outbound batch is dead-lettered.
+    ///
+    /// `0` disables the ceiling and restores the old retry-forever behaviour.
+    /// Backoff caps at 300s, so the default of 10 gives a peer roughly 25
+    /// minutes to come back before its batches are parked.
+    #[serde(default = "default_outbound_max_attempts")]
+    pub outbound_max_attempts: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +318,19 @@ impl AppConfig {
             .unwrap_or(ConflictPolicy::LastWriteWins)
     }
 
+    /// Largest file this share will accept, in bytes. `None` = no limit.
+    ///
+    /// Applies to inbound receives as well as local indexing: without it a peer
+    /// could push a file of any size into a share whose config caps it. There is
+    /// deliberately no per-peer override — the cap is a property of the share's
+    /// storage, not of who is writing to it.
+    pub fn resolve_max_file_size_bytes(&self, share_name: &str) -> Option<u64> {
+        self.shares
+            .iter()
+            .find(|s| s.name == share_name)
+            .and_then(|s| s.max_file_size_bytes)
+    }
+
     /// Resolved sync_allow (peer override wins). Empty = no allowlist restriction.
     pub fn resolve_sync_allow(&self, share_name: &str, peer_key: Option<&str>) -> Vec<String> {
         if let Some(peer) = peer_key {
@@ -496,6 +516,12 @@ impl Default for ApplicationState {
 
 fn default_use_tls_for_peers() -> bool {
     true
+}
+
+pub const DEFAULT_OUTBOUND_MAX_ATTEMPTS: u32 = 10;
+
+fn default_outbound_max_attempts() -> u32 {
+    DEFAULT_OUTBOUND_MAX_ATTEMPTS
 }
 
 fn default_dht_port() -> u16 {

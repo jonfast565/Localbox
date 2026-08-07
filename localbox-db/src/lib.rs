@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-const DB_SCHEMA_VERSION: i32 = 11;
+const DB_SCHEMA_VERSION: i32 = 12;
 
 pub struct Db {
     conn: Connection,
@@ -124,6 +124,14 @@ impl Db {
     }
 
     fn init_schema(&self) -> Result<()> {
+        // Explicitly off for the duration of schema setup and migrations. The
+        // v12 orphan sweep exists precisely to repair a DB that predates
+        // enforcement, and it cannot do that while enforcement is live.
+        //
+        // Not redundant: the default is a *compile-time* property of the SQLite
+        // build (the bundled libsqlite3-sys sets SQLITE_DEFAULT_FOREIGN_KEYS=1,
+        // a plain system SQLite does not), so neither state may be assumed.
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
         self.conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS peers (
@@ -311,6 +319,9 @@ impl Db {
         "#,
         )?;
         self.apply_schema_migrations()?;
+        // Deliberately last: every `ON DELETE CASCADE` declared above is inert
+        // until this runs.
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         Ok(())
     }
 
@@ -609,10 +620,63 @@ impl Db {
             }
         }
 
+        if current < 12 {
+            // `PRAGMA foreign_keys = ON` (set at open, below) starts *rejecting*
+            // writes that touch an inconsistent row, so every orphan a
+            // foreign-key-less past left behind has to go first. Runs with the
+            // pragma still off, which is what makes the sweep possible at all.
+            self.delete_orphan_rows()?;
+        }
+
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {DB_SCHEMA_VERSION};"))?;
 
         Ok(())
+    }
+
+    /// One-off sweep of rows whose declared parent no longer exists.
+    ///
+    /// NOT NULL references (`peer_shares.peer_id`, `files.share_id`, …) have no
+    /// valid repair other than removal. Nullable ones are the
+    /// `ON DELETE SET NULL` relationships, so blanking the column is exactly the
+    /// state the cascade would have produced had it ever been enforced.
+    fn delete_orphan_rows(&self) -> Result<usize> {
+        let mut removed = 0usize;
+        for sql in [
+            "DELETE FROM peer_shares    WHERE peer_id   NOT IN (SELECT id FROM peers)",
+            "DELETE FROM files          WHERE share_id  NOT IN (SELECT id FROM shares)",
+            "DELETE FROM share_journal  WHERE share_id  NOT IN (SELECT id FROM shares)",
+            "DELETE FROM peer_progress  WHERE peer_id   NOT IN (SELECT id FROM peers)",
+            "DELETE FROM peer_progress  WHERE share_id  NOT IN (SELECT id FROM shares)",
+            "DELETE FROM share_progress WHERE share_id  NOT IN (SELECT id FROM shares)",
+            "DELETE FROM chat_messages  WHERE thread_id NOT IN (SELECT id FROM chat_threads)",
+            "DELETE FROM batches        WHERE peer_id   NOT IN (SELECT id FROM peers)",
+            "DELETE FROM batches        WHERE share_id  NOT IN (SELECT id FROM shares)",
+            // Nullable references: blank rather than delete.
+            "UPDATE share_journal    SET origin_peer_id = NULL
+               WHERE origin_peer_id IS NOT NULL
+                 AND origin_peer_id NOT IN (SELECT id FROM peers)",
+            "UPDATE transfer_intents SET peer_id = NULL
+               WHERE peer_id IS NOT NULL AND peer_id NOT IN (SELECT id FROM peers)",
+            "UPDATE transfer_requests SET peer_id = NULL
+               WHERE peer_id IS NOT NULL AND peer_id NOT IN (SELECT id FROM peers)",
+            "UPDATE outbound_queue   SET peer_id = NULL
+               WHERE peer_id IS NOT NULL AND peer_id NOT IN (SELECT id FROM peers)",
+            "UPDATE outbound_queue   SET intent_id = NULL
+               WHERE intent_id IS NOT NULL
+                 AND intent_id NOT IN (SELECT id FROM transfer_intents)",
+        ] {
+            removed += self.conn.execute(sql, [])?;
+        }
+        Ok(removed)
+    }
+
+    /// Whether `PRAGMA foreign_keys` is on for this connection.
+    pub fn foreign_keys_enabled(&self) -> Result<bool> {
+        let on: i64 = self
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        Ok(on != 0)
     }
 
     fn has_column(&self, table: &str, column: &str) -> Result<bool> {
@@ -734,7 +798,8 @@ impl Db {
         Ok(id)
     }
 
-    fn load_file_index(&self, share_row_id: i64) -> Result<HashMap<String, FileMeta>> {
+    /// A share's current file index, keyed by relative path.
+    pub fn load_file_index(&self, share_row_id: i64) -> Result<HashMap<String, FileMeta>> {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT rel_path, size, mtime, hash, version, deleted
@@ -1257,7 +1322,7 @@ impl Db {
             r#"
             SELECT batch_uuid, payload, attempts, peer_id, intent_id
             FROM outbound_queue
-            WHERE status != 'sent' AND next_attempt_at <= ?1
+            WHERE status NOT IN ('sent', 'failed') AND next_attempt_at <= ?1
             ORDER BY created_at ASC
             LIMIT ?2
             "#,
@@ -1313,6 +1378,112 @@ impl Db {
             params![batch_id, err, next_attempt],
         )?;
         Ok(())
+    }
+
+    /// Record one failed send and decide whether the batch still has a future.
+    ///
+    /// `max_attempts` of 0 means "retry forever", which is the pre-existing
+    /// behaviour: `attempts` was incremented on every failure but never read,
+    /// so a batch for a decommissioned peer — or one failing deterministically,
+    /// like a missing share or a permanently unreadable file — was retried at
+    /// the 300s backoff ceiling for the life of the database.
+    pub fn record_outbound_failure(
+        &self,
+        batch_id: &str,
+        err: &str,
+        backoff_secs: i64,
+        max_attempts: u32,
+    ) -> Result<OutboundAttempt> {
+        self.mark_outbound_failed(batch_id, err, backoff_secs)?;
+
+        let (attempts, intent_id) = self.conn.query_row(
+            "SELECT attempts, intent_id FROM outbound_queue WHERE batch_uuid = ?1",
+            params![batch_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+
+        if max_attempts == 0 || attempts < i64::from(max_attempts) {
+            return Ok(OutboundAttempt::Retrying { attempts });
+        }
+
+        // Terminal. `next_attempt_at = 0` is cosmetic — `dequeue_due_outbound`
+        // filters on the status — but keeps the row from reading as "due".
+        self.conn.execute(
+            "UPDATE outbound_queue SET status = 'failed', next_attempt_at = 0 WHERE batch_uuid = ?1",
+            params![batch_id],
+        )?;
+
+        // The owning intent has to follow the batch into a terminal state,
+        // otherwise it sits in the outbox as permanently in-flight.
+        if let Some(id) = intent_id.as_deref() {
+            self.update_transfer_intent_status(
+                id,
+                IntentStatus::Failed,
+                Some(&format!(
+                    "batch {batch_id} gave up after {attempts} attempt(s): {err}"
+                )),
+            )?;
+        }
+
+        Ok(OutboundAttempt::DeadLettered {
+            attempts,
+            intent_id,
+        })
+    }
+
+    /// Outbound batches that exhausted their attempts and will never be retried.
+    pub fn outbound_dead_letter_count(&self) -> Result<i64> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM outbound_queue WHERE status = 'failed'")?;
+        stmt.query_row([], |row| row.get(0))
+    }
+
+    /// Dead-lettered batches, newest first, for `localbox status queue`.
+    pub fn list_dead_letter_batches(&self, limit: usize) -> Result<Vec<DeadLetterRow>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT batch_uuid, peer_id, intent_id, attempts, last_error, created_at
+            FROM outbound_queue
+            WHERE status = 'failed'
+            ORDER BY created_at DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit.max(1) as i64], |row| {
+            Ok(DeadLetterRow {
+                batch_id: row.get(0)?,
+                peer_id: row.get(1)?,
+                intent_id: row.get(2)?,
+                attempts: row.get(3)?,
+                last_error: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Put dead-lettered batches back in the queue with a clean attempt count.
+    /// Returns how many rows were revived.
+    pub fn retry_dead_letter_batches(&self, batch_id: Option<&str>) -> Result<usize> {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let n = match batch_id {
+            Some(id) => self.conn.execute(
+                "UPDATE outbound_queue SET status = 'pending', attempts = 0, next_attempt_at = ?2
+                 WHERE status = 'failed' AND batch_uuid = ?1",
+                params![id, now],
+            )?,
+            None => self.conn.execute(
+                "UPDATE outbound_queue SET status = 'pending', attempts = 0, next_attempt_at = ?1
+                 WHERE status = 'failed'",
+                params![now],
+            )?,
+        };
+        Ok(n)
     }
 
     /* Inbound tracking */
@@ -1818,16 +1989,17 @@ impl Db {
     }
 
     pub fn outbound_queue_depth(&self) -> Result<i64> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT COUNT(*) FROM outbound_queue WHERE status != 'sent'")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT COUNT(*) FROM outbound_queue WHERE status NOT IN ('sent', 'failed')",
+        )?;
         let n: i64 = stmt.query_row([], |row| row.get(0))?;
         Ok(n)
     }
 
     pub fn outbound_queue_due_now(&self, now_ts: i64) -> Result<i64> {
         let mut stmt = self.conn.prepare(
-            "SELECT COUNT(*) FROM outbound_queue WHERE status != 'sent' AND next_attempt_at <= ?1",
+            "SELECT COUNT(*) FROM outbound_queue
+             WHERE status NOT IN ('sent', 'failed') AND next_attempt_at <= ?1",
         )?;
         let n: i64 = stmt.query_row(params![now_ts], |row| row.get(0))?;
         Ok(n)
@@ -2020,7 +2192,8 @@ impl Db {
 
     /// Delete a conversation and its messages. Returns `true` if the thread was removed.
     pub fn delete_chat_thread(&self, thread_id: &str) -> Result<bool> {
-        // Explicit message delete: SQLite foreign keys are off unless PRAGMA is set.
+        // Redundant since v12 turned the `ON DELETE CASCADE` on, but kept so the
+        // sweep does not depend on the pragma having been applied.
         self.conn.execute(
             "DELETE FROM chat_messages WHERE thread_id = ?1",
             params![thread_id],
@@ -2350,10 +2523,15 @@ impl Db {
         }
     }
 
-    /// Pending (not yet sent) outbound batches for an intent.
+    /// Outbound batches for an intent that are still trying to go out.
+    ///
+    /// Dead-lettered rows are excluded deliberately: they will never be
+    /// dequeued again, so counting them would pin the intent at `InFlight`
+    /// forever even once every other batch had landed.
     pub fn count_pending_batches_for_intent(&self, intent_id: &str) -> Result<i64> {
         let mut stmt = self.conn.prepare(
-            "SELECT COUNT(*) FROM outbound_queue WHERE intent_id = ?1 AND status != 'sent'",
+            "SELECT COUNT(*) FROM outbound_queue
+             WHERE intent_id = ?1 AND status NOT IN ('sent', 'failed')",
         )?;
         stmt.query_row(params![intent_id], |row| row.get(0))
     }
@@ -2780,4 +2958,28 @@ pub struct OutboundQueueItem {
     pub attempts: i64,
     pub peer_id: Option<i64>,
     pub intent_id: Option<String>,
+}
+
+/// What became of an outbound batch after a failed send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutboundAttempt {
+    /// Requeued behind the backoff; will be tried again.
+    Retrying { attempts: i64 },
+    /// Attempts exhausted. The row is parked at `status = 'failed'` and the
+    /// owning intent (if any) has been marked `Failed`.
+    DeadLettered {
+        attempts: i64,
+        intent_id: Option<String>,
+    },
+}
+
+/// One dead-lettered outbound batch, for operator-facing listings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadLetterRow {
+    pub batch_id: String,
+    pub peer_id: Option<i64>,
+    pub intent_id: Option<String>,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub created_at: i64,
 }

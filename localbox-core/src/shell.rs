@@ -228,6 +228,8 @@ fn print_help() {
          \x20 status | peers | shares | pending | intents [--all] [--limit N]\n\
          \x20 logs [--limit N]  — tail the engine log file\n\
          \x20 share list | share add --name NAME --path DIR [--recursive true|false]\n\
+         \x20 rescan [--share NAME]  — journal changes made while not watching\n\
+         \x20 queue retry [--batch ID]  — requeue dead-lettered batches\n\
          \x20 config list | config get KEY | config set KEY VALUE | config unset KEY\n\
          \x20 intent show --id ID\n\
          \x20 push --share NAME [--peer KEY] [--path REL]\n\
@@ -262,6 +264,22 @@ pub fn parse_repl_to_request(line: &str) -> Result<ControlRequest> {
         "shutdown" | "stop" => Ok(ControlRequest::Shutdown),
         "peers" => Ok(ControlRequest::Status), // status includes peer count; use Pending for lists via inbox-like
         "shares" => Ok(ControlRequest::ShareList),
+        "queue" => {
+            let sub = parts.get(1).map(|s| s.as_str()).unwrap_or("");
+            if sub != "retry" {
+                return Err(anyhow!("usage: queue retry [--batch ID]"));
+            }
+            let args = parse_flags(&parts[2..])?;
+            Ok(ControlRequest::QueueRetry {
+                batch: args.get("batch").cloned(),
+            })
+        }
+        "rescan" => {
+            let args = parse_flags(&parts[1..])?;
+            Ok(ControlRequest::Rescan {
+                share: args.get("share").cloned(),
+            })
+        }
         "share" => {
             let sub = parts
                 .get(1)

@@ -2,8 +2,8 @@ use clap::Parser;
 use comfy_table::{presets::ASCII_FULL_CONDENSED, Table};
 use localbox_core::config::{
     init_config_template, set_quarantined_peer_in_config, validate_app_config, BootstrapCommand,
-    ChatCommand, Cli, Command, ConfigCliCommand, PeerCliCommand, ShareCliCommand, StatusSection,
-    DEFAULT_CONFIG_PATH,
+    ChatCommand, Cli, Command, ConfigCliCommand, PeerCliCommand, QueueCliCommand, ShareCliCommand,
+    StatusSection, DEFAULT_CONFIG_PATH,
 };
 use localbox_core::control::send_control_request;
 use localbox_core::integrity;
@@ -202,6 +202,8 @@ async fn main() -> anyhow::Result<()> {
             let progress_count = progress.len();
             let queue_depth = db.outbound_queue_depth()?;
             let queue_due = db.outbound_queue_due_now(now)?;
+            let queue_dead = db.outbound_dead_letter_count()?;
+            let dead_rows = db.list_dead_letter_batches(20)?;
             let journal_entries = db.journal_entry_count()?;
             let db_filename = cfg
                 .db_path
@@ -282,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
                                 "metrics": {
                                     "outbound_queue_depth": queue_depth,
                                     "outbound_queue_due_now": queue_due,
+                                    "outbound_dead_lettered": queue_dead,
                                     "journal_entries": journal_entries,
                                 },
                                 "peers": peers_json(),
@@ -303,6 +306,18 @@ async fn main() -> anyhow::Result<()> {
                                 "queue": {
                                     "outbound_queue_depth": queue_depth,
                                     "outbound_queue_due_now": queue_due,
+                                    "outbound_dead_lettered": queue_dead,
+                                    "dead_letters": dead_rows
+                                        .iter()
+                                        .map(|r| json!({
+                                            "batch_id": r.batch_id,
+                                            "peer_id": r.peer_id,
+                                            "intent_id": r.intent_id,
+                                            "attempts": r.attempts,
+                                            "last_error": r.last_error,
+                                            "created_at": r.created_at,
+                                        }))
+                                        .collect::<Vec<_>>(),
                                 },
                             }))?
                         );
@@ -386,9 +401,41 @@ async fn main() -> anyhow::Result<()> {
                         println!("Queue status:");
                         let mut queue_table = Table::new();
                         queue_table.load_preset(ASCII_FULL_CONDENSED);
-                        queue_table.set_header(vec!["depth", "due_now"]);
-                        queue_table.add_row(vec![queue_depth.to_string(), queue_due.to_string()]);
+                        queue_table.set_header(vec!["depth", "due_now", "dead_lettered"]);
+                        queue_table.add_row(vec![
+                            queue_depth.to_string(),
+                            queue_due.to_string(),
+                            queue_dead.to_string(),
+                        ]);
                         println!("{queue_table}");
+
+                        if !dead_rows.is_empty() {
+                            println!(
+                                "\nDead-lettered batches ({queue_dead}) \
+                                 -- these will not be retried:"
+                            );
+                            let mut dead_table = Table::new();
+                            dead_table.load_preset(ASCII_FULL_CONDENSED);
+                            dead_table.set_header(vec![
+                                "batch_id",
+                                "peer_id",
+                                "intent_id",
+                                "attempts",
+                                "last_error",
+                            ]);
+                            for r in &dead_rows {
+                                dead_table.add_row(vec![
+                                    r.batch_id.clone(),
+                                    r.peer_id
+                                        .map(|p| p.to_string())
+                                        .unwrap_or_else(|| "-".into()),
+                                    r.intent_id.clone().unwrap_or_else(|| "-".into()),
+                                    r.attempts.to_string(),
+                                    r.last_error.clone().unwrap_or_else(|| "-".into()),
+                                ]);
+                            }
+                            println!("{dead_table}");
+                        }
                     }
                     StatusSection::Metrics => {
                         println!("Metrics status:");
@@ -522,6 +569,40 @@ async fn main() -> anyhow::Result<()> {
                         name: name.clone(),
                         path: path.display().to_string(),
                         recursive: *recursive,
+                    },
+                )
+                .await?;
+                print_control_resp(&resp);
+                if resp.ok {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(resp.message))
+                }
+            }
+        },
+        Command::Rescan(args) => {
+            let sock = resolve_control_socket(&cli, args.socket.clone())?;
+            let resp = send_control_request(
+                &sock,
+                &ControlRequest::Rescan {
+                    share: args.share.clone(),
+                },
+            )
+            .await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
+            }
+        }
+        Command::Queue(args) => match &args.command {
+            QueueCliCommand::Retry { batch, socket } => {
+                let sock = resolve_control_socket(&cli, socket.clone())?;
+                let resp = send_control_request(
+                    &sock,
+                    &ControlRequest::QueueRetry {
+                        batch: batch.clone(),
                     },
                 )
                 .await?;

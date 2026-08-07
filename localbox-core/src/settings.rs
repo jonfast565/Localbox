@@ -39,13 +39,18 @@ pub const SETTABLE_KEYS: &[&str] = &[
     "quarantined_peers",
     "bootstrap_peers",
     "control_socket",
+    "outbound_max_attempts",
 ];
 
-/// Keys that bind sockets / change identity; take effect after restart.
+/// Keys that bind sockets, change identity, or are snapshotted by a long-lived
+/// worker; they take effect after restart.
 pub fn requires_restart(key: &str) -> bool {
     matches!(
         key,
-        "pc_name"
+        // The outbox worker reads its attempt ceiling once when it spawns, so a
+        // live `config set` is persisted but not honoured until the next start.
+        "outbound_max_attempts"
+            | "pc_name"
             | "instance_id"
             | "listen_port"
             | "plain_listen_port"
@@ -155,6 +160,10 @@ pub fn apply_setting(cfg: &mut AppConfig, key: &str, value: &Value) -> Result<()
                 .map_err(|e| anyhow!("{key}: {e}"))?;
         }
         "control_socket" => cfg.control_socket = PathBuf::from(json_string(value, key)?),
+        "outbound_max_attempts" => {
+            cfg.outbound_max_attempts = u32::try_from(json_u64(value, key)?)
+                .map_err(|_| anyhow!("{key}: must fit in a u32"))?;
+        }
         _ => bail!("unhandled setting key '{key}'"),
     }
     Ok(())
@@ -193,6 +202,7 @@ pub fn read_setting(cfg: &AppConfig, key: &str) -> Result<Value> {
         "quarantined_peers" => serde_json::to_value(&cfg.quarantined_peers)?,
         "bootstrap_peers" => serde_json::to_value(&cfg.bootstrap_peers)?,
         "control_socket" => Value::String(cfg.control_socket.display().to_string()),
+        "outbound_max_attempts" => Value::from(cfg.outbound_max_attempts),
         _ => bail!("unhandled setting key '{key}'"),
     };
     Ok(v)
@@ -389,6 +399,7 @@ mod tests {
             peer_policies: Vec::new(),
             quarantined_peers: Vec::new(),
             control_socket: PathBuf::from("localbox.sock"),
+            outbound_max_attempts: models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
         }
     }
 

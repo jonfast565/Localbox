@@ -90,6 +90,7 @@ fn discovery_fanout_ports_dedupes_and_includes_listen() {
         peer_policies: Vec::new(),
         quarantined_peers: Vec::new(),
         control_socket: PathBuf::from("localbox.sock"),
+        outbound_max_attempts: localbox_models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
     };
     assert_eq!(cfg.discovery_fanout_ports(), vec![5001, 6001]);
     cfg.discovery_send_ports.clear();
@@ -128,6 +129,7 @@ fn dht_and_utp_toggles_default_to_lan_only() {
         peer_policies: Vec::new(),
         quarantined_peers: Vec::new(),
         control_socket: PathBuf::from("localbox.sock"),
+        outbound_max_attempts: localbox_models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
     };
     assert!(!cfg.dht_enabled());
     assert!(!cfg.utp_enabled());
@@ -184,6 +186,7 @@ fn app_config_json_round_trip() {
         peer_policies: Vec::new(),
         quarantined_peers: Vec::new(),
         control_socket: std::path::PathBuf::from("localbox.sock"),
+        outbound_max_attempts: localbox_models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
     };
     let bytes = serde_json::to_vec(&cfg).unwrap();
     let decoded: AppConfig = serde_json::from_slice(&bytes).unwrap();

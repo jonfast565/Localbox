@@ -59,6 +59,7 @@ fn pinning_blocks_auto_generation() {
         peer_policies: Vec::new(),
         quarantined_peers: Vec::new(),
         control_socket: std::path::PathBuf::from("localbox.sock"),
+        outbound_max_attempts: models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
     };
 
     let res = tls::TlsComponents::from_config(&cfg, fs.as_ref());
@@ -136,6 +137,7 @@ fn pinning_allows_matching_ca() {
         peer_policies: Vec::new(),
         quarantined_peers: Vec::new(),
         control_socket: std::path::PathBuf::from("localbox.sock"),
+        outbound_max_attempts: models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
     };
 
     tls::TlsComponents::from_config(&cfg, fs.as_ref()).unwrap();

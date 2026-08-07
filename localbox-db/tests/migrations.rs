@@ -29,7 +29,7 @@ fn db_sets_user_version_and_is_backward_openable() {
     }
 
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
     // Should have created the full schema.
     assert!(db.list_shares_table().unwrap().is_empty());
 
@@ -66,7 +66,7 @@ fn db_migrates_http_port_column_to_plain_port() {
     }
 
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
     drop(db);
 
     let conn = Connection::open(&path).unwrap();
@@ -144,7 +144,7 @@ fn db_migrates_v4_to_current_adds_intents_and_share_journal() {
     }
 
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
     drop(db);
 
     let conn = Connection::open(&path).unwrap();
@@ -250,6 +250,14 @@ fn db_migrates_v6_to_v7_separates_seq_namespaces() {
                 updated_at INTEGER NOT NULL
             );
 
+            -- Parent for the journal/progress rows below; without it the v12
+            -- orphan sweep would (correctly) discard them.
+            INSERT INTO shares (share_name, pc_name, share_id, root_path, recursive)
+            VALUES ('s', 'pc-old', X'00', '/tmp/s', 1);
+            INSERT INTO peers (pc_name, instance_id, last_ip, last_port, last_tls_port,
+                               last_plain_port, last_seen, state, prefer_tls, last_insecure_seen)
+            VALUES ('pc-old', 'inst', '127.0.0.1', 4000, 8443, 8080, 0, 'known', 1, 0);
+
             INSERT INTO share_journal
               (share_id, seq, path, kind, size, mtime, hash, version, deleted, created_at)
             VALUES (1, 4, 'legacy.txt', 'Modify', 1, 0, X'00', 4, 0, 0);
@@ -265,7 +273,7 @@ fn db_migrates_v6_to_v7_separates_seq_namespaces() {
     }
 
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 11);
+    assert_eq!(db.schema_version().unwrap(), 12);
     drop(db);
 
     let conn = Connection::open(&path).unwrap();
@@ -314,6 +322,86 @@ fn db_migrates_v6_to_v7_separates_seq_namespaces() {
     assert_eq!(has_index, 1);
 
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn db_v12_clears_orphans_and_enables_foreign_keys() {
+    let path = test_temp_path("localbox-mig-v11-fk").with_extension("db");
+    {
+        // A v11 DB carrying exactly the rows an un-enforced cascade leaves behind:
+        // children pointing at parents that were deleted out from under them.
+        let db = Db::open(&path).unwrap();
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            -- The bundled SQLite defaults foreign_keys ON, so the inconsistency
+            -- this migration repairs has to be created with it explicitly off.
+            PRAGMA foreign_keys = OFF;
+            PRAGMA user_version = 11;
+            INSERT INTO peers (pc_name, instance_id, last_ip, last_port, last_tls_port,
+                               last_plain_port, last_seen, state)
+            VALUES ('live-pc', 'inst', '127.0.0.1', 5000, 5000, 5002, 0, 'known');
+            INSERT INTO shares (share_name, pc_name, share_id, root_path, recursive)
+            VALUES ('live', 'live-pc', X'00', '/tmp/live', 1);
+
+            -- peer 99 and share 99 do not exist.
+            INSERT INTO peer_shares (peer_id, share_name) VALUES (99, 'ghost');
+            INSERT INTO files (share_id, rel_path, size, mtime, hash, version, deleted)
+            VALUES (99, 'ghost.txt', 1, 0, X'00', 1, 0);
+            INSERT INTO peer_progress (peer_id, share_id) VALUES (99, 99);
+            INSERT INTO share_progress (share_id, last_seq_applied) VALUES (99, 5);
+            INSERT INTO chat_threads (id, kind, title, updated_at) VALUES ('t1', 'peer', 'T', 0);
+            INSERT INTO chat_messages (id, thread_id, from_peer, body, created_at, direction)
+            VALUES ('m1', 'gone-thread', 'x', 'b', 0, 'in');
+            INSERT INTO share_journal
+              (share_id, seq, path, kind, deleted, created_at, origin_peer_id, origin_seq)
+            VALUES (1, 1, 'a.txt', 'Modify', 0, 0, 99, 3);
+            "#,
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.schema_version().unwrap(), 12);
+    assert!(db.foreign_keys_enabled().unwrap());
+    drop(db);
+
+    let conn = Connection::open(&path).unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(count("SELECT COUNT(*) FROM peer_shares"), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM files"), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM peer_progress"), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM share_progress"), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM chat_messages"), 0);
+
+    // The journal row itself is sound; only its dangling origin is blanked, which
+    // is what ON DELETE SET NULL would have done.
+    assert_eq!(count("SELECT COUNT(*) FROM share_journal"), 1);
+    let origin: Option<i64> = conn
+        .query_row("SELECT origin_peer_id FROM share_journal", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(origin, None);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn foreign_keys_reject_a_write_against_a_missing_parent() {
+    let db = Db::open_in_memory().unwrap();
+    assert!(db.foreign_keys_enabled().unwrap());
+
+    // Share 999 does not exist. Before the pragma this silently created an
+    // unreachable `files` row; now it is refused at the write.
+    let meta = models::FileMeta {
+        path: "orphan.txt".into(),
+        size: 1,
+        mtime: 0,
+        hash: [0u8; 32],
+        version: 1,
+        deleted: false,
+    };
+    assert!(db.upsert_file_meta(999, &meta).is_err());
 }
 
 #[test]

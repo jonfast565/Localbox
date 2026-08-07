@@ -58,6 +58,7 @@ fn cfg() -> AppConfig {
         }],
         quarantined_peers: vec![],
         control_socket: PathBuf::from("sock"),
+        outbound_max_attempts: localbox_models::DEFAULT_OUTBOUND_MAX_ATTEMPTS,
     }
 }
 
@@ -105,4 +106,16 @@ fn acl_and_conflict_resolvers() {
     assert!(c.resolve_allow_request("docs", "bob"));
     assert_eq!(c.resolve_sync_allow("docs", Some("bob")), vec!["other/*"]);
     assert_eq!(c.resolve_sync_allow("docs", None), vec!["public/*"]);
+}
+
+#[test]
+fn max_file_size_resolves_per_share_and_defaults_to_unlimited() {
+    let mut c = cfg();
+    assert_eq!(c.resolve_max_file_size_bytes("docs"), None);
+    // A share with no config entry at all (a peer-owned mirror, typically).
+    assert_eq!(c.resolve_max_file_size_bytes("unknown"), None);
+
+    c.shares[0].max_file_size_bytes = Some(1024);
+    assert_eq!(c.resolve_max_file_size_bytes("docs"), Some(1024));
+    assert_eq!(c.resolve_max_file_size_bytes("unknown"), None);
 }

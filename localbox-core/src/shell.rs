@@ -32,6 +32,7 @@ pub async fn run_inprocess_shell(
     net_tx: mpsc::Sender<String>,
     cmd_tx: mpsc::Sender<PeerCommand>,
     progress: Arc<TransferProgressRegistry>,
+    events: tokio::sync::broadcast::Sender<models::ControlEvent>,
     share_hooks: Option<ShareHooks>,
     token: CancellationToken,
 ) -> Result<()> {
@@ -42,6 +43,7 @@ pub async fn run_inprocess_shell(
         net_tx,
         peer_cmd_tx: cmd_tx,
         progress,
+        events,
         share_hooks,
         token: token.clone(),
     };
@@ -399,6 +401,19 @@ pub fn parse_repl_to_request(line: &str) -> Result<ControlRequest> {
                 .ok_or_else(|| anyhow!("chat requires subcommand"))?;
             match sub {
                 "inbox" | "threads" => Ok(ControlRequest::ChatInbox),
+                "subscribe" => {
+                    let args = parse_flags(&parts[2..])?;
+                    let topics = args
+                        .get("topics")
+                        .map(|s| {
+                            s.split(',')
+                                .map(|t| t.trim().to_string())
+                                .filter(|t| !t.is_empty())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Ok(ControlRequest::Subscribe { topics })
+                }
                 "show" => {
                     let args = parse_flags(&parts[2..])?;
                     Ok(ControlRequest::ChatShow {
@@ -413,6 +428,36 @@ pub fn parse_repl_to_request(line: &str) -> Result<ControlRequest> {
                         thread: required(&args, "thread")
                             .or_else(|_| required(&args, "thread_id"))?,
                     })
+                }
+                "rename" => {
+                    let args = parse_flags(&parts[2..])?;
+                    Ok(ControlRequest::ChatRename {
+                        thread: required(&args, "thread")
+                            .or_else(|_| required(&args, "thread_id"))?,
+                        title: required(&args, "title")
+                            .or_else(|_| required(&args, "name"))?,
+                    })
+                }
+                "delete-message" | "rm-message" => {
+                    let args = parse_flags(&parts[2..])?;
+                    Ok(ControlRequest::ChatDeleteMessage {
+                        message: required(&args, "message")
+                            .or_else(|_| required(&args, "id"))
+                            .or_else(|_| required(&args, "message_id"))?,
+                    })
+                }
+                "delete" | "delete-thread" | "rm-thread" | "rm" => {
+                    let args = parse_flags(&parts[2..])?;
+                    if let Ok(message) = required(&args, "message")
+                        .or_else(|_| required(&args, "message_id"))
+                    {
+                        Ok(ControlRequest::ChatDeleteMessage { message })
+                    } else {
+                        Ok(ControlRequest::ChatDeleteThread {
+                            thread: required(&args, "thread")
+                                .or_else(|_| required(&args, "thread_id"))?,
+                        })
+                    }
                 }
                 "send" => {
                     let args = parse_flags(&parts[2..])?;

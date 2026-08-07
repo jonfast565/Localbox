@@ -2,12 +2,12 @@
 
 use anyhow::{Context, Result};
 use db::Db;
-use models::{AppConfig, TransferProgressRegistry};
+use models::{AppConfig, ControlEvent, TransferProgressRegistry};
 use peering::PeerCommand;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -19,6 +19,7 @@ pub async fn run_control_server(
     net_tx: mpsc::Sender<String>,
     cmd_tx: mpsc::Sender<PeerCommand>,
     progress: Arc<TransferProgressRegistry>,
+    events: broadcast::Sender<ControlEvent>,
     share_hooks: Option<ShareHooks>,
     token: CancellationToken,
 ) -> Result<()> {
@@ -28,6 +29,7 @@ pub async fn run_control_server(
         net_tx,
         cmd_tx,
         progress,
+        events,
         share_hooks,
         token,
     )
@@ -40,6 +42,7 @@ pub async fn run_control_server_with_cfg(
     net_tx: mpsc::Sender<String>,
     cmd_tx: mpsc::Sender<PeerCommand>,
     progress: Arc<TransferProgressRegistry>,
+    events: broadcast::Sender<ControlEvent>,
     share_hooks: Option<ShareHooks>,
     token: CancellationToken,
 ) -> Result<()> {
@@ -54,6 +57,7 @@ pub async fn run_control_server_with_cfg(
         net_tx,
         peer_cmd_tx: cmd_tx,
         progress,
+        events,
         share_hooks,
         token: token.clone(),
     };
@@ -183,11 +187,71 @@ where
                             write_json_line(&mut writer, &r).await?;
                             break;
                         }
+                        if let ControlRequest::Subscribe { topics } = req {
+                            let ack = ControlResponse::ok_data(
+                                "subscribed",
+                                serde_json::json!({ "topics": topics }),
+                            );
+                            write_json_line(&mut writer, &ack).await?;
+                            run_event_push_loop(
+                                &mut writer,
+                                service.events.subscribe(),
+                                &topics,
+                                &token,
+                            )
+                            .await?;
+                            break;
+                        }
                         service.handle(req).await
                     }
                     Err(e) => ControlResponse::err(format!("invalid request: {e}")),
                 };
                 write_json_line(&mut writer, &resp).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn event_matches_topics(event: &ControlEvent, topics: &[String]) -> bool {
+    if topics.is_empty() {
+        return true;
+    }
+    let name = match event {
+        ControlEvent::ChatReceived { .. } => "chat",
+        ControlEvent::TransferRequestPending { .. } => "transfer",
+        ControlEvent::BatchReceived { .. } => "batch",
+    };
+    topics.iter().any(|t| t.eq_ignore_ascii_case(name))
+}
+
+async fn run_event_push_loop<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    mut rx: broadcast::Receiver<ControlEvent>,
+    topics: &[String],
+    token: &CancellationToken,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            recv = rx.recv() => {
+                match recv {
+                    Ok(event) => {
+                        if !event_matches_topics(&event, topics) {
+                            continue;
+                        }
+                        let mut bytes = serde_json::to_vec(&event)?;
+                        bytes.push(b'\n');
+                        if writer.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                        if writer.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
         }
     }

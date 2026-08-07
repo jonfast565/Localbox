@@ -6,7 +6,7 @@ use irontide_utp::{UtpConfig, UtpListener, UtpSocket};
 use models::{AppConfig, ShareContext, ShareId, TransferProgressRegistry, WireMessage};
 use time::OffsetDateTime;
 use tls::ManagedTls;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::{self, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -45,7 +45,7 @@ fn spawn_utp_listener(
     tls: Arc<ManagedTls>,
     fs: Arc<dyn FileSystem>,
     net: Arc<dyn Net>,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
     token: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -67,7 +67,7 @@ fn spawn_utp_listener(
                             let tls = tls.clone();
                             let fs = fs.clone();
                             let net = net.clone();
-                            let progress = Arc::clone(&progress);
+                            let notify = notify.clone();
                             tokio::spawn(async move {
                                 let tls_acceptor = tls.acceptor().await;
                                 let dyn_stream: DynStream = Box::new(stream);
@@ -82,7 +82,7 @@ fn spawn_utp_listener(
                                     tls_acceptor,
                                     fs,
                                     net,
-                                    progress,
+                                    notify,
                                 )
                                 .await
                                 {
@@ -105,9 +105,11 @@ mod commands;
 mod connection;
 mod dht;
 mod discovery;
+mod notify;
 mod writer;
 
 pub use commands::PeerCommand;
+pub use notify::PeerNotify;
 
 /// Build a [`ShareContext`] from a DB share row (runtime share registry).
 pub fn share_context_from_row(row: &ShareRow) -> ShareContext {
@@ -147,7 +149,7 @@ pub struct PeerManager {
     net_tx: mpsc::Sender<String>,
     fs: Arc<dyn FileSystem>,
     net: Arc<dyn Net>,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
 }
 
 impl PeerManager {
@@ -159,7 +161,7 @@ impl PeerManager {
         fs: Arc<dyn FileSystem>,
         net: Arc<dyn Net>,
     ) -> Result<Self> {
-        Self::with_progress(cfg, db, net_tx, shares, fs, net, TransferProgressRegistry::new())
+        Self::with_notify(cfg, db, net_tx, shares, fs, net, PeerNotify::new())
     }
 
     pub fn with_progress(
@@ -171,6 +173,27 @@ impl PeerManager {
         net: Arc<dyn Net>,
         progress: Arc<TransferProgressRegistry>,
     ) -> Result<Self> {
+        let (events, _) = broadcast::channel(256);
+        Self::with_notify(
+            cfg,
+            db,
+            net_tx,
+            shares,
+            fs,
+            net,
+            PeerNotify::from_parts(progress, events),
+        )
+    }
+
+    pub fn with_notify(
+        cfg: AppConfig,
+        db: DbHandle,
+        net_tx: mpsc::Sender<String>,
+        shares: Vec<ShareContext>,
+        fs: Arc<dyn FileSystem>,
+        net: Arc<dyn Net>,
+        notify: PeerNotify,
+    ) -> Result<Self> {
         let _ = shares; // callers still pass shares loaded into the DB registry
         let tls = Arc::new(ManagedTls::new(&cfg, fs.clone())?);
         Ok(Self {
@@ -180,12 +203,16 @@ impl PeerManager {
             net_tx,
             fs,
             net,
-            progress,
+            notify,
         })
     }
 
+    pub fn notify(&self) -> PeerNotify {
+        self.notify.clone()
+    }
+
     pub fn progress(&self) -> Arc<TransferProgressRegistry> {
-        Arc::clone(&self.progress)
+        Arc::clone(&self.notify.progress)
     }
 
     pub async fn run(
@@ -231,7 +258,7 @@ impl PeerManager {
             self.fs.clone(),
             self.net.clone(),
             pending_files.clone(),
-            Arc::clone(&self.progress),
+            self.notify.clone(),
             utp_socket.clone(),
             token.clone(),
         );
@@ -239,13 +266,13 @@ impl PeerManager {
             connections.clone(),
             pending_files.clone(),
             tls.clone(),
-            Arc::clone(&self.progress),
+            self.notify.clone(),
             token.clone(),
         );
         let plain_listener = self.spawn_plain_listener(
             connections.clone(),
             pending_files.clone(),
-            Arc::clone(&self.progress),
+            self.notify.clone(),
             token.clone(),
         );
         let utp_accept = spawn_utp_listener(
@@ -257,7 +284,7 @@ impl PeerManager {
             tls.clone(),
             self.fs.clone(),
             self.net.clone(),
-            Arc::clone(&self.progress),
+            self.notify.clone(),
             token.clone(),
         );
         let dht_task = if self.cfg.dht_enabled() {
@@ -269,7 +296,7 @@ impl PeerManager {
                 self.fs.clone(),
                 self.net.clone(),
                 pending_files.clone(),
-                Arc::clone(&self.progress),
+                self.notify.clone(),
                 utp_socket.clone(),
                 token.clone(),
             )
@@ -279,7 +306,7 @@ impl PeerManager {
         let sender = self.spawn_outbox_worker(
             connections.clone(),
             self.fs.clone(),
-            Arc::clone(&self.progress),
+            self.notify.clone(),
             net_rx,
             token.clone(),
         );
@@ -329,7 +356,7 @@ impl PeerManager {
         connections: SharedWriters,
         pending_files: PendingFiles,
         tls: Arc<ManagedTls>,
-        progress: Arc<TransferProgressRegistry>,
+        notify: PeerNotify,
         token: tokio_util::sync::CancellationToken,
     ) -> JoinHandle<()> {
         let cfg = self.cfg.clone();
@@ -362,7 +389,7 @@ impl PeerManager {
                                 let tls = tls.clone();
                                 let fs = fs.clone();
                                 let net = net.clone();
-                                let progress = Arc::clone(&progress);
+                                let notify = notify.clone();
                                 tokio::spawn(async move {
                                     let tls_acceptor = tls.acceptor().await;
                                     if let Err(e) =
@@ -377,7 +404,7 @@ impl PeerManager {
                                             tls_acceptor,
                                             fs,
                                             net,
-                                            progress,
+                                            notify,
                                         )
                                         .await
                                     {
@@ -400,7 +427,7 @@ impl PeerManager {
         &self,
         connections: SharedWriters,
         pending_files: PendingFiles,
-        progress: Arc<TransferProgressRegistry>,
+        notify: PeerNotify,
         token: tokio_util::sync::CancellationToken,
     ) -> JoinHandle<()> {
         let cfg = self.cfg.clone();
@@ -432,7 +459,7 @@ impl PeerManager {
                                 let pending_files = pending_files.clone();
                                 let fs = fs.clone();
                                 let net = net.clone();
-                                let progress = Arc::clone(&progress);
+                                let notify = notify.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = connection::handle_plain_connection(
                                             stream,
@@ -444,7 +471,7 @@ impl PeerManager {
                                             pending_files,
                                             fs,
                                         net,
-                                        progress,
+                                        notify,
                                     )
                                     .await
                                     {
@@ -467,7 +494,7 @@ impl PeerManager {
         &self,
         connections: SharedWriters,
         fs: Arc<dyn FileSystem>,
-        progress: Arc<TransferProgressRegistry>,
+        notify: PeerNotify,
         mut net_rx: mpsc::Receiver<String>,
         token: CancellationToken,
     ) -> JoinHandle<()> {
@@ -562,7 +589,7 @@ impl PeerManager {
                                     && c.meta.as_ref().map(|m| !m.deleted).unwrap_or(false)
                             })
                             .count() as u64;
-                        progress.begin_outbound(
+                        notify.progress.begin_outbound(
                             item.intent_id.as_deref(),
                             &item.batch_id,
                             item.peer_id,
@@ -575,7 +602,7 @@ impl PeerManager {
                             &item.manifest,
                             &db,
                             fs.clone(),
-                            Arc::clone(&progress),
+                            notify.clone(),
                             item.intent_id.as_deref(),
                         )
                         .await
@@ -672,7 +699,7 @@ async fn send_file_chunks(
     manifest: &models::BatchManifest,
     db: &DbHandle,
     fs: Arc<dyn FileSystem>,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
     intent_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let share_ctx = match db.lock().await.get_share_by_share_id(&manifest.share_id) {
@@ -729,7 +756,7 @@ async fn send_file_chunks(
                 eof: true,
             };
             writer.send(&WireMessage::FileChunk(chunk)).await?;
-            progress.add_outbound_bytes(intent_id, &manifest.batch_id, 0, true);
+            notify.progress.add_outbound_bytes(intent_id, &manifest.batch_id, 0, true);
             continue;
         }
 
@@ -795,7 +822,7 @@ async fn send_file_chunks(
                 eof,
             };
             writer.send(&WireMessage::FileChunk(chunk)).await?;
-            progress.add_outbound_bytes(intent_id, &manifest.batch_id, n, eof);
+            notify.progress.add_outbound_bytes(intent_id, &manifest.batch_id, n, eof);
         }
 
         let computed = finalize_hasher(hasher);
@@ -822,17 +849,23 @@ async fn dispatch_peer_command(
             send_to_peer_id(connections, peer_id, &msg).await?;
         }
         PeerCommand::SendToPeerKey { peer_key, msg } => {
+            prune_duplicate_peer_writers(connections).await;
             let peer_ids = resolve_peer_ids(db, &peer_key).await;
             for pid in peer_ids {
                 let _ = send_to_peer_id(connections, pid, &msg).await;
             }
         }
         PeerCommand::Broadcast { msg } => {
-            let writers: Vec<Arc<tokio::sync::Mutex<writer::PeerWriter>>> = {
+            // One framed send per peer id — duplicate sessions must not fan out chat.
+            prune_duplicate_peer_writers(connections).await;
+            let writers: Vec<(i64, Arc<tokio::sync::Mutex<writer::PeerWriter>>)> = {
                 let guard = connections.lock().await;
-                guard.iter().map(|(_, w)| Arc::clone(w)).collect()
+                guard
+                    .iter()
+                    .map(|(pid, w)| (*pid, Arc::clone(w)))
+                    .collect()
             };
-            for writer in writers {
+            for (_pid, writer) in writers {
                 let mut g = writer.lock().await;
                 let _ = g.send(&msg).await;
             }
@@ -868,6 +901,23 @@ async fn send_to_peer_id(
     let mut g = writer.lock().await;
     g.send(msg).await?;
     Ok(())
+}
+
+/// Keep a single writer entry per peer id (newest wins).
+pub(crate) async fn prune_duplicate_peer_writers(connections: &SharedWriters) {
+    let mut guard = connections.lock().await;
+    if guard.len() < 2 {
+        return;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut kept = Vec::with_capacity(guard.len());
+    for (pid, writer) in guard.drain(..).rev() {
+        if seen.insert(pid) {
+            kept.push((pid, writer));
+        }
+    }
+    kept.reverse();
+    *guard = kept;
 }
 
 async fn resolve_peer_ids(db: &DbHandle, peer_key: &str) -> Vec<i64> {

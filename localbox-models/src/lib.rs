@@ -20,6 +20,7 @@ pub mod advertise;
 pub mod change;
 pub mod chat;
 pub mod config;
+pub mod events;
 pub mod intent;
 pub mod peer;
 pub mod progress;
@@ -36,12 +37,13 @@ pub use change::{
 };
 pub use chat::{
     peer_key, peer_thread_id, share_thread_id, ChatAck, ChatAttachment, ChatMessage,
-    ChatMessageRecord, ThreadKind, ThreadSummary,
+    ChatMessageRecord, format_chat_thread_title, ThreadKind, ThreadSummary,
 };
 pub use config::{
     peer_dht_infohash, peer_dht_mutable_seed, peer_keys_match, AppConfig, ApplicationState,
     BootstrapPeer, ConflictPolicy, PeerPolicy, ShareConfig, TransferMode,
 };
+pub use events::ControlEvent;
 pub use intent::{
     IntentBasis, IntentKind, IntentOrigin, IntentStatus, TransferIntent,
 };

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-const DB_SCHEMA_VERSION: i32 = 10;
+const DB_SCHEMA_VERSION: i32 = 11;
 
 pub struct Db {
     conn: Connection,
@@ -271,6 +271,7 @@ impl Db {
                 peer_key      TEXT,
                 share_name    TEXT,
                 title         TEXT NOT NULL,
+                title_custom  INTEGER NOT NULL DEFAULT 0,
                 updated_at    INTEGER NOT NULL,
                 unread_count  INTEGER NOT NULL DEFAULT 0
             );
@@ -594,6 +595,15 @@ impl Db {
             if !self.has_column("peer_shares", "pull")? {
                 self.conn.execute(
                     "ALTER TABLE peer_shares ADD COLUMN pull TEXT NOT NULL DEFAULT 'manual'",
+                    [],
+                )?;
+            }
+        }
+
+        if current < 11 {
+            if !self.has_column("chat_threads", "title_custom")? {
+                self.conn.execute(
+                    "ALTER TABLE chat_threads ADD COLUMN title_custom INTEGER NOT NULL DEFAULT 0",
                     [],
                 )?;
             }
@@ -1080,21 +1090,87 @@ impl Db {
         Ok(out)
     }
 
-    /// Refresh peer-DM thread titles to the peer's current display name.
+    /// Repoint peer DMs that were stored with *our own* key as the counterpart.
+    ///
+    /// Inbound chat used to copy the sender's `peer_key` (which addresses us) into the
+    /// thread, leaving the thread unable to name who to reply to. The counterpart is
+    /// recovered from the newest inbound message. Returns the number of threads repaired.
+    pub fn repair_self_keyed_peer_threads(&self, local_key: &str) -> Result<usize> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT t.id,
+                   (SELECT m.from_peer
+                      FROM chat_messages m
+                     WHERE m.thread_id = t.id
+                       AND m.direction = 'in'
+                       AND m.from_peer <> ?1
+                     ORDER BY m.created_at DESC
+                     LIMIT 1)
+            FROM chat_threads t
+            WHERE t.kind = 'peer' AND t.peer_key = ?1
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![local_key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut repaired = 0;
+        for (thread_id, counterpart) in rows {
+            // No inbound message from anyone else: nothing to recover the counterpart from.
+            let Some(counterpart) = counterpart else {
+                continue;
+            };
+            repaired += self.conn.execute(
+                r#"
+                UPDATE chat_threads
+                SET peer_key = ?2,
+                    title = CASE
+                        WHEN COALESCE(title_custom, 0) != 0 THEN title
+                        WHEN share_name IS NULL OR trim(share_name) = '' THEN ?2
+                        ELSE ?2 || ' · #' || share_name
+                    END
+                WHERE id = ?1
+                "#,
+                params![thread_id, counterpart],
+            )?;
+        }
+        Ok(repaired)
+    }
+
+    /// Refresh auto-named peer-DM titles (skips custom renames).
     pub fn refresh_chat_thread_titles_for_peer(
         &self,
         peer_key: &str,
-        title: &str,
+        peer_label: &str,
     ) -> Result<usize> {
         let n = self.conn.execute(
             r#"
             UPDATE chat_threads
-            SET title = ?2
-            WHERE kind = 'peer' AND peer_key = ?1
+            SET title = CASE
+                WHEN share_name IS NULL OR trim(share_name) = '' THEN ?2
+                ELSE ?2 || ' · #' || share_name
+            END
+            WHERE kind = 'peer'
+              AND peer_key = ?1
+              AND COALESCE(title_custom, 0) = 0
             "#,
-            params![peer_key, title],
+            params![peer_key, peer_label],
         )?;
         Ok(n)
+    }
+
+    /// Set a custom conversation title (Slack-style rename).
+    pub fn rename_chat_thread(&self, id: &str, title: &str) -> Result<bool> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Ok(false);
+        }
+        let n = self.conn.execute(
+            "UPDATE chat_threads SET title = ?2, title_custom = 1 WHERE id = ?1",
+            params![id, title],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn get_share_row_id_by_share_id(&self, share_id: &ShareId) -> Result<i64> {
@@ -1798,11 +1874,20 @@ impl Db {
     ) -> Result<()> {
         self.conn.execute(
             r#"
-            INSERT INTO chat_threads (id, kind, peer_key, share_name, title, updated_at, unread_count)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+            INSERT INTO chat_threads (id, kind, peer_key, share_name, title, title_custom, updated_at, unread_count)
+            VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 0)
             ON CONFLICT(id) DO UPDATE SET
-                title = excluded.title,
-                updated_at = MAX(chat_threads.updated_at, excluded.updated_at)
+                title = CASE
+                    WHEN chat_threads.title_custom != 0 THEN chat_threads.title
+                    WHEN (chat_threads.share_name IS NULL OR trim(chat_threads.share_name) = '')
+                         AND excluded.share_name IS NOT NULL
+                         AND trim(excluded.share_name) != ''
+                        THEN excluded.title
+                    ELSE chat_threads.title
+                END,
+                updated_at = MAX(chat_threads.updated_at, excluded.updated_at),
+                peer_key = COALESCE(excluded.peer_key, chat_threads.peer_key),
+                share_name = COALESCE(excluded.share_name, chat_threads.share_name)
             "#,
             params![
                 id,
@@ -1816,8 +1901,9 @@ impl Db {
         Ok(())
     }
 
-    pub fn insert_chat_message(&self, msg: &ChatMessageRecord, bump_unread: bool) -> Result<()> {
-        self.conn.execute(
+    /// Returns `true` when a new row was inserted; `false` when `id` was already present.
+    pub fn insert_chat_message(&self, msg: &ChatMessageRecord, bump_unread: bool) -> Result<bool> {
+        let inserted = self.conn.execute(
             r#"
             INSERT OR IGNORE INTO chat_messages
               (id, thread_id, from_peer, body, attachment_share, attachment_path, created_at, direction, status)
@@ -1834,7 +1920,10 @@ impl Db {
                 msg.direction,
                 msg.status
             ],
-        )?;
+        )? > 0;
+        if !inserted {
+            return Ok(false);
+        }
         self.conn.execute(
             "UPDATE chat_threads SET updated_at = MAX(updated_at, ?2) WHERE id = ?1",
             params![msg.thread_id, msg.created_at],
@@ -1845,27 +1934,29 @@ impl Db {
                 params![msg.thread_id],
             )?;
         }
-        Ok(())
+        Ok(true)
     }
 
     pub fn list_inbox(&self) -> Result<Vec<ThreadSummary>> {
         let mut stmt = self.conn.prepare(
             r#"
-            SELECT id, kind, peer_key, share_name, title, updated_at, unread_count
+            SELECT id, kind, peer_key, share_name, title, title_custom, updated_at, unread_count
             FROM chat_threads
             ORDER BY updated_at DESC
             "#,
         )?;
         let rows = stmt.query_map([], |row| {
             let kind_s: String = row.get(1)?;
+            let title_custom: i64 = row.get(5)?;
             Ok(ThreadSummary {
                 id: row.get(0)?,
                 kind: ThreadKind::parse(&kind_s).unwrap_or(ThreadKind::Peer),
                 peer_key: row.get(2)?,
                 share_name: row.get(3)?,
                 title: row.get(4)?,
-                updated_at: row.get(5)?,
-                unread_count: row.get(6)?,
+                title_custom: title_custom != 0,
+                updated_at: row.get(6)?,
+                unread_count: row.get(7)?,
             })
         })?;
         let mut out = Vec::new();
@@ -1916,6 +2007,29 @@ impl Db {
             params![thread_id],
         )?;
         Ok(())
+    }
+
+    /// Delete one chat message locally. Returns `true` if a row was removed.
+    pub fn delete_chat_message(&self, message_id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM chat_messages WHERE id = ?1",
+            params![message_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Delete a conversation and its messages. Returns `true` if the thread was removed.
+    pub fn delete_chat_thread(&self, thread_id: &str) -> Result<bool> {
+        // Explicit message delete: SQLite foreign keys are off unless PRAGMA is set.
+        self.conn.execute(
+            "DELETE FROM chat_messages WHERE thread_id = ?1",
+            params![thread_id],
+        )?;
+        let n = self.conn.execute(
+            "DELETE FROM chat_threads WHERE id = ?1",
+            params![thread_id],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn insert_transfer_request(
@@ -2589,7 +2703,7 @@ impl Db {
         self.ensure_chat_thread(id, kind, peer_key, share_name, title, updated_at)
     }
 
-    pub fn insert_message(&self, msg: &ChatMessageRecord, bump_unread: bool) -> Result<()> {
+    pub fn insert_message(&self, msg: &ChatMessageRecord, bump_unread: bool) -> Result<bool> {
         self.insert_chat_message(msg, bump_unread)
     }
 

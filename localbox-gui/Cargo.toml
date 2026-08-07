@@ -16,6 +16,7 @@ clap = { version = "4", features = ["derive"] }
 dark-light = "1"
 iced = { version = "0.13", features = ["tokio"] }
 localbox-core = { path = "../localbox-core" }
+notify-rust = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

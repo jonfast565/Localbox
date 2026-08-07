@@ -11,3 +11,4 @@ pub mod settings;
 pub mod shell;
 
 pub use engine::Engine;
+pub use models::ControlEvent;

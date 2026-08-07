@@ -3,7 +3,7 @@ use db::JournalOrigin;
 use models::{
     AdvertisedShare, AppConfig, ChangeKind, ChatAck, ChatMessage, ChatMessageRecord, ConflictPolicy,
     FileChange, FileChunk, FileMeta, HelloMessage, ShareConfig, ShareId, ThreadKind, TransferMode,
-    TransferProgressRegistry, TransferReply, TransferReplyStatus, TransferRequest, WireMessage,
+    ControlEvent, TransferReply, TransferReplyStatus, TransferRequest, WireMessage,
 };
 use uuid::Uuid;
 use irontide_utp::UtpSocket;
@@ -25,8 +25,37 @@ use std::io::Write;
 use utilities::{staging_tmp_path, DynStream, FileSystem, Net};
 
 use crate::writer::{recv_framed_message, send_framed_message, PeerWriter};
-use crate::{DbHandle, InboundFileState, PendingFiles, SharedWriters};
+use crate::{DbHandle, InboundFileState, PendingFiles, PeerNotify, SharedWriters};
 use tls::{fingerprint_from_certificates, normalize_fingerprint, verify_peer_cert_name};
+
+/// True when we already have a live writer for this peer id.
+pub(crate) async fn is_peer_connected(connections: &SharedWriters, peer_id: i64) -> bool {
+    let guard = connections.lock().await;
+    guard.iter().any(|(id, _)| *id == peer_id)
+}
+
+/// Register a writer for `peer_id`, or return `false` if one already exists.
+async fn try_register_peer_writer(
+    connections: &SharedWriters,
+    peer_id: i64,
+    writer: PeerWriter,
+) -> bool {
+    let mut guard = connections.lock().await;
+    if guard.iter().any(|(id, _)| *id == peer_id) {
+        return false;
+    }
+    guard.push((peer_id, Arc::new(AsyncMutex::new(writer))));
+    true
+}
+
+async fn forget_peer_connection(connections: &SharedWriters, peer_id: i64) {
+    let mut guard = connections.lock().await;
+    let before = guard.len();
+    guard.retain(|(id, _)| *id != peer_id);
+    if guard.len() != before {
+        debug!(peer_id, "Removed peer connection after session end");
+    }
+}
 
 pub async fn handle_tls_connection(
     stream: DynStream,
@@ -39,7 +68,7 @@ pub async fn handle_tls_connection(
     tls_acceptor: TlsAcceptor,
     fs: Arc<dyn FileSystem>,
     _net: Arc<dyn Net>,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
 ) -> Result<()> {
     let tls_stream = tls_acceptor.accept(stream).await?;
     let mut tls_stream = tls_stream;
@@ -70,12 +99,18 @@ pub async fn handle_tls_connection(
     }
 
     let (reader, writer) = split(tls_stream);
+    if !try_register_peer_writer(
+        &connections,
+        resolved_peer_id,
+        PeerWriter::Server(writer),
+    )
+    .await
     {
-        let mut guard = connections.lock().await;
-        guard.push((
-            resolved_peer_id,
-            Arc::new(AsyncMutex::new(PeerWriter::Server(writer))),
-        ));
+        info!(
+            peer = %remote.pc_name,
+            "Already connected; dropping redundant inbound TLS session"
+        );
+        return Ok(());
     }
 
     maybe_auto_pull(cfg, db, &connections, resolved_peer_id, &remote).await;
@@ -89,7 +124,7 @@ pub async fn handle_tls_connection(
         connections.clone(),
         pending_files,
         fs,
-        progress,
+        notify,
     );
     Ok(())
 }
@@ -104,7 +139,7 @@ pub async fn handle_plain_connection(
     pending_files: PendingFiles,
     fs: Arc<dyn FileSystem>,
     _net: Arc<dyn Net>,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
 ) -> Result<()> {
     warn!("Inbound plaintext peer connection from {addr}");
     let (remote, resolved_peer_id) =
@@ -114,12 +149,18 @@ pub async fn handle_plain_connection(
     db.lock().await.mark_peer_insecure(resolved_peer_id, now)?;
 
     let (reader, writer) = split(stream);
+    if !try_register_peer_writer(
+        &connections,
+        resolved_peer_id,
+        PeerWriter::Plain(writer),
+    )
+    .await
     {
-        let mut guard = connections.lock().await;
-        guard.push((
-            resolved_peer_id,
-            Arc::new(AsyncMutex::new(PeerWriter::Plain(writer))),
-        ));
+        info!(
+            peer = %remote.pc_name,
+            "Already connected; dropping redundant inbound plaintext session"
+        );
+        return Ok(());
     }
 
     maybe_auto_pull(cfg, db, &connections, resolved_peer_id, &remote).await;
@@ -133,7 +174,7 @@ pub async fn handle_plain_connection(
         connections.clone(),
         pending_files,
         fs,
-        progress,
+        notify,
     );
     Ok(())
 }
@@ -159,7 +200,7 @@ pub async fn connect_to_peer(
     fs: Arc<dyn FileSystem>,
     net: Arc<dyn Net>,
     utp: Option<UtpSocket>,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
 ) -> Result<()> {
     let use_tls = if cfg.use_tls_for_peers && peer_tls_addr.port() != 0 {
         true
@@ -196,7 +237,7 @@ pub async fn connect_to_peer(
                 pending_files.clone(),
                 connector.clone(),
                 fs.clone(),
-                Arc::clone(&progress),
+                notify.clone(),
             )
             .await
             {
@@ -235,7 +276,7 @@ pub async fn connect_to_peer(
                         pending_files,
                         connector,
                         fs,
-                        progress,
+                        notify,
                     )
                     .await
                     .with_context(|| format!("TCP to {target_addr} failed ({e}); uTP also failed"));
@@ -279,12 +320,12 @@ pub async fn connect_to_peer(
         }
 
         let (reader, writer) = split(tls_stream);
-        {
-            let mut guard = connections.lock().await;
-            guard.push((
-                peer_id,
-                Arc::new(AsyncMutex::new(PeerWriter::Client(writer))),
-            ));
+        if !try_register_peer_writer(&connections, peer_id, PeerWriter::Client(writer)).await {
+            info!(
+                peer = %remote.pc_name,
+                "Already connected; abandoning redundant outbound TLS dial"
+            );
+            return Ok(());
         }
         maybe_auto_pull(cfg, db, &connections, peer_id, &remote).await;
         let _reader_task = spawn_incoming_reader(
@@ -296,7 +337,7 @@ pub async fn connect_to_peer(
             connections.clone(),
             pending_files,
             fs,
-            progress,
+            notify,
         );
         info!("Established outbound TLS to {}", target_addr);
     } else {
@@ -314,12 +355,12 @@ pub async fn connect_to_peer(
         let now = OffsetDateTime::now_utc().unix_timestamp();
         db.lock().await.mark_peer_insecure(peer_id, now)?;
         let (reader, writer) = split(plain_stream);
-        {
-            let mut guard = connections.lock().await;
-            guard.push((
-                peer_id,
-                Arc::new(AsyncMutex::new(PeerWriter::Plain(writer))),
-            ));
+        if !try_register_peer_writer(&connections, peer_id, PeerWriter::Plain(writer)).await {
+            info!(
+                peer = %remote.pc_name,
+                "Already connected; abandoning redundant outbound plaintext dial"
+            );
+            return Ok(());
         }
         maybe_auto_pull(cfg, db, &connections, peer_id, &remote).await;
         let _reader_task = spawn_incoming_reader(
@@ -331,7 +372,7 @@ pub async fn connect_to_peer(
             connections.clone(),
             pending_files,
             fs,
-            progress,
+            notify,
         );
         info!("Established outbound plaintext to {}", target_addr);
     }
@@ -349,7 +390,7 @@ async fn connect_tls_over_utp(
     pending_files: PendingFiles,
     connector: TlsConnector,
     fs: Arc<dyn FileSystem>,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
 ) -> Result<()> {
     let stream = utp.connect(utp_addr).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     let stream: DynStream = Box::new(stream);
@@ -376,12 +417,12 @@ async fn connect_tls_over_utp(
     check_peer_identity(cfg, db, peer_id, &remote.pc_name, peer_certs.as_deref()).await?;
     ensure_peer_fingerprint(cfg, &remote.pc_name, peer_fp.as_deref())?;
     let (reader, writer) = split(tls_stream);
-    {
-        let mut guard = connections.lock().await;
-        guard.push((
-            peer_id,
-            Arc::new(AsyncMutex::new(PeerWriter::Client(writer))),
-        ));
+    if !try_register_peer_writer(&connections, peer_id, PeerWriter::Client(writer)).await {
+        info!(
+            peer = %remote.pc_name,
+            "Already connected; abandoning redundant outbound uTP dial"
+        );
+        return Ok(());
     }
     maybe_auto_pull(cfg, db, &connections, peer_id, &remote).await;
     let _reader_task = spawn_incoming_reader(
@@ -393,7 +434,7 @@ async fn connect_tls_over_utp(
         connections,
         pending_files,
         fs,
-        progress,
+        notify,
     );
     info!("Established outbound TLS-over-uTP to {}", utp_addr);
     Ok(())
@@ -478,7 +519,7 @@ fn spawn_incoming_reader<R>(
     connections: SharedWriters,
     pending_files: PendingFiles,
     fs: Arc<dyn FileSystem>,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
 ) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -492,7 +533,7 @@ where
         connections,
         pending_files,
         fs,
-        progress,
+        notify,
     ))
 }
 
@@ -505,7 +546,7 @@ async fn incoming_reader_loop<R>(
     connections: SharedWriters,
     pending_files: PendingFiles,
     fs: Arc<dyn FileSystem>,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -524,6 +565,7 @@ async fn incoming_reader_loop<R>(
                     peer_id,
                     &remote,
                     b,
+                    notify.clone(),
                 )
                 .await;
             }
@@ -545,21 +587,31 @@ async fn incoming_reader_loop<R>(
                     chunk,
                     &pending_files,
                     Arc::clone(&fs),
-                    Arc::clone(&progress),
+                    notify.clone(),
                 )
                 .await;
             }
             Ok(Some(WireMessage::TransferRequest(req))) => {
-                handle_transfer_request(&cfg, &db, &connections, peer_id, req).await;
+                handle_transfer_request(&cfg, &db, &connections, peer_id, req, notify.clone())
+                    .await;
             }
             Ok(Some(WireMessage::TransferReply(reply))) => {
                 handle_transfer_reply(&db, reply).await;
             }
             Ok(Some(WireMessage::TransferPushOffer(offer))) => {
-                handle_transfer_push_offer(&cfg, &db, &connections, peer_id, offer).await;
+                handle_transfer_push_offer(
+                    &cfg,
+                    &db,
+                    &connections,
+                    peer_id,
+                    offer,
+                    notify.clone(),
+                )
+                .await;
             }
             Ok(Some(WireMessage::ChatMessage(msg))) => {
-                handle_chat_message(&cfg, &db, &connections, peer_id, msg).await;
+                handle_chat_message(&cfg, &db, &connections, peer_id, msg, notify.clone())
+                    .await;
             }
             Ok(Some(WireMessage::ChatAck(ack))) => {
                 handle_chat_ack(&db, &ack.message_id).await;
@@ -574,6 +626,7 @@ async fn incoming_reader_loop<R>(
             }
         }
     }
+    forget_peer_connection(&connections, peer_id).await;
 }
 
 async fn maybe_auto_pull(
@@ -647,6 +700,7 @@ async fn handle_transfer_request(
     connections: &SharedWriters,
     peer_id: i64,
     req: TransferRequest,
+    notify: PeerNotify,
 ) {
     let peer_key = format!("{}@{}", req.from_pc, req.from_instance);
     if !cfg.resolve_allow_pull(&req.share_name, &peer_key) {
@@ -711,6 +765,12 @@ async fn handle_transfer_request(
             from = %peer_key,
             "Inbound transfer request queued for manual reply"
         );
+        notify.emit(ControlEvent::TransferRequestPending {
+            request_id: req.request_id.clone(),
+            share_name: req.share_name.clone(),
+            from_peer: peer_key,
+            direction: "in".into(),
+        });
     }
 }
 
@@ -817,6 +877,7 @@ async fn handle_transfer_push_offer(
     connections: &SharedWriters,
     peer_id: i64,
     offer: models::TransferPushOffer,
+    notify: PeerNotify,
 ) {
     let peer_key = format!("{}@{}", offer.from_pc, offer.from_instance);
     let as_req = TransferRequest {
@@ -858,6 +919,12 @@ async fn handle_transfer_push_offer(
             peer = %peer_key,
             "Stored TransferPushOffer for manual pull"
         );
+        notify.emit(ControlEvent::TransferRequestPending {
+            request_id: offer.offer_id.clone(),
+            share_name: offer.share_name.clone(),
+            from_peer: peer_key,
+            direction: "push".into(),
+        });
     }
 }
 
@@ -875,24 +942,41 @@ async fn handle_chat_message(
     connections: &SharedWriters,
     peer_id: i64,
     msg: ChatMessage,
+    notify: PeerNotify,
 ) {
     let kind = msg.thread_kind;
-    let title = match kind {
-        ThreadKind::Peer => msg
-            .peer_key
-            .clone()
-            .unwrap_or_else(|| format!("{}@{}", msg.from_pc, msg.from_instance)),
-        ThreadKind::Share => msg
-            .share_name
-            .clone()
-            .unwrap_or_else(|| "share".to_string()),
-    };
-    {
+    let from_peer = format!("{}@{}", msg.from_pc, msg.from_instance);
+    let inserted = {
         let db = db.lock().await;
+        // `msg.peer_key` is the sender addressing *us*, so it must never be stored as
+        // this thread's counterpart — from here the counterpart is the sender.
+        let thread_peer_key = match kind {
+            ThreadKind::Peer => Some(from_peer.clone()),
+            ThreadKind::Share => None,
+        };
+        let peer_label = thread_peer_key.as_ref().map(|key| {
+            db.find_peer_by_key(key)
+                .ok()
+                .flatten()
+                .and_then(|p| {
+                    let d = p.display_name.trim();
+                    if d.is_empty() {
+                        None
+                    } else {
+                        Some(d.to_string())
+                    }
+                })
+                .unwrap_or_else(|| key.clone())
+        });
+        let title = models::format_chat_thread_title(
+            kind,
+            peer_label.as_deref(),
+            msg.share_name.as_deref(),
+        );
         let _ = db.ensure_chat_thread(
             &msg.thread_id,
             kind,
-            msg.peer_key.as_deref(),
+            thread_peer_key.as_deref(),
             msg.share_name.as_deref(),
             &title,
             msg.created_at,
@@ -900,7 +984,7 @@ async fn handle_chat_message(
         let record = ChatMessageRecord {
             id: msg.message_id.clone(),
             thread_id: msg.thread_id.clone(),
-            from_peer: format!("{}@{}", msg.from_pc, msg.from_instance),
+            from_peer: from_peer.clone(),
             body: msg.body.clone(),
             attachment_share: msg.attachment.as_ref().map(|a| a.share_name.clone()),
             attachment_path: msg.attachment.as_ref().map(|a| a.path.clone()),
@@ -908,18 +992,52 @@ async fn handle_chat_message(
             direction: "in".into(),
             status: "received".into(),
         };
-        let _ = db.insert_chat_message(&record, true);
+        match db.insert_chat_message(&record, true) {
+            Ok(true) => {
+                info!(
+                    thread = %msg.thread_id,
+                    from = %msg.from_pc,
+                    "Chat message received"
+                );
+                true
+            }
+            Ok(false) => {
+                debug!(
+                    message_id = %msg.message_id,
+                    "Ignoring duplicate chat message"
+                );
+                false
+            }
+            Err(e) => {
+                error!("Failed to persist chat message: {e}");
+                false
+            }
+        }
+    };
+    if inserted {
+        let preview = truncate_preview(&msg.body, 80);
+        notify.emit(ControlEvent::ChatReceived {
+            thread_id: msg.thread_id.clone(),
+            message_id: msg.message_id.clone(),
+            from_peer,
+            preview,
+        });
     }
     let ack = ChatAck {
         protocol_version: models::WIRE_PROTOCOL_VERSION,
         message_id: msg.message_id.clone(),
     };
     let _ = send_wire_to_peer(connections, peer_id, &WireMessage::ChatAck(ack)).await;
-    info!(
-        thread = %msg.thread_id,
-        from = %msg.from_pc,
-        "Chat message received"
-    );
+}
+
+fn truncate_preview(body: &str, max_chars: usize) -> String {
+    let mut chars = body.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 async fn handle_batch_message(
@@ -931,6 +1049,7 @@ async fn handle_batch_message(
     peer_id: i64,
     remote: &HelloMessage,
     batch: models::BatchManifest,
+    notify: PeerNotify,
 ) {
     let span = tracing::info_span!(
         "handle_batch",
@@ -1121,6 +1240,13 @@ async fn handle_batch_message(
             Some(batch.batch_id.clone()),
         )
         .await;
+
+        notify.emit(ControlEvent::BatchReceived {
+            batch_id: batch.batch_id.clone(),
+            share_name,
+            from_peer: peer_key,
+            change_count: batch.changes.len(),
+        });
     }
     .instrument(span)
     .await;
@@ -1211,7 +1337,7 @@ async fn handle_file_chunk_message(
     chunk: FileChunk,
     pending_files: &PendingFiles,
     fs: Arc<dyn FileSystem>,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
 ) {
     let key = (chunk.share_id, chunk.path.clone());
     let mut completed: Option<(PathBuf, PathBuf, [u8; 32], Option<[u8; 32]>)> = None;
@@ -1264,7 +1390,7 @@ async fn handle_file_chunk_message(
             }
             state.hasher.update(&chunk.data);
             state.expected_offset = chunk.offset + chunk.data.len() as u64;
-            progress.note_inbound_file(
+            notify.progress.note_inbound_file(
                 Some(&chunk.batch_id),
                 &chunk.path,
                 state.expected_offset,

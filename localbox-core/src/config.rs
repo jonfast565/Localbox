@@ -253,6 +253,11 @@ pub enum ChatCommand {
     Threads(ChatSocketArgs),
     Show(ChatShowArgs),
     Read(ChatReadArgs),
+    Rename(ChatRenameArgs),
+    /// Delete one message from a conversation.
+    DeleteMessage(ChatDeleteMessageArgs),
+    /// Delete a whole conversation (and its messages).
+    Delete(ChatDeleteThreadArgs),
 }
 
 #[derive(Debug, Args)]
@@ -291,6 +296,32 @@ pub struct ChatShowArgs {
 
 #[derive(Debug, Args)]
 pub struct ChatReadArgs {
+    #[arg(long)]
+    pub thread: String,
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ChatRenameArgs {
+    #[arg(long)]
+    pub thread: String,
+    #[arg(long)]
+    pub title: String,
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ChatDeleteMessageArgs {
+    #[arg(long)]
+    pub message: String,
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ChatDeleteThreadArgs {
     #[arg(long)]
     pub thread: String,
     #[arg(long, value_name = "PATH")]

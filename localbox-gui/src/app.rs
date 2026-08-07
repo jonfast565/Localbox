@@ -1,19 +1,26 @@
 use iced::widget::pane_grid::{self, PaneGrid};
+use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::{
     button, column, container, progress_bar, row, scrollable, text, text_input, Column, Space,
 };
-use iced::{time, Alignment, Element, Length, Padding, Subscription, Task, Theme};
+use iced::{event, time, window, Alignment, Element, Event, Length, Padding, Subscription, Task,
+    Theme};
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::theme::Colors;
+use localbox_core::ControlEvent;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::client::{self, ControlRequest, ControlResponse};
+use crate::events as control_events;
 use crate::prefs::{self, GuiPrefs, DEFAULT_LOG_TAIL_LINES};
-use crate::runtime::{ensure_runtime, stop_runtime, EnsureOpts, RuntimeHandle, RuntimeMode};
+use crate::runtime::{
+    restart_runtime, stop_managed_sync, stop_runtime, EnsureOpts, RuntimeHandle, RuntimeMode,
+};
 use crate::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +84,15 @@ pub enum Message {
     SelectChatShare(String),
     ChatBodyInput(String),
     ChatSend,
+    ChatSent(Result<ControlResponse, String>),
+    NewChat,
     SelectThread(String),
+    StartRenameChat,
+    ChatTitleInput(String),
+    SaveChatTitle,
+    CancelRenameChat,
+    DeleteChatThread,
+    DeleteChatMessage(String),
     MarkRead,
     QuarantinePeer(String),
     UnquarantinePeer(String),
@@ -93,6 +108,19 @@ pub enum Message {
     ClearFlash,
     SyncSystemTheme,
     Tick,
+    /// Last window closed — stop a managed child runtime if we own one.
+    WindowClosed,
+    WindowFocused(bool),
+    ControlEventArrived(ControlEvent),
+    DismissToast(u64),
+}
+
+#[derive(Debug, Clone)]
+struct Toast {
+    id: u64,
+    title: String,
+    body: String,
+    created: Instant,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -218,6 +246,8 @@ struct ThreadInfo {
     share_name: Option<String>,
     title: String,
     #[serde(default)]
+    title_custom: bool,
+    #[serde(default)]
     updated_at: i64,
     #[serde(default)]
     unread_count: i64,
@@ -266,6 +296,10 @@ pub struct App {
     chat_share: String,
     chat_body: String,
     selected_thread: Option<String>,
+    editing_chat_title: bool,
+    chat_title_draft: String,
+    /// After a successful send, bind the inbox thread for this peer once it appears.
+    bind_chat_peer_after_inbox: Option<String>,
     log_lines: Vec<String>,
     log_path: String,
     log_truncated: bool,
@@ -282,6 +316,11 @@ pub struct App {
     split_prefs_dirty: bool,
     /// When true, load errors from periodic polls do not spam the flash banner.
     background_refresh: bool,
+    window_focused: bool,
+    toasts: VecDeque<Toast>,
+    next_toast_id: u64,
+    /// Dedupe keys for push + poll-fallback notifications.
+    seen_notify_keys: HashSet<String>,
 }
 
 impl App {
@@ -333,6 +372,9 @@ impl App {
             chat_share: String::new(),
             chat_body: String::new(),
             selected_thread: None,
+            editing_chat_title: false,
+            chat_title_draft: String::new(),
+            bind_chat_peer_after_inbox: None,
             log_lines: Vec::new(),
             log_path: String::new(),
             log_truncated: false,
@@ -363,12 +405,50 @@ impl App {
             ),
             split_prefs_dirty: false,
             background_refresh: false,
+            window_focused: true,
+            toasts: VecDeque::new(),
+            next_toast_id: 1,
+            seen_notify_keys: HashSet::new(),
         };
         (app, Task::done(Message::Refresh))
     }
 
+    fn notify_event(&mut self, event: ControlEvent, from_poll: bool) {
+        let key = event.dedupe_key();
+        if !self.seen_notify_keys.insert(key) {
+            return;
+        }
+        // Cap memory for long sessions.
+        if self.seen_notify_keys.len() > 2000 {
+            self.seen_notify_keys.clear();
+        }
+        let title = event.title().to_string();
+        let body = event.body();
+        let id = self.next_toast_id;
+        self.next_toast_id = self.next_toast_id.saturating_add(1);
+        self.toasts.push_back(Toast {
+            id,
+            title,
+            body,
+            created: Instant::now(),
+        });
+        while self.toasts.len() > 5 {
+            self.toasts.pop_front();
+        }
+        if !self.window_focused {
+            control_events::show_os_notification(&event);
+        }
+        let _ = from_poll;
+    }
+
+    fn prune_toasts(&mut self) {
+        let ttl = Duration::from_secs(8);
+        self.toasts
+            .retain(|t| t.created.elapsed() < ttl);
+    }
+
     pub fn title(&self) -> String {
-        format!("Localbox — {}", self.socket.display())
+        format!("LocalBox — {}", self.socket.display())
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -389,21 +469,46 @@ impl App {
                 Task::none()
             }
             Message::InboxLoaded(res) => {
+                let prev_threads = self.threads.clone();
                 self.apply_result(res, |app, resp| {
                     app.threads = parse_vec(&resp);
                 });
+                if self.background_refresh {
+                    poll_notify_chat_threads(self, &prev_threads);
+                }
+                if let Some(peer) = self.bind_chat_peer_after_inbox.take() {
+                    if let Some(thread) = find_thread_for_peer(self, &peer).cloned() {
+                        apply_thread_to_composer(self, &thread);
+                        self.selected_thread = Some(thread.id);
+                        self.messages.clear();
+                        return Task::done(Message::Refresh);
+                    }
+                }
                 Task::none()
             }
             Message::PendingLoaded(res) => {
+                let prev_pending: HashSet<String> =
+                    self.pending.iter().map(|p| p.request_id.clone()).collect();
                 self.apply_result(res, |app, resp| {
                     app.pending = parse_vec(&resp);
                 });
+                if self.background_refresh {
+                    poll_notify_pending(self, &prev_pending);
+                }
                 Task::none()
             }
             Message::IntentsLoaded(res) => {
+                let prev_progress: HashSet<(String, u64, u64)> = self
+                    .intents
+                    .iter()
+                    .map(|i| (i.id.clone(), i.files_done, i.bytes_done))
+                    .collect();
                 self.apply_result(res, |app, resp| {
                     app.intents = parse_intent_rows(&resp);
                 });
+                if self.background_refresh {
+                    poll_notify_intents(self, &prev_progress);
+                }
                 Task::none()
             }
             Message::PeersLoaded(res) => {
@@ -451,6 +556,8 @@ impl App {
                     }
                     _ => {}
                 }
+                let prev_len = self.log_lines.len();
+                let prev_last = self.log_lines.last().cloned();
                 self.apply_result(res, |app, resp| {
                     if let Some(data) = &resp.data {
                         app.log_path = data
@@ -477,13 +584,33 @@ impl App {
                             .unwrap_or_default();
                     }
                 });
-                Task::none()
+                let grew = self.log_lines.len() > prev_len
+                    || self.log_lines.last() != prev_last.as_ref();
+                if grew {
+                    scrollable::scroll_to(
+                        scrollable::Id::new("engine-logs"),
+                        AbsoluteOffset { x: 0.0, y: f32::MAX },
+                    )
+                } else {
+                    Task::none()
+                }
             }
             Message::ThreadLoaded(res) => {
+                let prev_len = self.messages.len();
+                let prev_last = self.messages.last().map(|m| m.id.clone());
                 self.apply_result(res, |app, resp| {
                     app.messages = parse_vec(&resp);
                 });
-                Task::none()
+                let grew = self.messages.len() > prev_len
+                    || self.messages.last().map(|m| &m.id) != prev_last.as_ref();
+                if grew && self.selected_thread.is_some() {
+                    scrollable::scroll_to(
+                        scrollable::Id::new("chat-messages"),
+                        AbsoluteOffset { x: 0.0, y: f32::MAX },
+                    )
+                } else {
+                    Task::none()
+                }
             }
             Message::ActionDone(res) => {
                 match res {
@@ -497,6 +624,20 @@ impl App {
                             && (resp.message.starts_with("set ") || resp.message.starts_with("unset "))
                         {
                             self.config_value.clear();
+                        }
+                        if resp.ok && resp.message.starts_with("deleted thread ") {
+                            self.selected_thread = None;
+                            self.messages.clear();
+                            self.chat_peer.clear();
+                            self.chat_share.clear();
+                            self.editing_chat_title = false;
+                            self.chat_title_draft.clear();
+                        }
+                        if !resp.ok {
+                            if let Some(msg) = stale_runtime_message(&resp.message) {
+                                self.flash = Some((false, msg));
+                                return Task::done(Message::Refresh);
+                            }
                         }
                         self.flash = Some((resp.ok, resp.message));
                     }
@@ -603,52 +744,146 @@ impl App {
             }),
             Message::SelectChatPeer(s) => {
                 self.chat_peer = s;
-                self.chat_share.clear();
-                Task::none()
+                self.editing_chat_title = false;
+                self.chat_title_draft.clear();
+                if let Some(thread) = find_thread_for_peer(self, &self.chat_peer).cloned() {
+                    apply_thread_to_composer(self, &thread);
+                    self.selected_thread = Some(thread.id);
+                    self.messages.clear();
+                    Task::done(Message::Refresh)
+                } else {
+                    // New DM to this peer — keep optional share the user already picked.
+                    self.selected_thread = None;
+                    self.messages.clear();
+                    Task::none()
+                }
             }
             Message::SelectChatShare(s) => {
                 self.chat_share = s;
-                self.chat_peer.clear();
                 Task::none()
             }
             Message::ChatBodyInput(s) => {
                 self.chat_body = s;
                 Task::none()
             }
+            Message::NewChat => {
+                self.selected_thread = None;
+                self.messages.clear();
+                self.chat_peer.clear();
+                self.chat_share.clear();
+                self.chat_body.clear();
+                self.editing_chat_title = false;
+                self.chat_title_draft.clear();
+                Task::none()
+            }
             Message::ChatSend => {
+                if self.chat_peer.trim().is_empty() {
+                    self.flash = Some((false, "select a peer in To to send a chat message".into()));
+                    return Task::none();
+                }
+                if self.chat_body.trim().is_empty() {
+                    return Task::none();
+                }
+                // Keep an explicit thread id only for peer DMs; share-thread ids
+                // must not override a peer-targeted send.
+                let thread = self.selected_thread.clone().filter(|id| {
+                    self.threads
+                        .iter()
+                        .any(|t| &t.id == id && t.kind != "share")
+                });
                 let req = ControlRequest::ChatSend {
                     peer: nonempty(&self.chat_peer),
                     share: nonempty(&self.chat_share),
-                    thread: self.selected_thread.clone(),
+                    thread,
                     message: nonempty(&self.chat_body),
                     file: None,
                     share_dest: None,
                 };
                 self.chat_body.clear();
-                self.transfer_action(req)
+                let sock = self.socket.clone();
+                Task::perform(
+                    async move {
+                        client::send_request(&sock, &req)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    Message::ChatSent,
+                )
+            }
+            Message::ChatSent(res) => match res {
+                Ok(resp) if resp.ok => {
+                    self.connected = true;
+                    self.bind_chat_peer_after_inbox = Some(self.chat_peer.clone());
+                    self.background_refresh = true;
+                    Task::batch([
+                        self.refresh_tasks(),
+                        scrollable::scroll_to(
+                            scrollable::Id::new("chat-messages"),
+                            AbsoluteOffset { x: 0.0, y: f32::MAX },
+                        ),
+                    ])
+                }
+                Ok(resp) => {
+                    self.connected = true;
+                    self.flash = Some((false, resp.message));
+                    Task::none()
+                }
+                Err(e) => {
+                    self.connected = false;
+                    self.flash = Some((false, disconnect_message(&e, self.managed_runtime)));
+                    Task::none()
+                }
             }
             Message::SelectThread(id) => {
-                if let Some(thread) = self.threads.iter().find(|t| t.id == id) {
-                    match thread.kind.as_str() {
-                        "share" => {
-                            self.chat_peer.clear();
-                            self.chat_share = thread
-                                .share_name
-                                .clone()
-                                .unwrap_or_else(|| thread.title.clone());
-                        }
-                        _ => {
-                            self.chat_share.clear();
-                            self.chat_peer = thread
-                                .peer_key
-                                .clone()
-                                .unwrap_or_else(|| thread.title.clone());
-                        }
-                    }
+                if let Some(thread) = self.threads.iter().find(|t| t.id == id).cloned() {
+                    apply_thread_to_composer(self, &thread);
                 }
                 self.selected_thread = Some(id);
                 self.messages.clear();
+                self.editing_chat_title = false;
+                self.chat_title_draft.clear();
                 Task::done(Message::Refresh)
+            }
+            Message::StartRenameChat => {
+                if let Some(thread) = self
+                    .selected_thread
+                    .as_ref()
+                    .and_then(|id| self.threads.iter().find(|t| &t.id == id))
+                {
+                    self.chat_title_draft = thread.title.clone();
+                    self.editing_chat_title = true;
+                }
+                Task::none()
+            }
+            Message::ChatTitleInput(s) => {
+                self.chat_title_draft = s;
+                Task::none()
+            }
+            Message::CancelRenameChat => {
+                self.editing_chat_title = false;
+                self.chat_title_draft.clear();
+                Task::none()
+            }
+            Message::SaveChatTitle => {
+                let Some(thread) = self.selected_thread.clone() else {
+                    return Task::none();
+                };
+                let title = self.chat_title_draft.trim().to_string();
+                if title.is_empty() {
+                    return Task::none();
+                }
+                self.editing_chat_title = false;
+                self.transfer_action(ControlRequest::ChatRename { thread, title })
+            }
+            Message::DeleteChatThread => {
+                if let Some(thread) = self.selected_thread.clone() {
+                    self.transfer_action(ControlRequest::ChatDeleteThread { thread })
+                } else {
+                    Task::none()
+                }
+            }
+            Message::DeleteChatMessage(message) => {
+                self.transfer_action(ControlRequest::ChatDeleteMessage { message })
             }
             Message::MarkRead => {
                 if let Some(tid) = self.selected_thread.clone() {
@@ -684,7 +919,9 @@ impl App {
                             let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
                             guard.take();
                         }
-                        let handle = ensure_runtime(opts).await.map_err(|e| e.to_string())?;
+                        // Replace any daemon still on the socket so Start picks up a newly
+                        // built localbox-core instead of re-attaching to a stale process.
+                        let handle = restart_runtime(opts).await.map_err(|e| e.to_string())?;
                         let label = handle.label().to_string();
                         let managed = handle.mode == RuntimeMode::Managed;
                         let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -825,6 +1062,7 @@ impl App {
                 Task::none()
             }
             Message::Tick => {
+                self.prune_toasts();
                 if self.split_prefs_dirty {
                     if self.persist_prefs().is_ok() {
                         self.split_prefs_dirty = false;
@@ -846,6 +1084,35 @@ impl App {
                 }
                 Task::none()
             }
+            Message::WindowFocused(focused) => {
+                self.window_focused = focused;
+                Task::none()
+            }
+            Message::ControlEventArrived(event) => {
+                self.notify_event(event, false);
+                self.background_refresh = true;
+                self.refresh_tasks()
+            }
+            Message::DismissToast(id) => {
+                self.toasts.retain(|t| t.id != id);
+                Task::none()
+            }
+            Message::WindowClosed => {
+                // Tear down a GUI-spawned child immediately on window close.
+                let mut guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(mut handle) = guard.take() {
+                    if handle.mode == RuntimeMode::Managed {
+                        stop_managed_sync(&mut handle);
+                        self.managed_runtime = false;
+                        self.connected = false;
+                        self.runtime_label = "stopped".into();
+                    } else {
+                        // Keep attached handle for main()'s post-run cleanup path.
+                        *guard = Some(handle);
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -853,6 +1120,17 @@ impl App {
         Subscription::batch([
             time::every(Duration::from_secs(2)).map(|_| Message::SyncSystemTheme),
             time::every(Duration::from_secs(2)).map(|_| Message::Tick),
+            window::close_events().map(|_| Message::WindowClosed),
+            event::listen_with(|event, _status, _id| match event {
+                Event::Window(window::Event::Focused) => Some(Message::WindowFocused(true)),
+                Event::Window(window::Event::Unfocused) => Some(Message::WindowFocused(false)),
+                _ => None,
+            }),
+            Subscription::run_with_id(
+                self.socket.clone(),
+                control_events::subscription(self.socket.clone()),
+            )
+            .map(Message::ControlEventArrived),
         ])
     }
 
@@ -1085,7 +1363,7 @@ impl App {
 
         let header = row![
             column![
-                text("Localbox").size(26).color(c.accent),
+                text("LocalBox").size(26).color(c.accent),
                 text(format!(
                     "{} · runtime {}",
                     self.socket.display(),
@@ -1134,6 +1412,31 @@ impl App {
             .style(theme::badge_style(color))
         });
 
+        let mut toast_col: Column<'_, Message> = column![].spacing(6);
+        for toast in self.toasts.iter().rev().take(3) {
+            toast_col = toast_col.push(
+                container(
+                    row![
+                        column![
+                            text(&toast.title).size(13).color(c.text),
+                            text(&toast.body).size(12).color(c.muted),
+                        ]
+                        .spacing(2)
+                        .width(Length::Fill),
+                        button(text("Dismiss").size(11))
+                            .padding([4, 8])
+                            .style(theme::btn_ghost)
+                            .on_press(Message::DismissToast(toast.id)),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                )
+                .padding([10, 14])
+                .width(Length::Fill)
+                .style(theme::card_style),
+            );
+        }
+
         let body: Element<'_, Message> = match self.tab {
             Tab::Status => status_view(self),
             Tab::Transfers => transfers_view(self),
@@ -1145,6 +1448,9 @@ impl App {
         let mut content = column![header, tabs].spacing(10);
         if let Some(banner) = flash {
             content = content.push(banner);
+        }
+        if !self.toasts.is_empty() {
+            content = content.push(toast_col);
         }
         content = content.push(body);
 
@@ -1378,7 +1684,15 @@ fn transfers_intents_body(app: &App) -> Element<'_, Message> {
 
 fn chat_inbox_body(app: &App) -> Element<'_, Message> {
     let c = app.colors();
-    let mut inbox_col: Column<'_, Message> = column![section_title("Inbox", c)].spacing(6);
+    let mut inbox_col: Column<'_, Message> = column![
+        row![
+            section_title("Messages", c),
+            Space::with_width(Length::Fill),
+            styled_button("New message", Message::NewChat, theme::btn_ghost),
+        ]
+        .align_y(Alignment::Center),
+    ]
+    .spacing(6);
     if app.threads.is_empty() {
         inbox_col = inbox_col.push(empty_state("No conversations yet.", c));
     } else {
@@ -1392,66 +1706,240 @@ fn chat_inbox_body(app: &App) -> Element<'_, Message> {
 
 fn chat_thread_body(app: &App) -> Element<'_, Message> {
     let c = app.colors();
-    let title = app
+    let composing_new = app.selected_thread.is_none();
+    let selected = app
         .selected_thread
         .as_ref()
-        .and_then(|id| app.threads.iter().find(|t| &t.id == id))
-        .map(|t| t.title.clone())
-        .unwrap_or_else(|| "Select a thread".into());
+        .and_then(|id| app.threads.iter().find(|t| &t.id == id));
+
+    let header: Element<'_, Message> = if composing_new {
+        column![
+            text("New message").size(18).color(c.text),
+            text("Choose who to message, then write below.")
+                .size(12)
+                .color(c.muted),
+        ]
+        .spacing(4)
+        .into()
+    } else if app.editing_chat_title {
+        let placeholder = if selected.map(|t| t.title_custom).unwrap_or(false) {
+            "Custom name"
+        } else {
+            "Conversation name"
+        };
+        column![
+            text("Rename conversation").size(12).color(c.muted),
+            row![
+                text_input(placeholder, &app.chat_title_draft)
+                    .on_input(Message::ChatTitleInput)
+                    .on_submit(Message::SaveChatTitle)
+                    .padding(8)
+                    .width(Length::Fill)
+                    .style(theme::input_style),
+                styled_button("Save", Message::SaveChatTitle, theme::btn_primary),
+                styled_button("Cancel", Message::CancelRenameChat, theme::btn_ghost),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(6)
+        .into()
+    } else {
+        let title = selected
+            .map(|t| t.title.as_str())
+            .unwrap_or("Conversation");
+        let subtitle = selected
+            .map(thread_subtitle)
+            .unwrap_or_default();
+        let mut actions = row![].spacing(8).align_y(Alignment::Center);
+        actions = actions.push(styled_button(
+            "Rename",
+            Message::StartRenameChat,
+            theme::btn_ghost,
+        ));
+        actions = actions.push(styled_button(
+            "Mark read",
+            Message::MarkRead,
+            theme::btn_ghost,
+        ));
+        actions = actions.push(styled_button(
+            "Delete",
+            Message::DeleteChatThread,
+            theme::btn_danger,
+        ));
+        column![
+            row![
+                text(title).size(18).color(c.text),
+                Space::with_width(Length::Fill),
+                actions,
+            ]
+            .align_y(Alignment::Center),
+            text(subtitle).size(12).color(c.muted),
+        ]
+        .spacing(4)
+        .into()
+    };
+
+    let mut body_col: Column<'_, Message> = column![header].spacing(10);
+
+    if composing_new {
+        let to_summary = chat_to_summary(app);
+        body_col = body_col.push(
+            container(
+                column![
+                    text("To").size(12).color(c.muted),
+                    picker_row(
+                        "Peer",
+                        &app.chat_peer,
+                        peer_picker_options(app),
+                        Message::SelectChatPeer,
+                        c,
+                    ),
+                    picker_row(
+                        "Share (optional)",
+                        &app.chat_share,
+                        share_picker_options(app),
+                        Message::SelectChatShare,
+                        c,
+                    ),
+                    text(to_summary).size(12).color(c.muted),
+                ]
+                .spacing(8),
+            )
+            .padding(12)
+            .width(Length::Fill)
+            .style(theme::card_style),
+        );
+    }
 
     let mut messages_col: Column<'_, Message> = column![].spacing(8);
-    if app.selected_thread.is_none() {
-        messages_col = messages_col.push(empty_state("Choose a thread from the inbox.", c));
+    if composing_new && app.chat_peer.trim().is_empty() {
+        messages_col = messages_col.push(empty_state(
+            "Pick a peer under To to start a DM, or open a conversation from the sidebar.",
+            c,
+        ));
+    } else if composing_new {
+        messages_col = messages_col.push(empty_state(
+            "Send a message to start this conversation.",
+            c,
+        ));
     } else if app.messages.is_empty() {
-        messages_col = messages_col.push(empty_state("No messages in this thread.", c));
+        messages_col = messages_col.push(empty_state("No messages yet. Say hello.", c));
     } else {
         for msg in &app.messages {
-            messages_col = messages_col.push(message_bubble(msg, c));
+            messages_col = messages_col.push(message_bubble(msg, app, c));
         }
     }
 
-    let composer = column![
-        picker_row(
-            "Peer DM",
-            &app.chat_peer,
-            peer_picker_options(app),
-            Message::SelectChatPeer,
-            c,
+    // Nothing to send to until the user picks a peer or opens an existing thread.
+    let can_compose = !app.chat_peer.trim().is_empty() || app.selected_thread.is_some();
+    let placeholder = if can_compose {
+        "Message…"
+    } else {
+        "Select a peer or conversation first"
+    };
+    let mut input = text_input(placeholder, &app.chat_body)
+        .padding(10)
+        .width(Length::Fill)
+        .style(theme::input_style);
+    if can_compose {
+        input = input
+            .on_input(Message::ChatBodyInput)
+            .on_submit(Message::ChatSend);
+    }
+    let composer = row![
+        input,
+        styled_button_maybe(
+            "Send",
+            can_compose.then_some(Message::ChatSend),
+            theme::btn_primary,
         ),
-        picker_row(
-            "Share thread",
-            &app.chat_share,
-            share_picker_options(app),
-            Message::SelectChatShare,
-            c,
-        ),
-        row![
-            text_input("Write a message…", &app.chat_body)
-                .on_input(Message::ChatBodyInput)
-                .padding(10)
-                .width(Length::Fill)
-                .style(theme::input_style),
-            styled_button("Send", Message::ChatSend, theme::btn_primary),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
     ]
-    .spacing(8);
+    .spacing(8)
+    .align_y(Alignment::Center);
 
-    column![
-        row![
-            text(title).size(16).color(c.text),
-            Space::with_width(Length::Fill),
-            styled_button("Mark read", Message::MarkRead, theme::btn_ghost),
-        ]
-        .align_y(Alignment::Center),
-        scrollable(messages_col).height(Length::Fill),
-        composer,
-    ]
-    .spacing(10)
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .into()
+    body_col = body_col
+        .push(
+            scrollable(messages_col)
+                .id(scrollable::Id::new("chat-messages"))
+                .anchor_bottom()
+                .height(Length::Fill),
+        )
+        .push(composer);
+
+    body_col
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+fn chat_to_summary(app: &App) -> String {
+    let peer = app.chat_peer.trim();
+    let share = app.chat_share.trim();
+    match (peer.is_empty(), share.is_empty()) {
+        (true, _) => "Choose a peer to message.".into(),
+        (false, true) => {
+            if app.selected_thread.is_some() {
+                format!("Opening conversation with {peer}")
+            } else {
+                format!("New conversation with {peer}")
+            }
+        }
+        (false, false) => {
+            if app.selected_thread.is_some() {
+                format!("Opening conversation with {peer} · #{share}")
+            } else {
+                format!("New conversation with {peer} · #{share}")
+            }
+        }
+    }
+}
+
+fn thread_subtitle(thread: &ThreadInfo) -> String {
+    match (thread.kind.as_str(), &thread.peer_key, &thread.share_name) {
+        ("share", _, Some(s)) => format!("#{s}"),
+        (_, Some(p), Some(s)) => format!("{p} · #{s}"),
+        (_, Some(p), None) => p.clone(),
+        (_, None, Some(s)) => format!("#{s}"),
+        _ => thread.kind.clone(),
+    }
+}
+
+fn apply_thread_to_composer(app: &mut App, thread: &ThreadInfo) {
+    match thread.kind.as_str() {
+        "share" => {
+            app.chat_peer.clear();
+            app.chat_share = thread
+                .share_name
+                .clone()
+                .unwrap_or_else(|| thread.title.clone());
+        }
+        _ => {
+            app.chat_peer = thread.peer_key.clone().unwrap_or_default();
+            app.chat_share = thread.share_name.clone().unwrap_or_default();
+        }
+    }
+}
+
+fn find_thread_for_peer<'a>(app: &'a App, peer_key: &str) -> Option<&'a ThreadInfo> {
+    let peer_key = peer_key.trim();
+    if peer_key.is_empty() {
+        return None;
+    }
+    app.threads.iter().find(|t| {
+        t.kind != "share" && t.peer_key.as_deref() == Some(peer_key)
+    })
+}
+
+fn peer_display_label(app: &App, peer_key: &str) -> String {
+    let peer_key = peer_key.trim();
+    if let Some(peer) = app.peers.iter().find(|p| p.peer_key() == peer_key) {
+        return peer.label();
+    }
+    peer_key
+        .split_once('@')
+        .map(|(pc, _)| pc.to_string())
+        .unwrap_or_else(|| peer_key.to_string())
 }
 
 fn logs_view(app: &App) -> Element<'_, Message> {
@@ -1503,7 +1991,13 @@ fn logs_view(app: &App) -> Element<'_, Message> {
         ]
         .spacing(12)
         .align_y(Alignment::End),
-        panel(scrollable(lines_col).height(Length::Fill), Length::Fill),
+        panel(
+            scrollable(lines_col)
+                .id(scrollable::Id::new("engine-logs"))
+                .anchor_bottom()
+                .height(Length::Fill),
+            Length::Fill,
+        ),
     ]
     .spacing(10)
     .height(Length::Fill)
@@ -1792,14 +2286,9 @@ fn intent_card<'a>(intent: &'a IntentRow, c: &'a Colors) -> Element<'a, Message>
 }
 
 fn thread_item<'a>(thread: &'a ThreadInfo, selected: bool, c: &'a Colors) -> Element<'a, Message> {
-    let subtitle = match (&thread.peer_key, &thread.share_name) {
-        (Some(p), Some(s)) => format!("{p} · {s}"),
-        (Some(p), None) => p.clone(),
-        (None, Some(s)) => format!("share {s}"),
-        _ => thread.kind.clone(),
-    };
+    let subtitle = thread_subtitle(thread);
     let unread = if thread.unread_count > 0 {
-        format!(" · {}", thread.unread_count)
+        format!(" ({})", thread.unread_count)
     } else {
         String::new()
     };
@@ -1824,15 +2313,16 @@ fn thread_item<'a>(thread: &'a ThreadInfo, selected: bool, c: &'a Colors) -> Ele
     .into()
 }
 
-fn message_bubble<'a>(msg: &'a ChatMsg, c: &'a Colors) -> Element<'a, Message> {
+fn message_bubble<'a>(msg: &'a ChatMsg, app: &'a App, c: &'a Colors) -> Element<'a, Message> {
     let outgoing = msg.direction == "out";
     let align = if outgoing {
         Alignment::End
     } else {
         Alignment::Start
     };
+    let from_label = peer_display_label(app, &msg.from_peer);
     let mut body = column![
-        text(&msg.from_peer).size(11).color(c.muted),
+        text(from_label).size(11).color(c.muted),
         text(&msg.body).size(14).color(c.text),
     ]
     .spacing(4);
@@ -1845,15 +2335,22 @@ fn message_bubble<'a>(msg: &'a ChatMsg, c: &'a Colors) -> Element<'a, Message> {
         );
     }
 
+    let meta = if outgoing {
+        format!("{} · {}", format_ts(msg.created_at), chat_delivery_label(&msg.status))
+    } else {
+        format_ts(msg.created_at)
+    };
     body = body.push(
-        text(format!(
-            "{} · {} · {}",
-            short_id(&msg.id),
-            format_ts(msg.created_at),
-            msg.status
-        ))
-        .size(10)
-        .color(c.muted),
+        row![
+            text(meta).size(10).color(c.muted),
+            Space::with_width(Length::Fill),
+            button(text("Delete").size(10).color(c.danger))
+                .padding(Padding::from([2, 6]))
+                .style(theme::btn_ghost)
+                .on_press(Message::DeleteChatMessage(msg.id.clone())),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
     );
 
     let bubble = container(body)
@@ -1865,6 +2362,15 @@ fn message_bubble<'a>(msg: &'a ChatMsg, c: &'a Colors) -> Element<'a, Message> {
         .width(Length::Fill)
         .align_x(align)
         .into()
+}
+
+fn chat_delivery_label(status: &str) -> &'static str {
+    match status {
+        "acked" | "delivered" => "Delivered",
+        "read" => "Read",
+        "failed" | "error" => "Failed",
+        _ => "Sent",
+    }
 }
 
 fn metric_card<'a>(label: &'a str, value: String, c: &'a Colors) -> Element<'a, Message> {
@@ -2041,10 +2547,19 @@ fn styled_button<'a>(
     msg: Message,
     style: impl Fn(&Theme, button::Status) -> button::Style + 'a,
 ) -> Element<'a, Message> {
+    styled_button_maybe(label, Some(msg), style)
+}
+
+/// Same as [`styled_button`] but renders disabled when `msg` is `None`.
+fn styled_button_maybe<'a>(
+    label: &'a str,
+    msg: Option<Message>,
+    style: impl Fn(&Theme, button::Status) -> button::Style + 'a,
+) -> Element<'a, Message> {
     button(text(label).size(13))
         .padding([8, 14])
         .style(style)
-        .on_press(msg)
+        .on_press_maybe(msg)
         .into()
 }
 
@@ -2189,5 +2704,107 @@ fn disconnect_message(err: &str, managed: bool) -> String {
         format!("Disconnected from managed runtime: {err}")
     } else {
         format!("Disconnected: {err}")
+    }
+}
+
+fn poll_notify_chat_threads(app: &mut App, prev: &[ThreadInfo]) {
+    for thread in &app.threads.clone() {
+        if thread.unread_count <= 0 {
+            continue;
+        }
+        if app.selected_thread.as_deref() == Some(thread.id.as_str()) {
+            continue;
+        }
+        let prev_unread = prev
+            .iter()
+            .find(|t| t.id == thread.id)
+            .map(|t| t.unread_count)
+            .unwrap_or(0);
+        if thread.unread_count <= prev_unread {
+            continue;
+        }
+        let from = thread
+            .peer_key
+            .clone()
+            .unwrap_or_else(|| thread.title.clone());
+        app.notify_event(
+            ControlEvent::ChatReceived {
+                thread_id: thread.id.clone(),
+                message_id: format!("poll:{}:{}", thread.id, thread.updated_at),
+                from_peer: from,
+                preview: thread.title.clone(),
+            },
+            true,
+        );
+    }
+}
+
+fn poll_notify_pending(app: &mut App, prev_ids: &HashSet<String>) {
+    for req in app.pending.clone() {
+        if prev_ids.contains(&req.request_id) {
+            continue;
+        }
+        app.notify_event(
+            ControlEvent::TransferRequestPending {
+                request_id: req.request_id.clone(),
+                share_name: req.share_name.clone(),
+                from_peer: format!("{}@{}", req.from_pc, req.from_instance),
+                direction: if req.direction.is_empty() {
+                    "in".into()
+                } else {
+                    req.direction.clone()
+                },
+            },
+            true,
+        );
+    }
+}
+
+fn poll_notify_intents(app: &mut App, prev: &HashSet<(String, u64, u64)>) {
+    for intent in app.intents.clone() {
+        let key = (intent.id.clone(), intent.files_done, intent.bytes_done);
+        if prev.contains(&key) {
+            continue;
+        }
+        let grew = prev
+            .iter()
+            .find(|(id, _, _)| id == &intent.id)
+            .map(|(_, files, bytes)| intent.files_done > *files || intent.bytes_done > *bytes)
+            .unwrap_or(intent.files_done > 0 || intent.bytes_done > 0);
+        if !grew {
+            continue;
+        }
+        app.notify_event(
+            ControlEvent::BatchReceived {
+                batch_id: format!("poll-intent:{}:{}:{}", intent.id, intent.files_done, intent.bytes_done),
+                share_name: intent.share.clone(),
+                from_peer: intent.kind.clone(),
+                change_count: intent.files_done as usize,
+            },
+            true,
+        );
+    }
+}
+
+/// Serde rejects new control cmds when the running daemon binary is older than the GUI.
+fn stale_runtime_message(err: &str) -> Option<String> {
+    let lower = err.to_ascii_lowercase();
+    let unknown = lower.contains("unknown variant")
+        || lower.contains("unknown message")
+        || lower.contains("invalid request");
+    if !unknown {
+        return None;
+    }
+    if lower.contains("chat_delete")
+        || lower.contains("chat_rename")
+        || lower.contains("\"logs\"")
+        || lower.contains("`logs`")
+    {
+        Some(
+            "Runtime is too old for this action — Stop, then Start (rebuild localbox-core if needed)."
+                .into(),
+        )
+    } else {
+        None
     }
 }

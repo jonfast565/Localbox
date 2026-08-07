@@ -35,6 +35,79 @@ Yb,_,d88b,,_   ,d8,   ,d8',d8,_    _,d8,   ,d8b,,d8b,_      88_____,d8',d8,   ,d
 
 const SEPARATOR: &str = r#"------------------------------------------------------------------------------------------------"#;
 
+/// Set by a supervising process (the GUI) to the pid it wants this daemon tied to.
+pub const PARENT_PID_ENV: &str = "LOCALBOX_PARENT_PID";
+
+const PARENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Cancel `token` once the process named by [`PARENT_PID_ENV`] is gone.
+///
+/// A supervisor's own teardown is best-effort: on macOS the GUI event loop can tear
+/// down without running its exit path, and a crash or `SIGKILL` never runs one at all.
+/// Without this, the daemon outlives its GUI as an orphan still writing to whatever
+/// terminal launched it. No env var means no supervisor, so the watchdog stays off.
+fn spawn_parent_watchdog(token: CancellationToken) {
+    let Ok(raw) = std::env::var(PARENT_PID_ENV) else {
+        return;
+    };
+    let Ok(parent_pid) = raw.trim().parse::<u32>() else {
+        warn!("Ignoring invalid {PARENT_PID_ENV}={raw}");
+        return;
+    };
+
+    // Being a direct child is the exact signal (reparenting can't false-positive the
+    // way a recycled pid can), so only fall back to liveness when we are not one.
+    let direct_child = current_parent_pid() == Some(parent_pid);
+    let orphaned = move || match current_parent_pid() {
+        Some(current) if direct_child => current != parent_pid,
+        _ => !process_alive(parent_pid),
+    };
+
+    tokio::spawn(async move {
+        let mut ticker = interval(PARENT_POLL_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = ticker.tick() => {
+                    if orphaned() {
+                        info!(parent_pid, "Supervising process exited; shutting down");
+                        token.cancel();
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn current_parent_pid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        Some(std::os::unix::process::parent_id())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // Signal 0 only runs the permission/existence checks. EPERM means it exists
+        // but belongs to someone else; only ESRCH means it is really gone.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 pub struct Engine {
     cfg: AppConfig,
     db: Arc<Mutex<Db>>,
@@ -82,6 +155,13 @@ impl Engine {
         for sc in &shares {
             seed_journal_from_index(&mut db_raw, sc, &fs, workdir.as_deref())?;
         }
+        let local_key = models::peer_key(&cfg.pc_name, &cfg.instance_id);
+        match db_raw.repair_self_keyed_peer_threads(&local_key) {
+            Ok(n) if n > 0 => info!(threads = n, "Repaired peer DMs keyed to this node"),
+            Ok(_) => {}
+            Err(e) => warn!("Could not repair self-keyed peer DMs: {e}"),
+        }
+
         let db = Arc::new(Mutex::new(db_raw));
         info!("Engine starting up");
         for sc in &shares {
@@ -206,6 +286,8 @@ impl Engine {
     ) -> Result<()> {
         info!("Engine running");
 
+        spawn_parent_watchdog(token.clone());
+
         self.start_watchers(token.clone());
 
         if let Some(rx) = self.change_rx.take() {
@@ -213,14 +295,15 @@ impl Engine {
         }
 
         let progress = models::TransferProgressRegistry::new();
-        let peer_mgr = PeerManager::with_progress(
+        let (event_tx, _) = tokio::sync::broadcast::channel::<models::ControlEvent>(256);
+        let peer_mgr = PeerManager::with_notify(
             self.cfg.clone(),
             Arc::clone(&self.db),
             self.net_tx.clone(),
             self.shares.clone(),
             self.fs.clone(),
             self.net.clone(),
-            Arc::clone(&progress),
+            peering::PeerNotify::from_parts(Arc::clone(&progress), event_tx.clone()),
         )?;
 
         let cleanup_task = tokio::spawn(cleanup_old_batches_task(
@@ -252,6 +335,7 @@ impl Engine {
                 let db = Arc::clone(&self.db);
                 let net_tx = self.net_tx.clone();
                 let progress = Arc::clone(&progress);
+                let events = event_tx.clone();
                 let share_hooks = share_hooks.clone();
                 let token = token.clone();
                 Some(tokio::spawn(async move {
@@ -261,6 +345,7 @@ impl Engine {
                         net_tx,
                         cmd_tx,
                         progress,
+                        events,
                         Some(share_hooks),
                         token,
                     )
@@ -282,6 +367,7 @@ impl Engine {
                 let db = Arc::clone(&self.db);
                 let net_tx = self.net_tx.clone();
                 let progress = Arc::clone(&progress);
+                let events = event_tx.clone();
                 let share_hooks = share_hooks.clone();
                 let token = token.clone();
                 Some(tokio::spawn(async move {
@@ -291,6 +377,7 @@ impl Engine {
                         net_tx,
                         cmd_tx,
                         progress,
+                        events,
                         Some(share_hooks),
                         token,
                     )

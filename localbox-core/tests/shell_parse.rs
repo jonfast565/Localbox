@@ -27,6 +27,33 @@ fn parses_push_and_chat() {
 }
 
 #[test]
+fn parses_chat_rename() {
+    let req = parse_repl_to_request("chat rename --thread abc --title \"Project chat\"").unwrap();
+    match req {
+        ControlRequest::ChatRename { thread, title } => {
+            assert_eq!(thread, "abc");
+            assert_eq!(title, "Project chat");
+        }
+        _ => panic!("expected chat rename"),
+    }
+}
+
+#[test]
+fn parses_chat_delete() {
+    let req = parse_repl_to_request("chat delete --thread abc").unwrap();
+    match req {
+        ControlRequest::ChatDeleteThread { thread } => assert_eq!(thread, "abc"),
+        _ => panic!("expected chat delete thread"),
+    }
+
+    let req = parse_repl_to_request("chat delete-message --message mid").unwrap();
+    match req {
+        ControlRequest::ChatDeleteMessage { message } => assert_eq!(message, "mid"),
+        _ => panic!("expected chat delete message"),
+    }
+}
+
+#[test]
 fn push_requires_a_share() {
     assert!(parse_repl_to_request("push --peer bob").is_err());
 }

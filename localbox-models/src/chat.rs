@@ -54,6 +54,32 @@ pub fn share_thread_id(share_name: &str) -> String {
     Uuid::new_v5(&ns, format!("share:{share_name}").as_bytes()).to_string()
 }
 
+/// Slack-style conversation title: DM name, optional `· #share`, or `#channel`.
+pub fn format_chat_thread_title(
+    kind: ThreadKind,
+    peer_label: Option<&str>,
+    share_name: Option<&str>,
+) -> String {
+    let share = share_name.map(str::trim).filter(|s| !s.is_empty());
+    let peer = peer_label.map(str::trim).filter(|s| !s.is_empty());
+    let channel = |name: &str| {
+        if name.starts_with('#') {
+            name.to_string()
+        } else {
+            format!("#{name}")
+        }
+    };
+    match kind {
+        ThreadKind::Share => channel(share.unwrap_or("share")),
+        ThreadKind::Peer => match (peer, share) {
+            (Some(p), Some(s)) => format!("{p} · {}", channel(s)),
+            (Some(p), None) => p.to_string(),
+            (None, Some(s)) => channel(s),
+            (None, None) => "Direct message".into(),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatAttachment {
     pub share_name: String,
@@ -93,6 +119,9 @@ pub struct ThreadSummary {
     pub peer_key: Option<String>,
     pub share_name: Option<String>,
     pub title: String,
+    /// When true, auto-refresh must not overwrite `title`.
+    #[serde(default)]
+    pub title_custom: bool,
     pub updated_at: i64,
     pub unread_count: i64,
 }

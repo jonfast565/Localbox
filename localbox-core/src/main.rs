@@ -1257,5 +1257,54 @@ async fn handle_chat_command(
                 Err(anyhow::anyhow!(resp.message))
             }
         }
+        ChatCommand::Rename(a) => {
+            let sock = resolve_control_socket(cli, a.socket.clone())?;
+            let resp = send_control_request(
+                &sock,
+                &ControlRequest::ChatRename {
+                    thread: a.thread.clone(),
+                    title: a.title.clone(),
+                },
+            )
+            .await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
+            }
+        }
+        ChatCommand::DeleteMessage(a) => {
+            let sock = resolve_control_socket(cli, a.socket.clone())?;
+            let resp = send_control_request(
+                &sock,
+                &ControlRequest::ChatDeleteMessage {
+                    message: a.message.clone(),
+                },
+            )
+            .await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
+            }
+        }
+        ChatCommand::Delete(a) => {
+            let sock = resolve_control_socket(cli, a.socket.clone())?;
+            let resp = send_control_request(
+                &sock,
+                &ControlRequest::ChatDeleteThread {
+                    thread: a.thread.clone(),
+                },
+            )
+            .await?;
+            print_control_resp(&resp);
+            if resp.ok {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(resp.message))
+            }
+        }
     }
 }

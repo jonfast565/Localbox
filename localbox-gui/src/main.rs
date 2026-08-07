@@ -1,5 +1,6 @@
 mod app;
 mod client;
+mod events;
 mod prefs;
 mod runtime;
 mod theme;
@@ -9,7 +10,10 @@ use iced::Size;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use runtime::{default_control_socket, ensure_runtime, resolve_socket, EnsureOpts, RuntimeHandle};
+use runtime::{
+    default_control_socket, ensure_runtime, resolve_socket, stop_runtime, EnsureOpts, RuntimeHandle,
+    RuntimeMode,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "localbox-gui", about = "Localbox desktop control UI")]
@@ -77,6 +81,16 @@ fn main() -> iced::Result {
         .window_size(Size::new(780.0, 620.0))
         .run_with(move || app::App::new(socket, ensure_opts, runtime_for_app));
 
-    drop(runtime);
+    // Window close / process exit: stop a GUI-spawned child runtime.
+    // Attached daemons are left running.
+    if let Some(mut handle) = runtime
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        if handle.mode == RuntimeMode::Managed {
+            let _ = rt.block_on(stop_runtime(&mut handle));
+        }
+    }
     result
 }

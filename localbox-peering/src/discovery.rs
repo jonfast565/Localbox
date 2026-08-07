@@ -1,14 +1,15 @@
 use irontide_utp::UtpSocket;
-use models::{encode_discovery_shares, escape_discovery_value, AdvertisedShare, AppConfig, ShareContext, TransferProgressRegistry};
+use models::{encode_discovery_shares, escape_discovery_value, AdvertisedShare, AppConfig, ShareContext};
+use crate::PeerNotify;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use utilities::{Net, UdpSocketLike};
 
-use crate::connection::connect_to_peer;
+use crate::connection::{connect_to_peer, is_peer_connected};
 use crate::{DbHandle, PendingFiles, SharedWriters};
 use protocol::{parse_discovery_message, DiscoveryMessage};
 use std::collections::HashSet;
@@ -23,7 +24,7 @@ pub fn spawn_discovery(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
     utp: Option<UtpSocket>,
     token: CancellationToken,
 ) -> JoinHandle<()> {
@@ -37,7 +38,7 @@ pub fn spawn_discovery(
         fs,
         net,
         pending_files,
-        progress,
+        notify,
         utp,
         token,
     ))
@@ -52,7 +53,7 @@ async fn discovery_loop(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
     utp: Option<UtpSocket>,
     token: CancellationToken,
 ) {
@@ -103,7 +104,7 @@ async fn discovery_loop(
                             fs.clone(),
                             net.clone(),
                             pending_files.clone(),
-                            Arc::clone(&progress),
+                            notify.clone(),
                             utp.clone(),
                             token.clone(),
                         )
@@ -172,7 +173,7 @@ async fn handle_discovery_message(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
     utp: Option<UtpSocket>,
     token: CancellationToken,
 ) {
@@ -219,7 +220,7 @@ async fn handle_discovery_message(
                 fs.clone(),
                 net.clone(),
                 pending_files.clone(),
-                progress,
+                notify,
                 utp.clone(),
                 token.clone(),
             )
@@ -258,7 +259,7 @@ async fn handle_discovery_message(
                 fs.clone(),
                 net.clone(),
                 pending_files.clone(),
-                progress,
+                notify,
                 utp.clone(),
                 token.clone(),
             )
@@ -289,7 +290,7 @@ async fn handle_discover(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
     utp: Option<UtpSocket>,
     token: CancellationToken,
 ) {
@@ -379,6 +380,7 @@ async fn handle_discover(
         peer_plain_addr,
         peer_utp_addr,
         pc_name,
+        Some(peer_id),
         cfg,
         db,
         local_shares,
@@ -387,7 +389,7 @@ async fn handle_discover(
         fs,
         net.clone(),
         pending_files,
-        progress,
+        notify,
         utp,
         token,
     );
@@ -414,7 +416,7 @@ async fn handle_here(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
     utp: Option<UtpSocket>,
     token: CancellationToken,
 ) {
@@ -501,6 +503,7 @@ async fn handle_here(
         peer_plain_addr,
         peer_utp_addr,
         pc_name,
+        Some(peer_id),
         cfg,
         db,
         local_shares,
@@ -509,7 +512,7 @@ async fn handle_here(
         fs,
         net.clone(),
         pending_files,
-        progress,
+        notify,
         utp,
         token,
     );
@@ -520,6 +523,7 @@ pub(crate) fn spawn_connect_task(
     peer_plain_addr: SocketAddr,
     peer_utp_addr: Option<SocketAddr>,
     pc_name: &str,
+    peer_id: Option<i64>,
     cfg: &AppConfig,
     db: &DbHandle,
     shares: &[AdvertisedShare],
@@ -528,7 +532,7 @@ pub(crate) fn spawn_connect_task(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
     utp: Option<UtpSocket>,
     token: CancellationToken,
 ) {
@@ -547,6 +551,7 @@ pub(crate) fn spawn_connect_task(
         peer_plain_addr,
         peer_utp_addr,
         pc_name_connect,
+        peer_id,
         cfg_clone,
         db,
         shares,
@@ -555,7 +560,7 @@ pub(crate) fn spawn_connect_task(
         fs,
         net,
         pending_files,
-        progress,
+        notify,
         utp,
         token,
     ));
@@ -566,6 +571,7 @@ async fn run_connect_task(
     peer_plain_addr: SocketAddr,
     peer_utp_addr: Option<SocketAddr>,
     pc_name: String,
+    peer_id: Option<i64>,
     cfg: AppConfig,
     db: DbHandle,
     shares: Vec<AdvertisedShare>,
@@ -574,13 +580,23 @@ async fn run_connect_task(
     fs: Arc<dyn utilities::FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
     utp: Option<UtpSocket>,
     token: CancellationToken,
 ) {
     tokio::select! {
         _ = token.cancelled() => {}
         res = async {
+            if should_skip_dial(&db, &connections, &pc_name, peer_id).await {
+                debug!(
+                    peer = %pc_name,
+                    peer_id = ?peer_id,
+                    "Already connected; skip rediscovery dial"
+                );
+                // Drop extra writer slots from earlier reconnect storms.
+                crate::prune_duplicate_peer_writers(&connections).await;
+                return Ok(());
+            }
             let connector = tls.connector().await;
             connect_to_peer(
                 peer_tls_addr,
@@ -596,7 +612,7 @@ async fn run_connect_task(
                 fs,
                 net,
                 utp,
-                progress,
+                notify,
             ).await
         } => {
             if let Err(e) = res {
@@ -604,6 +620,31 @@ async fn run_connect_task(
             }
         }
     }
+}
+
+async fn should_skip_dial(
+    db: &DbHandle,
+    connections: &SharedWriters,
+    pc_name: &str,
+    peer_id: Option<i64>,
+) -> bool {
+    if let Some(id) = peer_id {
+        return is_peer_connected(connections, id).await;
+    }
+    let ids: Vec<i64> = db
+        .lock()
+        .await
+        .list_peers()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.pc_name == pc_name)
+        .map(|p| p.id)
+        .collect();
+    if ids.is_empty() {
+        return false;
+    }
+    let guard = connections.lock().await;
+    ids.iter().any(|id| guard.iter().any(|(pid, _)| pid == id))
 }
 
 async fn upsert_peer_with_state(

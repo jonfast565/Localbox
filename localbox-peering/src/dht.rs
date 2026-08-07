@@ -4,7 +4,8 @@ use anyhow::Result;
 use irontide_core::Id20;
 use irontide_dht::{DhtConfig, DhtHandle, IpVoteSource};
 use irontide_utp::UtpSocket;
-use models::{peer_dht_infohash, peer_dht_mutable_seed, AppConfig, TransferProgressRegistry};
+use models::{peer_dht_infohash, peer_dht_mutable_seed, AppConfig};
+use crate::PeerNotify;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -51,7 +52,7 @@ pub fn spawn_dht(
     fs: Arc<dyn FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
     utp: Option<UtpSocket>,
     token: CancellationToken,
 ) -> JoinHandle<()> {
@@ -64,7 +65,7 @@ pub fn spawn_dht(
             fs,
             net,
             pending_files,
-            progress,
+            notify,
             utp,
             token,
         )
@@ -83,7 +84,7 @@ async fn dht_loop(
     fs: Arc<dyn FileSystem>,
     net: Arc<dyn Net>,
     pending_files: PendingFiles,
-    progress: Arc<TransferProgressRegistry>,
+    notify: PeerNotify,
     utp: Option<UtpSocket>,
     token: CancellationToken,
 ) -> Result<()> {
@@ -132,6 +133,7 @@ async fn dht_loop(
                     plain,
                     utp_hint,
                     pc_name,
+                    None,
                     &cfg,
                     &db,
                     &shares,
@@ -140,7 +142,7 @@ async fn dht_loop(
                     fs.clone(),
                     net.clone(),
                     pending_files.clone(),
-                    Arc::clone(&progress),
+                    notify.clone(),
                     utp.clone(),
                     token.clone(),
                 );
@@ -158,6 +160,7 @@ async fn dht_loop(
                         plain,
                         utp_hint,
                         pc_name,
+                        None,
                         &cfg,
                         &db,
                         &shares,
@@ -166,7 +169,7 @@ async fn dht_loop(
                         fs.clone(),
                         net.clone(),
                         pending_files.clone(),
-                        Arc::clone(&progress),
+                        notify.clone(),
                         utp.clone(),
                         token.clone(),
                     );
@@ -207,7 +210,7 @@ async fn dht_loop(
                     &fs,
                     &net,
                     &pending_files,
-                    &progress,
+                    &notify,
                     utp.clone(),
                     &token,
                 ).await;
@@ -265,7 +268,7 @@ async fn lookup_and_dial(
     fs: &Arc<dyn FileSystem>,
     net: &Arc<dyn Net>,
     pending_files: &PendingFiles,
-    progress: &Arc<TransferProgressRegistry>,
+    notify: &PeerNotify,
     utp: Option<UtpSocket>,
     token: &CancellationToken,
 ) {
@@ -303,7 +306,7 @@ async fn lookup_and_dial(
                     fs,
                     net,
                     pending_files,
-                    progress,
+                    notify,
                     utp.clone(),
                     token,
                     &shares,
@@ -339,6 +342,7 @@ async fn lookup_and_dial(
                                 plain,
                                 utp_addr,
                                 &pc_name,
+                                None,
                                 cfg,
                                 db,
                                 &shares,
@@ -347,7 +351,7 @@ async fn lookup_and_dial(
                                 fs.clone(),
                                 net.clone(),
                                 pending_files.clone(),
-                                Arc::clone(progress),
+                                notify.clone(),
                                 utp.clone(),
                                 token.clone(),
                             );
@@ -374,7 +378,7 @@ fn dial_from_record(
     fs: &Arc<dyn FileSystem>,
     net: &Arc<dyn Net>,
     pending_files: &PendingFiles,
-    progress: &Arc<TransferProgressRegistry>,
+    notify: &PeerNotify,
     utp: Option<UtpSocket>,
     token: &CancellationToken,
     shares: &[models::AdvertisedShare],
@@ -410,6 +414,7 @@ fn dial_from_record(
             plain_addr,
             utp_addr,
             &record.pc_name,
+            None,
             cfg,
             db,
             shares,
@@ -418,7 +423,7 @@ fn dial_from_record(
             fs.clone(),
             net.clone(),
             pending_files.clone(),
-            Arc::clone(progress),
+            notify.clone(),
             utp.clone(),
             token.clone(),
         );

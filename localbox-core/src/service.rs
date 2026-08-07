@@ -1,11 +1,13 @@
 use anyhow::{anyhow, bail, Context, Result};
 use db::{Db, PendingTransferRequest};
 use models::{
-    peer_key, peer_thread_id, share_thread_id, AppConfig, ChatAttachment, ChatMessage,
-    ChatMessageRecord, FileChange, IntentBasis, IntentKind, IntentOrigin, IntentStatus, ShareConfig,
-    ShareContext, ShareId, ThreadKind, ThreadSummary, TransferProgressRegistry, TransferReply,
-    TransferReplyStatus, TransferRequest, WireMessage, WIRE_PROTOCOL_VERSION,
+    format_chat_thread_title, peer_key, peer_thread_id, share_thread_id, AppConfig, ChatAttachment,
+    ChatMessage, ChatMessageRecord, ControlEvent, FileChange, IntentBasis, IntentKind, IntentOrigin,
+    IntentStatus, ShareConfig, ShareContext, ShareId, ThreadKind, ThreadSummary,
+    TransferProgressRegistry, TransferReply, TransferReplyStatus, TransferRequest, WireMessage,
+    WIRE_PROTOCOL_VERSION,
 };
+use tokio::sync::broadcast;
 use peering::PeerCommand;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -72,6 +74,16 @@ pub enum ControlRequest {
     ChatRead {
         thread: String,
     },
+    ChatRename {
+        thread: String,
+        title: String,
+    },
+    ChatDeleteMessage {
+        message: String,
+    },
+    ChatDeleteThread {
+        thread: String,
+    },
     TransferProgress {
         intent_id: Option<String>,
     },
@@ -110,6 +122,13 @@ pub enum ControlRequest {
     Logs {
         /// Max lines to return (default 100, capped).
         limit: Option<usize>,
+    },
+    /// Switch this control connection into a push event stream.
+    /// Responds once with an ack, then writes [`ControlEvent`] JSON lines.
+    Subscribe {
+        /// Optional topic filter (`chat`, `transfer`, `batch`). Empty = all.
+        #[serde(default)]
+        topics: Vec<String>,
     },
     /// Disconnect this control client only; does not stop the daemon.
     Quit,
@@ -172,6 +191,8 @@ pub struct ControlService {
     pub net_tx: mpsc::Sender<String>,
     pub peer_cmd_tx: mpsc::Sender<PeerCommand>,
     pub progress: Arc<TransferProgressRegistry>,
+    /// Fan-out for GUI / control subscribers (`Subscribe`).
+    pub events: broadcast::Sender<ControlEvent>,
     pub share_hooks: Option<ShareHooks>,
     pub token: CancellationToken,
 }
@@ -342,6 +363,30 @@ impl ControlService {
                 self.db.lock().await.mark_thread_read(&thread)?;
                 Ok(ControlResponse::ok(format!("marked {thread} read")))
             }
+            ControlRequest::ChatRename { thread, title } => {
+                let renamed = self.db.lock().await.rename_chat_thread(&thread, &title)?;
+                if renamed {
+                    Ok(ControlResponse::ok(format!("renamed {thread}")))
+                } else {
+                    bail!("thread '{thread}' not found or title empty");
+                }
+            }
+            ControlRequest::ChatDeleteMessage { message } => {
+                let deleted = self.db.lock().await.delete_chat_message(&message)?;
+                if deleted {
+                    Ok(ControlResponse::ok(format!("deleted message {message}")))
+                } else {
+                    bail!("message '{message}' not found");
+                }
+            }
+            ControlRequest::ChatDeleteThread { thread } => {
+                let deleted = self.db.lock().await.delete_chat_thread(&thread)?;
+                if deleted {
+                    Ok(ControlResponse::ok(format!("deleted thread {thread}")))
+                } else {
+                    bail!("thread '{thread}' not found");
+                }
+            }
             ControlRequest::TransferProgress { intent_id } => {
                 let snap = self.progress.snapshot(intent_id.as_deref());
                 Ok(ControlResponse::ok_data(
@@ -417,6 +462,10 @@ impl ControlService {
                 ))
             }
             ControlRequest::Logs { limit } => self.tail_logs(limit).await,
+            ControlRequest::Subscribe { .. } => {
+                // Handled specially in the control server connection loop.
+                Ok(ControlResponse::ok("subscribed"))
+            }
         }
     }
 
@@ -749,17 +798,10 @@ impl ControlService {
         share_dest: Option<String>,
     ) -> Result<String> {
         let local_key = peer_key(&self.cfg_snapshot().pc_name, &self.cfg_snapshot().instance_id);
+        // Peer is preferred when both are set: share is optional context on a peer DM.
+        // Share-only remains for CLI/share-thread broadcasts.
         let (kind, thread_id, peer_key_opt, share_name_opt, title) =
-            if let Some(share_name) = share.clone() {
-                let tid = thread.unwrap_or_else(|| share_thread_id(&share_name));
-                (
-                    ThreadKind::Share,
-                    tid,
-                    None,
-                    Some(share_name.clone()),
-                    share_name,
-                )
-            } else if let Some(peer_s) = peer.clone() {
+            if let Some(peer_s) = peer.clone() {
                 let remote = self
                     .db
                     .lock()
@@ -768,20 +810,36 @@ impl ControlService {
                     .ok_or_else(|| anyhow!("peer '{peer_s}' not found"))?;
                 let remote_key = peer_key(&remote.pc_name, &remote.instance_id);
                 let tid = thread.unwrap_or_else(|| peer_thread_id(&local_key, &remote_key));
-                let title = if remote.display_name.trim().is_empty() {
+                let peer_label = if remote.display_name.trim().is_empty() {
                     remote_key.clone()
                 } else {
                     remote.display_name.clone()
                 };
+                let share_opt = share.clone().filter(|s| !s.trim().is_empty());
+                let title = format_chat_thread_title(
+                    ThreadKind::Peer,
+                    Some(&peer_label),
+                    share_opt.as_deref(),
+                );
                 (
                     ThreadKind::Peer,
                     tid,
                     Some(remote_key),
+                    share_opt,
+                    title,
+                )
+            } else if let Some(share_name) = share.clone() {
+                let tid = thread.unwrap_or_else(|| share_thread_id(&share_name));
+                let title = format_chat_thread_title(ThreadKind::Share, None, Some(&share_name));
+                (
+                    ThreadKind::Share,
+                    tid,
                     None,
+                    Some(share_name),
                     title,
                 )
             } else {
-                bail!("chat send requires --peer or --share");
+                bail!("chat send requires --peer (share is optional)");
             };
 
         let body = message.unwrap_or_default();
@@ -814,7 +872,7 @@ impl ControlService {
                 direction: "out".into(),
                 status: "sent".into(),
             };
-            db.insert_chat_message(&record, false)?;
+            let _ = db.insert_chat_message(&record, false)?;
         }
 
         let attachment = match (attachment_share.clone(), attachment_path.clone()) {

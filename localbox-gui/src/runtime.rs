@@ -93,6 +93,33 @@ pub fn control_socket_from_config(path: &Path) -> Result<Option<PathBuf>> {
     Ok(peek.control_socket)
 }
 
+/// Where to park a spawned runtime's raw stderr, alongside its configured log.
+///
+/// Only startup failures and panics land here — tracing's console stream goes to
+/// stdout, which we drop because the file log already has it.
+fn stderr_sink_path(config: Option<&Path>) -> Option<PathBuf> {
+    #[derive(Deserialize)]
+    struct Peek {
+        log_path: Option<PathBuf>,
+    }
+    let text = std::fs::read_to_string(config?).ok()?;
+    let log_path = toml::from_str::<Peek>(&text).ok()?.log_path?;
+    let stem = log_path.file_stem()?.to_str()?;
+    Some(log_path.with_file_name(format!("{stem}.stderr.log")))
+}
+
+fn stderr_sink(config: Option<&Path>) -> Stdio {
+    stderr_sink_path(config)
+        .and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+        })
+        .map_or_else(Stdio::null, Stdio::from)
+}
+
 pub fn resolve_core_binary(override_path: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = override_path {
         return Ok(p.to_path_buf());
@@ -138,9 +165,16 @@ fn spawn_runtime(bin: &Path, config: Option<&Path>, socket: &Path) -> Result<Chi
         cmd.arg("--config").arg(cfg);
     }
     cmd.arg("run").arg("--control-socket").arg(socket);
+    // Tie the child's lifetime to this process: our own teardown is best-effort, and an
+    // orphaned daemon keeps running. It watches this pid and exits when we are gone.
+    cmd.env(localbox_core::engine::PARENT_PID_ENV, std::process::id().to_string());
+    // Never inherit our console: an inherited stream lets the daemon scribble over
+    // whatever terminal launched us, and outlive us doing it. stdout is tracing's
+    // console mirror of `log_path`, which the Logs tab already tails, so drop it and
+    // keep only stderr — the startup errors and panics that never reach the log.
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::null())
+        .stderr(stderr_sink(config));
     cmd.spawn()
         .with_context(|| format!("spawn runtime {}", bin.display()))
 }
@@ -155,14 +189,38 @@ pub struct EnsureOpts {
 
 /// Attach to a live control plane, or spawn `localbox-core run` when none is listening.
 pub async fn ensure_runtime(opts: EnsureOpts) -> Result<RuntimeHandle> {
+    ensure_runtime_inner(opts, false).await
+}
+
+/// Like [`ensure_runtime`], but if a daemon is already listening, shut it down and
+/// spawn a fresh `localbox-core` from the resolved binary (avoids sticking to a stale process).
+pub async fn restart_runtime(opts: EnsureOpts) -> Result<RuntimeHandle> {
+    ensure_runtime_inner(opts, true).await
+}
+
+async fn ensure_runtime_inner(opts: EnsureOpts, replace_existing: bool) -> Result<RuntimeHandle> {
     let socket = opts.socket;
 
     if probe_alive(&socket).await {
-        return Ok(RuntimeHandle {
-            socket,
-            mode: RuntimeMode::Attached,
-            child: None,
-        });
+        if !replace_existing || opts.no_runtime {
+            return Ok(RuntimeHandle {
+                socket,
+                mode: RuntimeMode::Attached,
+                child: None,
+            });
+        }
+        // User explicitly started/restarted from the GUI — replace whatever is on the socket.
+        let _ = client::send_request(&socket, &ControlRequest::Shutdown).await;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while probe_alive(&socket).await {
+            if Instant::now() >= deadline {
+                bail!(
+                    "timed out waiting for old runtime on {} to exit after shutdown",
+                    socket.display()
+                );
+            }
+            sleep(READY_POLL).await;
+        }
     }
 
     if opts.no_runtime {
@@ -207,6 +265,21 @@ pub async fn ensure_runtime(opts: EnsureOpts) -> Result<RuntimeHandle> {
 pub async fn stop_runtime(handle: &mut RuntimeHandle) -> Result<&'static str> {
     match handle.mode {
         RuntimeMode::Managed => {
+            // Prefer a clean control-plane shutdown, then force-kill if needed.
+            let _ = client::send_request(&handle.socket, &ControlRequest::Shutdown).await;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            if let Some(child) = handle.child.as_mut() {
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            handle.child = None;
+                            return Ok("stopped managed runtime");
+                        }
+                        Ok(None) if Instant::now() < deadline => sleep(READY_POLL).await,
+                        _ => break,
+                    }
+                }
+            }
             handle.kill_managed()?;
             Ok("stopped managed runtime")
         }
@@ -219,4 +292,12 @@ pub async fn stop_runtime(handle: &mut RuntimeHandle) -> Result<&'static str> {
             }
         }
     }
+}
+
+/// Synchronously stop a GUI-owned child (safe during window teardown).
+pub fn stop_managed_sync(handle: &mut RuntimeHandle) {
+    if handle.mode != RuntimeMode::Managed {
+        return;
+    }
+    let _ = handle.kill_managed();
 }

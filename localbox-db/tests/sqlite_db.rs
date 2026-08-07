@@ -238,7 +238,7 @@ fn journal_append_and_list() {
 #[test]
 fn schema_version_is_current() {
     let db = Db::open_in_memory().unwrap();
-    assert_eq!(db.schema_version().unwrap(), 10);
+    assert_eq!(db.schema_version().unwrap(), 11);
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn migrates_v4_to_v6_renames_share_journal() {
         .unwrap();
     }
     let db = Db::open(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 10);
+    assert_eq!(db.schema_version().unwrap(), 11);
     assert_eq!(db.journal_entry_count().unwrap(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
